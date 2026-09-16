@@ -57,10 +57,11 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: build
-        run: go build -trimpath -ldflags="-s -w" -o ${{ matrix.out }} .
+        run: go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o ${{ matrix.out }} .
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
+          GITHUB_REF_NAME: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
       - name: smoke test
         if: matrix.smoke
         shell: bash

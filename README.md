@@ -17,6 +17,7 @@ like bash:
 unish -c "command"        run the string (ideal for agents/AI)
 unish script.sh [args...] run the file ($0=script, $1...=args)
 unish < script.sh         run stdin (like bash -s)
+unish --version           print version and exit
 ```
 
 No interactive mode, no readline. Timeout and cancellation are the

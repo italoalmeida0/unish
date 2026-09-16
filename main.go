@@ -16,6 +16,21 @@ import (
 
 var command = flag.String("c", "", "entire bash command to run")
 
+var version = "dev"
+
+func init() {
+	flag.BoolFunc("version", "print version and exit", func(string) error {
+		fmt.Println("unish " + version)
+		os.Exit(0)
+		return nil
+	})
+	flag.BoolFunc("V", "print version and exit", func(string) error {
+		fmt.Println("unish " + version)
+		os.Exit(0)
+		return nil
+	})
+}
+
 func main() {
 	flag.Parse()
 
