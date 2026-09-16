@@ -57,11 +57,10 @@ jobs:
       - name: vet
         run: go vet ./...
       - name: build
-        run: go build -trimpath -ldflags="-s -w -X main.version=${GITHUB_REF_NAME}" -o ${{ matrix.out }} .
+        run: go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}" -o ${{ matrix.out }} .
         env:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
-          GITHUB_REF_NAME: ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}
       - name: smoke test
         if: matrix.smoke
         shell: bash
@@ -73,6 +72,7 @@ jobs:
           printf '1 x\n2 y\n' > "$J2"
           "$BIN" -c "printf \"1 a\\n2 b\\n\" | join - $J2"
           "$BIN" -c 'printf "a\n\nb\n" | nl -ba; printf "abcdefghij\n" | fold -w4'
+          test "$("$BIN" --version)" = "unish ${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}"
       - uses: actions/upload-artifact@v5
         with:
           name: ${{ matrix.out }}

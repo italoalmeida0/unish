@@ -18,14 +18,21 @@ var command = flag.String("c", "", "entire bash command to run")
 
 var version = "dev"
 
+func versionString() string {
+	if version == "" {
+		return "dev"
+	}
+	return version
+}
+
 func init() {
 	flag.BoolFunc("version", "print version and exit", func(string) error {
-		fmt.Println("unish " + version)
+		fmt.Println("unish " + versionString())
 		os.Exit(0)
 		return nil
 	})
 	flag.BoolFunc("V", "print version and exit", func(string) error {
-		fmt.Println("unish " + version)
+		fmt.Println("unish " + versionString())
 		os.Exit(0)
 		return nil
 	})
