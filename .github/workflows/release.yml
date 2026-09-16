@@ -68,6 +68,7 @@ jobs:
           BIN="./${{ matrix.out }}"
           "$BIN" -c 'echo SMOKE; seq 1 3 | tac; printf "xy\n" | od -An -tx1'
           J2="${RUNNER_TEMP:-/tmp}/j2"
+          J2="${J2//\\//}"
           printf '1 x\n2 y\n' > "$J2"
           "$BIN" -c "printf \"1 a\\n2 b\\n\" | join - $J2"
           "$BIN" -c 'printf "a\n\nb\n" | nl -ba; printf "abcdefghij\n" | fold -w4'
