@@ -1,0 +1,86 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            goos: windows
+            goarch: amd64
+            out: unish-windows-amd64.exe
+          - os: windows-latest
+            goos: windows
+            goarch: arm64
+            out: unish-windows-arm64.exe
+          - os: ubuntu-latest
+            goos: linux
+            goarch: amd64
+            out: unish-linux-amd64
+          - os: ubuntu-latest
+            goos: linux
+            goarch: arm64
+            out: unish-linux-arm64
+          - os: macos-latest
+            goos: darwin
+            goarch: amd64
+            out: unish-macos-amd64
+          - os: macos-14
+            goos: darwin
+            goarch: arm64
+            out: unish-macos-arm64
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+          cache: true
+      - name: vet
+        run: go vet ./...
+      - name: build
+        run: go build -trimpath -ldflags="-s -w" -o ${{ matrix.out }} .
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+      - name: smoke test
+        shell: bash
+        run: |
+          BIN="./${{ matrix.out }}"
+          "$BIN" -c 'echo SMOKE; seq 1 3 | tac; printf "xy\n" | od -An -tx1'
+          printf '1 x\n2 y\n' > /tmp/j2
+          "$BIN" -c 'printf "1 a\n2 b\n" | join - /tmp/j2'
+          "$BIN" -c 'printf "a\n\nb\n" | nl -ba; printf "abcdefghij\n" | fold -w4'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.out }}
+          path: ${{ matrix.out }}
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - name: checksums
+        run: cd dist && sha256sum * > SHA256SUMS.txt && cat SHA256SUMS.txt
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
