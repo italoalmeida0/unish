@@ -7,10 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
@@ -158,7 +160,37 @@ func resolve(dir, p string) string {
 	if p == "" || p == "-" || filepath.IsAbs(p) || dir == "" {
 		return p
 	}
+	if runtime.GOOS == "windows" && len(p) > 0 && (p[0] == '/' || p[0] == '\\') {
+		if w, ok := msysPath(p); ok {
+			return w
+		}
+	}
 	return filepath.Join(dir, p)
+}
+
+var msysCygpathOnce sync.Once
+var msysCygpath string
+
+func msysPath(p string) (string, bool) {
+	msysCygpathOnce.Do(func() {
+		if v, err := exec.LookPath("cygpath.exe"); err == nil {
+			msysCygpath = v
+		} else if v, err := exec.LookPath("cygpath"); err == nil {
+			msysCygpath = v
+		}
+	})
+	if msysCygpath == "" {
+		return "", false
+	}
+	out, err := exec.Command(msysCygpath, "-w", p).Output()
+	if err != nil {
+		return "", false
+	}
+	w := strings.TrimSpace(string(out))
+	if w == "" {
+		return "", false
+	}
+	return w, true
 }
 
 func shellGetenv(hc interp.HandlerContext, key string) string {
