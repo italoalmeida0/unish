@@ -19,26 +19,32 @@ jobs:
             goos: windows
             goarch: amd64
             out: unish-windows-amd64.exe
+            smoke: true
           - os: windows-latest
             goos: windows
             goarch: arm64
             out: unish-windows-arm64.exe
+            smoke: false # windows-latest is x86_64; can't exec ARM64
           - os: ubuntu-latest
             goos: linux
             goarch: amd64
             out: unish-linux-amd64
-          - os: ubuntu-latest
+            smoke: true
+          - os: ubuntu-24.04-arm
             goos: linux
             goarch: arm64
             out: unish-linux-arm64
+            smoke: true
           - os: macos-latest
             goos: darwin
             goarch: amd64
             out: unish-macos-amd64
+            smoke: true # Rosetta runs amd64 on ARM runners
           - os: macos-14
             goos: darwin
             goarch: arm64
             out: unish-macos-arm64
+            smoke: true
     runs-on: ${{ matrix.os }}
     env:
       CGO_ENABLED: "0"
@@ -56,6 +62,7 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
       - name: smoke test
+        if: matrix.smoke
         shell: bash
         run: |
           BIN="./${{ matrix.out }}"
