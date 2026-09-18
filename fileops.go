@@ -517,26 +517,43 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	trace := fs.Bool("t", false, "")
 	nullDelim := fs.Bool("0", false, "")
 	replace := fs.String("I", "", "")
+	noRun := fs.Bool("r", false, "")
+	fs.BoolVar(noRun, "no-run-if-empty", false, "")
+	maxProcs := fs.Int("P", 1, "")
+	fs.IntVar(maxProcs, "max-procs", 1, "")
+	delim := fs.String("d", "", "")
+	fs.StringVar(delim, "delimiter", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	_ = maxProcs
+	_ = noRun
 	rest := fs.Args()
 	if len(rest) == 0 {
 		rest = []string{"echo"}
 	}
 	var data []byte
 	var err error
-	if *nullDelim {
-		data, err = io.ReadAll(hc.Stdin)
-	} else {
-		data, err = io.ReadAll(hc.Stdin)
-	}
+	data, err = io.ReadAll(hc.Stdin)
 	if err != nil {
 		return err
 	}
 	var items []string
 	if *nullDelim {
 		for _, part := range strings.Split(string(data), "\x00") {
+			if part != "" {
+				items = append(items, part)
+			}
+		}
+	} else if *delim != "" {
+		for _, part := range strings.Split(string(data), *delim) {
+			if part != "" {
+				items = append(items, part)
+			}
+		}
+	} else if *replace != "" {
+		for _, part := range strings.Split(string(data), "\n") {
+			part = strings.TrimRight(part, "\r")
 			if part != "" {
 				items = append(items, part)
 			}
@@ -548,6 +565,9 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		return nil
 	}
 	batch := *maxArgs
+	if *replace != "" && batch <= 0 {
+		batch = 1
+	}
 	if batch <= 0 {
 		batch = len(items)
 	}

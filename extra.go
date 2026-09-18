@@ -101,9 +101,6 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		if cmd == nil {
 			return next(ctx, args)
 		}
-		if args[0] == "cat" && !hasCatFlag(args[1:]) {
-			return next(ctx, args)
-		}
 		for _, a := range args[1:] {
 			if a == "--version" {
 				hc := interp.HandlerCtx(ctx)
@@ -278,7 +275,21 @@ var flagSpecs = map[string]flagSpec{
 	"ps": {bools: "aefu", values: "", long: map[string]string{}},
 	"free": {bools: "mhg", values: "", long: map[string]string{}},
 	"stat": {bools: "", values: "c", long: map[string]string{}},
-	"ss": {bools: "tuln", values: "", long: map[string]string{}},
+	"ss": {bools: "tulnpa", values: "", long: map[string]string{
+		"tcp": "t", "udp": "u", "listening": "l", "numeric": "n", "processes": "p", "all": "a",
+	}},
+	"pgrep": {bools: "filxc", values: "", long: map[string]string{
+		"full": "f", "ignore-case": "i", "list-name": "l", "exact": "x", "count": "c",
+	}},
+	"pkill": {bools: "filxe", values: "signal", long: map[string]string{
+		"full": "f", "ignore-case": "i", "exact": "x", "echo": "e", "signal": "signal",
+	}},
+	"nc": {bools: "zvul", values: "wp", long: map[string]string{
+		"zero": "z", "verbose": "v", "udp": "u", "listen": "l",
+	}},
+	"netcat": {bools: "zvul", values: "wp", long: map[string]string{
+		"zero": "z", "verbose": "v", "udp": "u", "listen": "l",
+	}},
 	"env": {bools: "i", values: "", long: map[string]string{}},
 	"nice": {bools: "", values: "n", long: map[string]string{
 		"adjustment": "n",
@@ -301,7 +312,19 @@ var flagSpecs = map[string]flagSpec{
 	"chmod": {bools: "Rv", values: "", long: map[string]string{
 		"recursive": "R", "verbose": "v",
 	}},
-	"xargs": {bools: "t0", values: "nI", long: map[string]string{}},
+	"xargs": {bools: "t0r", values: "nIPd", long: map[string]string{
+		"no-run-if-empty": "r", "null": "0", "max-procs": "P", "delimiter": "d",
+	}},
+	"sed": {bools: "nEr", values: "ef", long: map[string]string{
+		"quiet": "n", "silent": "n", "expression": "e", "file": "f",
+		"regexp-extended": "E",
+	}},
+	"timeout": {bools: "p", values: "sk", long: map[string]string{
+		"preserve-status": "p", "signal": "s", "kill-after": "k",
+	}},
+	"shasum": {bools: "bt", values: "a", long: map[string]string{
+		"algorithm": "a", "binary": "b", "text": "t",
+	}},
 	"base64": {bools: "d", values: "w", long: map[string]string{
 		"decode": "d", "wrap": "w",
 	}},
@@ -524,15 +547,6 @@ type stringList []string
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
-func hasCatFlag(args []string) bool {
-	for _, a := range args {
-		if len(a) > 1 && a[0] == '-' && a != "-" {
-			return true
-		}
-	}
-	return false
-}
-
 func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("cat", hc.Stderr)
 	numAll := fs.Bool("n", false, "")
@@ -558,6 +572,15 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	defer closeAll()
+	if !*numAll && !*numNonBlank && !*squeeze && !*showEnds && !*showTabs {
+		for _, r := range readers {
+			if _, err := io.Copy(hc.Stdout, r); err != nil {
+				fmt.Fprintln(hc.Stderr, "cat:", err)
+				return exitError{1}
+			}
+		}
+		return nil
+	}
 	ln := 0
 	prevBlank := false
 	for _, r := range readers {
@@ -797,6 +820,7 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 	node := fs.Bool("n", false, "")
 	release := fs.Bool("r", false, "")
 	sysname := fs.Bool("s", false, "")
+	version := fs.Bool("v", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -810,7 +834,7 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 		return nil
 	}
 	var parts []string
-	if *sysname || (!*machine && !*node && !*release) {
+	if *sysname || (!*machine && !*node && !*release && !*version) {
 		parts = append(parts, name)
 	}
 	if *node {
@@ -819,6 +843,9 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	if *release {
 		parts = append(parts, "unish")
+	}
+	if *version {
+		parts = append(parts, "1.0")
 	}
 	if *machine {
 		parts = append(parts, runtime.GOARCH)

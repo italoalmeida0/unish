@@ -267,7 +267,42 @@ var tcpStates = map[string]string{
 	"09": "LAST-ACK", "0A": "LISTEN", "0B": "CLOSING",
 }
 
+func getSocketInodes() map[string]struct {
+	pid  int
+	name string
+} {
+	m := make(map[string]struct {
+		pid  int
+		name string
+	})
+	procs, err := os.ReadDir("/proc")
+	if err != nil {
+		return m
+	}
+	for _, pe := range procs {
+		pid, err := strconv.Atoi(pe.Name())
+		if err != nil {
+			continue
+		}
+		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		pname := strings.TrimSpace(string(comm))
+		fds, _ := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))
+		for _, f := range fds {
+			link, err := os.Readlink(fmt.Sprintf("/proc/%d/fd/%s", pid, f.Name()))
+			if err == nil && strings.HasPrefix(link, "socket:[") {
+				inode := strings.TrimSuffix(strings.TrimPrefix(link, "socket:["), "]")
+				m[inode] = struct {
+					pid  int
+					name string
+				}{pid: pid, name: pname}
+			}
+		}
+	}
+	return m
+}
+
 func listSockets(protos []string) ([]sockInfo, error) {
+	inodeMap := getSocketInodes()
 	var out []sockInfo
 	for _, proto := range protos {
 		for _, f := range []string{"/proc/net/" + proto, "/proc/net/" + proto + "6"} {
@@ -282,10 +317,10 @@ func listSockets(protos []string) ([]sockInfo, error) {
 					continue
 				}
 				state := tcpStates[f[3]]
-				if state == "" {
+				if proto == "udp" {
+					state = "UNCONN"
+				} else if state == "" {
 					state = f[3]
-				}
-				if state == "LISTEN" {
 				}
 				local := netAddr(f[1])
 				peer := netAddr(f[2])
@@ -297,7 +332,17 @@ func listSockets(protos []string) ([]sockInfo, error) {
 						rxq, _ = strconv.ParseInt(qq[1], 16, 64)
 					}
 				}
-				out = append(out, sockInfo{proto: proto, state: state, local: local, peer: peer, recvQ: rxq, sendQ: txq})
+				inode := f[9]
+				var pid int
+				var procName string
+				if info, ok := inodeMap[inode]; ok {
+					pid = info.pid
+					procName = info.name
+				}
+				out = append(out, sockInfo{
+					proto: proto, state: state, local: local, peer: peer,
+					recvQ: rxq, sendQ: txq, pid: pid, procName: procName,
+				})
 			}
 		}
 	}

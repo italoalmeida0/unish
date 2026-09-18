@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/sha1"
 	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"flag"
 	"fmt"
@@ -251,6 +252,10 @@ func parseDurationLoose(s string) (time.Duration, error) {
 
 func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	_ = ctx
+	if len(args) > 1 && (args[1] == "-l" || args[1] == "-L" || args[1] == "--list") {
+		fmt.Fprintln(hc.Stdout, "HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM")
+		return nil
+	}
 	sig := "TERM"
 	var pids []string
 	for _, a := range args[1:] {
@@ -567,7 +572,31 @@ func cmdSha256sum(_ context.Context, hc interp.HandlerContext, args []string) er
 }
 
 func cmdShasum(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return cmdHash("shasum", sha1.New, hc, args)
+	fs := newFlagSet("shasum", hc.Stderr)
+	algo := fs.String("a", "1", "")
+	fs.StringVar(algo, "algorithm", "1", "")
+	fs.Bool("b", false, "")
+	fs.Bool("t", false, "")
+	if err := fs.Parse(args[1:]); err != nil {
+		return err
+	}
+	newHash := sha1.New
+	switch *algo {
+	case "256":
+		newHash = sha256.New
+	case "512":
+		newHash = sha512.New
+	case "384":
+		newHash = sha512.New384
+	case "224":
+		newHash = sha256.New224
+	case "1":
+		newHash = sha1.New
+	default:
+		fmt.Fprintf(hc.Stderr, "shasum: unrecognized algorithm '%s'\n", *algo)
+		return exitError{1}
+	}
+	return runHash("shasum", newHash, hc, fs.Args())
 }
 
 func cmdHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, args []string) error {
@@ -577,7 +606,10 @@ func cmdHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, ar
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	files := fs.Args()
+	return runHash(name, newHash, hc, fs.Args())
+}
+
+func runHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string) error {
 	if len(files) == 0 {
 		files = []string{"-"}
 	}

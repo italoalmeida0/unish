@@ -15,6 +15,11 @@ import (
 )
 
 func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
+	rawArgs := args[1:]
+	if len(rawArgs) > 0 && !strings.HasPrefix(rawArgs[0], "-") && !strings.Contains(rawArgs[0], "=") {
+		rawArgs = append([]string{"-" + rawArgs[0]}, rawArgs[1:]...)
+		rawArgs = splitAttached("tar", append([]string{"tar"}, rawArgs...))[1:]
+	}
 	fs := newFlagSet("tar", hc.Stderr)
 	create := fs.Bool("c", false, "")
 	extract := fs.Bool("x", false, "")
@@ -23,7 +28,7 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	verb := fs.Bool("v", false, "")
 	file := fs.String("f", "", "")
 	dir := fs.String("C", "", "")
-	if err := fs.Parse(args[1:]); err != nil {
+	if err := fs.Parse(rawArgs); err != nil {
 		return err
 	}
 	nops := 0
@@ -142,7 +147,14 @@ func tarOpenReader(archive string, zip bool) (io.ReadCloser, *gzip.Reader, *tar.
 		return nil, nil, nil, err
 	}
 	var gz *gzip.Reader
-	r := io.Reader(f)
+	var r io.Reader = f
+	if !zip {
+		var magic [2]byte
+		if n, _ := f.Read(magic[:]); n == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+			zip = true
+		}
+		f.Seek(0, io.SeekStart)
+	}
 	if zip {
 		gz, err = gzip.NewReader(f)
 		if err != nil {

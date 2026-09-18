@@ -9,12 +9,15 @@ import (
 )
 
 var (
-	modIphlpapi     = syscall.NewLazyDLL("iphlpapi.dll")
-	procGetTcpTable = modIphlpapi.NewProc("GetTcpTable2")
-	procGetUdpTable = modIphlpapi.NewProc("GetUdpTable")
+	modIphlpapi             = syscall.NewLazyDLL("iphlpapi.dll")
+	procGetTcpTable         = modIphlpapi.NewProc("GetTcpTable2")
+	procGetExtendedUdpTable = modIphlpapi.NewProc("GetExtendedUdpTable")
+	procGetUdpTable         = modIphlpapi.NewProc("GetUdpTable")
 )
 
 const (
+	afInet            = 2
+	udpTableOwnerPid  = 1
 	mibTcpStateClosed = 1
 	mibTcpStateListen = 2
 	mibTcpStateSynSent = 3
@@ -73,12 +76,13 @@ func tcpTable() []sockInfo {
 			proto: "tcp", state: state,
 			local: fmt.Sprintf("%s:%d", ipv4Str(row.localAddr), swapPort(row.localPort)),
 			peer:  fmt.Sprintf("%s:%d", ipv4Str(row.remoteAddr), swapPort(row.remotePort)),
+			pid:   int(row.owningPid),
 		})
 	}
 	return out
 }
 
-type mibUdprow struct {
+type mibUdprowOwnerPid struct {
 	localAddr uint32
 	localPort uint32
 	owningPid uint32
@@ -86,6 +90,30 @@ type mibUdprow struct {
 
 func udpTable() []sockInfo {
 	var size uint32
+	if procGetExtendedUdpTable.Find() == nil {
+		procGetExtendedUdpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0, uintptr(afInet), uintptr(udpTableOwnerPid), 0)
+		if size > 0 && size <= 16*1024*1024 {
+			buf := make([]byte, size)
+			r, _, _ := procGetExtendedUdpTable.Call(uintptr(unsafe.Pointer(&buf[0])), uintptr(unsafe.Pointer(&size)), 0, uintptr(afInet), uintptr(udpTableOwnerPid), 0)
+			if r == 0 {
+				n := *(*uint32)(unsafe.Pointer(&buf[0]))
+				var out []sockInfo
+				off := 4
+				rowSize := int(unsafe.Sizeof(mibUdprowOwnerPid{}))
+				for i := uint32(0); i < n && off+rowSize <= len(buf); i++ {
+					row := (*mibUdprowOwnerPid)(unsafe.Pointer(&buf[off]))
+					off += rowSize
+					out = append(out, sockInfo{
+						proto: "udp", state: "UNCONN",
+						local: fmt.Sprintf("%s:%d", ipv4Str(row.localAddr), swapPort(row.localPort)),
+						peer:  "0.0.0.0:*",
+						pid:   int(row.owningPid),
+					})
+				}
+				return out
+			}
+		}
+	}
 	procGetUdpTable.Call(0, uintptr(unsafe.Pointer(&size)), 0)
 	if size == 0 || size > 16*1024*1024 {
 		return nil
@@ -98,13 +126,13 @@ func udpTable() []sockInfo {
 	n := *(*uint32)(unsafe.Pointer(&buf[0]))
 	var out []sockInfo
 	off := 4
-	rowSize := 12
+	rowSize := 8
 	for i := uint32(0); i < n && off+rowSize <= len(buf); i++ {
 		addr := *(*uint32)(unsafe.Pointer(&buf[off]))
 		port := *(*uint32)(unsafe.Pointer(&buf[off+4]))
 		off += rowSize
 		out = append(out, sockInfo{
-			proto: "udp", state: "",
+			proto: "udp", state: "UNCONN",
 			local: fmt.Sprintf("%s:%d", ipv4Str(addr), swapPort(port)),
 			peer:  "0.0.0.0:*",
 		})

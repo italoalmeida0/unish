@@ -234,5 +234,16 @@ func listSockets(protos []string) ([]sockInfo, error) {
 			out = append(out, udpTable()...)
 		}
 	}
+	if procs, err := listProcs(); err == nil {
+		pMap := make(map[int]string, len(procs))
+		for _, pr := range procs {
+			pMap[pr.pid] = pr.cmd
+		}
+		for i := range out {
+			if out[i].pid > 0 {
+				out[i].procName = pMap[out[i].pid]
+			}
+		}
+	}
 	return out, nil
 }

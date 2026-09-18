@@ -444,6 +444,8 @@ func statFormat(f, display, full string, fi os.FileInfo) string {
 type sockInfo struct {
 	proto, state, local, peer string
 	recvQ, sendQ              int64
+	pid                       int
+	procName                  string
 }
 
 func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -452,6 +454,14 @@ func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	udp := fs.Bool("u", false, "")
 	listen := fs.Bool("l", false, "")
 	numeric := fs.Bool("n", false, "")
+	proc := fs.Bool("p", false, "")
+	all := fs.Bool("a", false, "")
+	fs.BoolVar(tcp, "tcp", false, "")
+	fs.BoolVar(udp, "udp", false, "")
+	fs.BoolVar(listen, "listening", false, "")
+	fs.BoolVar(numeric, "numeric", false, "")
+	fs.BoolVar(proc, "processes", false, "")
+	fs.BoolVar(all, "all", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -470,7 +480,7 @@ func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if *tcp || (!*tcp && !*udp) {
 		protos = append(protos, "tcp")
 	}
-	if *udp {
+	if *udp || (!*tcp && !*udp) {
 		protos = append(protos, "udp")
 	}
 	socks, err := listSockets(protos)
@@ -481,25 +491,50 @@ func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if wantState != "" {
 		var f []sockInfo
 		for _, s := range socks {
-			if strings.ToUpper(s.state) == wantState ||
-				(wantState == "LISTENING" && strings.ToUpper(s.state) == "LISTEN") {
+			st := strings.ToUpper(s.state)
+			if st == wantState ||
+				(wantState == "LISTENING" && st == "LISTEN") ||
+				(wantState == "LISTEN" && st == "LISTENING") ||
+				(wantState == "LISTEN" && s.proto == "udp") {
+				f = append(f, s)
+			}
+		}
+		socks = f
+	} else if !*all {
+		var f []sockInfo
+		for _, s := range socks {
+			st := strings.ToUpper(s.state)
+			if st != "LISTEN" && st != "LISTENING" {
 				f = append(f, s)
 			}
 		}
 		socks = f
 	}
-	if *listen || wantState != "" {
-		fmt.Fprintln(hc.Stdout, "State  Recv-Q Send-Q  Local Address:Port  Peer Address:PortProcess")
+	hdrProcess := ""
+	if *proc {
+		hdrProcess = " Process"
+	}
+	showNetid := len(protos) > 1
+	if showNetid {
+		fmt.Fprintf(hc.Stdout, "Netid  State   Recv-Q Send-Q  Local Address:Port  Peer Address:Port%s\n", hdrProcess)
 	} else {
-		fmt.Fprintln(hc.Stdout, "Netid  State  Recv-Q Send-Q  Local Address:Port  Peer Address:PortProcess")
+		fmt.Fprintf(hc.Stdout, "State   Recv-Q Send-Q  Local Address:Port  Peer Address:Port%s\n", hdrProcess)
 	}
 	for _, s := range socks {
-		if *listen || wantState != "" {
-			fmt.Fprintf(hc.Stdout, "%-6s %-6d %-6d  %-18s %-18s\n",
-				s.state, s.recvQ, s.sendQ, s.local, s.peer)
+		procCol := ""
+		if *proc && s.pid > 0 {
+			name := s.procName
+			if name == "" {
+				name = "unknown"
+			}
+			procCol = fmt.Sprintf(" users:((\"%s\",pid=%d))", name, s.pid)
+		}
+		if showNetid {
+			fmt.Fprintf(hc.Stdout, "%-6s %-7s %-6d %-6d  %-18s %-18s%s\n",
+				s.proto, s.state, s.recvQ, s.sendQ, s.local, s.peer, procCol)
 		} else {
-			fmt.Fprintf(hc.Stdout, "%-6s %-6s %-6d %-6d  %-18s %-18s\n",
-				s.proto, s.state, s.recvQ, s.sendQ, s.local, s.peer)
+			fmt.Fprintf(hc.Stdout, "%-7s %-6d %-6d  %-18s %-18s%s\n",
+				s.state, s.recvQ, s.sendQ, s.local, s.peer, procCol)
 		}
 	}
 	return nil
