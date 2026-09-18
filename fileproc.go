@@ -474,38 +474,355 @@ func splitMktempPattern(pattern string) (prefix, suffix string) {
 	return pattern + ".", ""
 }
 
-func cmdFind(_ context.Context, hc interp.HandlerContext, args []string) error {
+type findNode struct {
+	display string
+	full    string
+	fi      os.FileInfo
+	depth   int
+	pruned  bool
+}
+
+type findPredicate func(node *findNode, hc interp.HandlerContext) bool
+
+func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	var paths, expr []string
-	seenFlag := false
+	seenExpr := false
 	for _, a := range args[1:] {
-		if !seenFlag && !strings.HasPrefix(a, "-") {
+		if !seenExpr && !strings.HasPrefix(a, "-") && a != "!" && a != "(" {
 			paths = append(paths, a)
 		} else {
-			seenFlag = true
+			seenExpr = true
 			expr = append(expr, a)
 		}
 	}
-	fs := newFlagSet("find", hc.Stderr)
-	maxdepth := fs.Int("maxdepth", -1, "")
-	name := fs.String("name", "", "")
-	iname := fs.String("iname", "", "")
-	typ := fs.String("type", "", "")
-	print := fs.Bool("print", false, "")
-	if err := fs.Parse(expr); err != nil {
-		return err
-	}
-	_ = print
 	if len(paths) == 0 {
 		paths = []string{"."}
 	}
+
+	maxdepth := -1
+	mindepth := 0
+	hasAction := false
+
+	pos := 0
+	peek := func() string {
+		if pos < len(expr) {
+			return expr[pos]
+		}
+		return ""
+	}
+	next := func() string {
+		if pos < len(expr) {
+			tok := expr[pos]
+			pos++
+			return tok
+		}
+		return ""
+	}
+
+	matchPath := func(pat, str string, ignoreCase bool) bool {
+		pat = filepath.ToSlash(pat)
+		str = filepath.ToSlash(str)
+		if ignoreCase {
+			pat = strings.ToLower(pat)
+			str = strings.ToLower(str)
+		}
+		if ok, _ := filepath.Match(pat, str); ok {
+			return true
+		}
+		cleanStr := strings.TrimPrefix(str, "./")
+		if ok, _ := filepath.Match(pat, cleanStr); ok {
+			return true
+		}
+		if ok, _ := filepath.Match("./"+pat, str); ok {
+			return true
+		}
+		cleanPat := strings.Trim(pat, "/")
+		if !strings.ContainsAny(pat, "*?[") {
+			if strings.Contains(str, "/"+cleanPat+"/") || strings.HasSuffix(str, "/"+cleanPat) || cleanStr == cleanPat {
+				return true
+			}
+		}
+		return false
+	}
+
+	var parseOr func() findPredicate
+	var parseAnd func() findPredicate
+	var parseNot func() findPredicate
+	var parsePrimary func() findPredicate
+
+	parseOr = func() findPredicate {
+		left := parseAnd()
+		for peek() == "-o" || peek() == "-or" {
+			next()
+			right := parseAnd()
+			l, r := left, right
+			left = func(node *findNode, hc interp.HandlerContext) bool {
+				return l(node, hc) || r(node, hc)
+			}
+		}
+		return left
+	}
+
+	parseAnd = func() findPredicate {
+		left := parseNot()
+		for {
+			p := peek()
+			if p == "" || p == ")" || p == "-o" || p == "-or" {
+				break
+			}
+			if p == "-a" || p == "-and" {
+				next()
+			}
+			right := parseNot()
+			l, r := left, right
+			left = func(node *findNode, hc interp.HandlerContext) bool {
+				return l(node, hc) && r(node, hc)
+			}
+		}
+		return left
+	}
+
+	parseNot = func() findPredicate {
+		if peek() == "!" || peek() == "-not" {
+			next()
+			inner := parseNot()
+			return func(node *findNode, hc interp.HandlerContext) bool {
+				return !inner(node, hc)
+			}
+		}
+		return parsePrimary()
+	}
+
+	parsePrimary = func() findPredicate {
+		if pos >= len(expr) {
+			return func(*findNode, interp.HandlerContext) bool { return true }
+		}
+		tok := next()
+		if tok == "(" {
+			sub := parseOr()
+			if peek() == ")" {
+				next()
+			}
+			return sub
+		}
+		switch tok {
+		case "-name":
+			pat := next()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				ok, _ := filepath.Match(pat, n.fi.Name())
+				return ok
+			}
+		case "-iname":
+			pat := strings.ToLower(next())
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				ok, _ := filepath.Match(pat, strings.ToLower(n.fi.Name()))
+				return ok
+			}
+		case "-path", "-wholename":
+			pat := next()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				return matchPath(pat, n.display, false)
+			}
+		case "-ipath", "-iwholename":
+			pat := next()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				return matchPath(pat, n.display, true)
+			}
+		case "-type":
+			t := next()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				isDir := n.fi.IsDir()
+				switch t {
+				case "d":
+					return isDir
+				case "f":
+					return !isDir && (n.fi.Mode()&os.ModeType == 0)
+				case "l":
+					return n.fi.Mode()&os.ModeSymlink != 0
+				case "s":
+					return n.fi.Mode()&os.ModeSocket != 0
+				case "p":
+					return n.fi.Mode()&os.ModeNamedPipe != 0
+				default:
+					return false
+				}
+			}
+		case "-maxdepth":
+			if v, err := strconv.Atoi(next()); err == nil {
+				maxdepth = v
+			}
+			return func(*findNode, interp.HandlerContext) bool { return true }
+		case "-mindepth":
+			if v, err := strconv.Atoi(next()); err == nil {
+				mindepth = v
+			}
+			return func(*findNode, interp.HandlerContext) bool { return true }
+		case "-prune":
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				if n.fi.IsDir() {
+					n.pruned = true
+				}
+				return true
+			}
+		case "-empty":
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				if n.fi.IsDir() {
+					entries, err := os.ReadDir(n.full)
+					return err == nil && len(entries) == 0
+				}
+				return n.fi.Size() == 0
+			}
+		case "-size":
+			s := next()
+			sign := 0
+			if strings.HasPrefix(s, "+") {
+				sign = 1
+				s = s[1:]
+			} else if strings.HasPrefix(s, "-") {
+				sign = -1
+				s = s[1:]
+			}
+			unit := int64(512)
+			if len(s) > 0 {
+				switch s[len(s)-1] {
+				case 'c':
+					unit = 1
+					s = s[:len(s)-1]
+				case 'w':
+					unit = 2
+					s = s[:len(s)-1]
+				case 'b':
+					unit = 512
+					s = s[:len(s)-1]
+				case 'k':
+					unit = 1024
+					s = s[:len(s)-1]
+				case 'M':
+					unit = 1024 * 1024
+					s = s[:len(s)-1]
+				case 'G':
+					unit = 1024 * 1024 * 1024
+					s = s[:len(s)-1]
+				}
+			}
+			val, _ := strconv.ParseInt(s, 10, 64)
+			targetBytes := val * unit
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				sz := n.fi.Size()
+				if sign > 0 {
+					return sz > targetBytes
+				} else if sign < 0 {
+					return sz < targetBytes
+				}
+				return sz == targetBytes
+			}
+		case "-mtime":
+			s := next()
+			sign := 0
+			if strings.HasPrefix(s, "+") {
+				sign = 1
+				s = s[1:]
+			} else if strings.HasPrefix(s, "-") {
+				sign = -1
+				s = s[1:]
+			}
+			days, _ := strconv.Atoi(s)
+			now := time.Now()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				ageDays := int(now.Sub(n.fi.ModTime()).Hours() / 24)
+				if sign > 0 {
+					return ageDays > days
+				} else if sign < 0 {
+					return ageDays < days
+				}
+				return ageDays == days
+			}
+		case "-mmin":
+			s := next()
+			sign := 0
+			if strings.HasPrefix(s, "+") {
+				sign = 1
+				s = s[1:]
+			} else if strings.HasPrefix(s, "-") {
+				sign = -1
+				s = s[1:]
+			}
+			mins, _ := strconv.Atoi(s)
+			now := time.Now()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				ageMins := int(now.Sub(n.fi.ModTime()).Minutes())
+				if sign > 0 {
+					return ageMins > mins
+				} else if sign < 0 {
+					return ageMins < mins
+				}
+				return ageMins == mins
+			}
+		case "-print":
+			hasAction = true
+			return func(n *findNode, hc interp.HandlerContext) bool {
+				fmt.Fprintln(hc.Stdout, filepath.ToSlash(n.display))
+				return true
+			}
+		case "-print0":
+			hasAction = true
+			return func(n *findNode, hc interp.HandlerContext) bool {
+				fmt.Fprintf(hc.Stdout, "%s\x00", filepath.ToSlash(n.display))
+				return true
+			}
+		case "-delete":
+			hasAction = true
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				_ = os.Remove(n.full)
+				return true
+			}
+		case "-exec":
+			hasAction = true
+			var execArgs []string
+			for pos < len(expr) {
+				a := next()
+				if a == ";" || a == "+" {
+					break
+				}
+				execArgs = append(execArgs, a)
+			}
+			return func(n *findNode, hc interp.HandlerContext) bool {
+				var cmdLine []string
+				for _, a := range execArgs {
+					if a == "{}" {
+						cmdLine = append(cmdLine, n.display)
+					} else {
+						cmdLine = append(cmdLine, a)
+					}
+				}
+				if len(cmdLine) > 0 {
+					_ = runSubcommand(ctx, hc, cmdLine)
+				}
+				return true
+			}
+		case "-true":
+			return func(*findNode, interp.HandlerContext) bool { return true }
+		case "-false":
+			return func(*findNode, interp.HandlerContext) bool { return false }
+		default:
+			if strings.HasPrefix(tok, "-") {
+				fmt.Fprintf(hc.Stderr, "find: unknown predicate `%s`\n", tok)
+			}
+			return func(*findNode, interp.HandlerContext) bool { return true }
+		}
+	}
+
+	var rootPred findPredicate
+	if len(expr) > 0 {
+		rootPred = parseOr()
+	} else {
+		rootPred = func(*findNode, interp.HandlerContext) bool { return true }
+	}
+
 	code := 0
 	for _, p := range paths {
 		full := resolve(hc.Dir, p)
-		base := p
-		if base == "." {
-			base = "."
-		}
-		walkFind(hc, base, full, 0, *maxdepth, *name, *iname, *typ, &code)
+		walkFind(ctx, hc, p, full, 0, maxdepth, mindepth, rootPred, hasAction, &code)
 	}
 	if code != 0 {
 		return exitError{code}
@@ -513,36 +830,27 @@ func cmdFind(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func walkFind(hc interp.HandlerContext, display, full string, depth, maxdepth int, name, iname, typ string, code *int) {
+func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth, maxdepth, mindepth int, pred findPredicate, hasAction bool, code *int) {
+	if ctx.Err() != nil {
+		return
+	}
 	fi, err := os.Lstat(full)
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
 		*code = 1
 		return
 	}
-	match := true
-	if name != "" {
-		ok, _ := filepath.Match(name, fi.Name())
-		match = ok
+	node := findNode{
+		display: display,
+		full:    full,
+		fi:      fi,
+		depth:   depth,
 	}
-	if iname != "" {
-		ok, _ := filepath.Match(strings.ToLower(iname), strings.ToLower(fi.Name()))
-		match = match && ok
-	}
-	if typ != "" {
-		isDir := fi.IsDir()
-		wantDir := typ == "d"
-		wantFile := typ == "f" || typ == "l" && fi.Mode()&os.ModeSymlink != 0
-		if typ == "l" {
-			match = match && fi.Mode()&os.ModeSymlink != 0
-		} else {
-			match = match && ((wantDir && isDir) || (wantFile && !isDir))
-		}
-	}
-	if match {
+	match := pred(&node, hc)
+	if match && !hasAction && depth >= mindepth {
 		fmt.Fprintln(hc.Stdout, filepath.ToSlash(display))
 	}
-	if !fi.IsDir() {
+	if !fi.IsDir() || node.pruned {
 		return
 	}
 	if maxdepth >= 0 && depth >= maxdepth {
@@ -555,9 +863,18 @@ func walkFind(hc interp.HandlerContext, display, full string, depth, maxdepth in
 		return
 	}
 	for _, e := range entries {
-		walkFind(hc, display+"/"+e.Name(), filepath.Join(full, e.Name()), depth+1, maxdepth, name, iname, typ, code)
+		subDisplay := display
+		if subDisplay == "." {
+			subDisplay = "./" + e.Name()
+		} else if strings.HasSuffix(subDisplay, "/") {
+			subDisplay = subDisplay + e.Name()
+		} else {
+			subDisplay = subDisplay + "/" + e.Name()
+		}
+		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code)
 	}
 }
+
 
 func cmdMd5sum(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return cmdHash("md5sum", md5.New, hc, args)

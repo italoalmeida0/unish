@@ -244,10 +244,18 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 			}
 			if fi.IsDir() {
 				filepath.Walk(full, func(path string, info os.FileInfo, e error) error {
-					if e != nil || info.IsDir() {
+					if e != nil {
 						return nil
 					}
 					rel, _ := filepath.Rel(hc.Dir, path)
+					if info.IsDir() {
+						for _, xd := range excludeDirs {
+							if strings.Contains(rel, xd) || filepath.Base(path) == xd {
+								return filepath.SkipDir
+							}
+						}
+						return nil
+					}
 					base := filepath.Base(path)
 					for _, x := range excludes {
 						if ok, _ := filepath.Match(x, base); ok {
@@ -261,13 +269,12 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 								hit = true
 								break
 							}
+							if strings.HasPrefix(in, ".") && strings.HasSuffix(base, in) {
+								hit = true
+								break
+							}
 						}
 						if !hit {
-							return nil
-						}
-					}
-					for _, xd := range excludeDirs {
-						if strings.Contains(rel, xd) {
 							return nil
 						}
 					}
@@ -289,7 +296,9 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		matchedAny = matchedAny || m
 	}
 	if len(files) == 0 {
-		emit("", hc.Stdin)
+		if !recursive && len(rest) == 0 {
+			emit("", hc.Stdin)
+		}
 	} else {
 		for _, f := range files {
 			if f == "" {

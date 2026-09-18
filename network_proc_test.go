@@ -85,3 +85,31 @@ func TestPgrep(t *testing.T) {
 		t.Errorf("expected non-empty output for pgrep -l .")
 	}
 }
+
+func TestFindExpressions(t *testing.T) {
+	// Test find with -name and -not -path
+	stdout, stderr, err := runUnishScript(t, `find . -maxdepth 1 -name "main.go" -not -path "/.git/"`)
+	if err != nil {
+		t.Fatalf("find failed: %v\nstderr: %s", err, stderr)
+	}
+	if !strings.Contains(stdout, "main.go") {
+		t.Errorf("expected find to locate main.go, got:\n%s", stdout)
+	}
+
+	// Test find -not matching
+	stdout, _, err = runUnishScript(t, `find . -maxdepth 1 -name "main.go" -not -name "main.go"`)
+	if err != nil {
+		t.Fatalf("find failed: %v", err)
+	}
+	if strings.Contains(stdout, "main.go") {
+		t.Errorf("expected empty output with negation, got:\n%s", stdout)
+	}
+}
+
+func TestGrepNonHanging(t *testing.T) {
+	// Grep with recursive and an include filter that matches nothing should exit without hanging
+	_, _, err := runUnishScript(t, `grep -rl "system-prompt" --include=".cs" --include=".json" .`)
+	if err == nil {
+		t.Errorf("expected grep to return exit code 1 when no files match, got nil error")
+	}
+}

@@ -590,7 +590,7 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		if *trace {
 			fmt.Fprintf(hc.Stderr, "+ %s\n", strings.Join(cmdArgs, " "))
 		}
-		if err := runXargsCmd(ctx, hc, cmdArgs); err != nil {
+		if err := runSubcommand(ctx, hc, cmdArgs); err != nil {
 			if es, ok := err.(exitError); ok && es.code == 127 {
 				return err
 			}
@@ -603,7 +603,7 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	return nil
 }
 
-func runXargsCmd(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) error {
+func runSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) error {
 	if len(cmdArgs) == 0 {
 		return nil
 	}
