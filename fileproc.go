@@ -538,7 +538,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		}
 		cleanPat := strings.Trim(pat, "/")
 		if !strings.ContainsAny(pat, "*?[") {
-			if strings.Contains(str, "/"+cleanPat+"/") || strings.HasSuffix(str, "/"+cleanPat) || cleanStr == cleanPat {
+			if strings.Contains(str, "/"+cleanPat+"/") || strings.HasSuffix(str, "/"+cleanPat) || cleanStr == cleanPat || strings.Contains(str, cleanPat) {
 				return true
 			}
 		}
@@ -609,14 +609,25 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-name":
 			pat := next()
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				ok, _ := filepath.Match(pat, n.fi.Name())
-				return ok
+				if ok, _ := filepath.Match(pat, n.fi.Name()); ok {
+					return true
+				}
+				if strings.HasPrefix(pat, ".") && !strings.ContainsAny(pat, "*?[") {
+					return strings.HasSuffix(n.fi.Name(), pat)
+				}
+				return false
 			}
 		case "-iname":
 			pat := strings.ToLower(next())
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				ok, _ := filepath.Match(pat, strings.ToLower(n.fi.Name()))
-				return ok
+				name := strings.ToLower(n.fi.Name())
+				if ok, _ := filepath.Match(pat, name); ok {
+					return true
+				}
+				if strings.HasPrefix(pat, ".") && !strings.ContainsAny(pat, "*?[") {
+					return strings.HasSuffix(name, pat)
+				}
+				return false
 			}
 		case "-path", "-wholename":
 			pat := next()

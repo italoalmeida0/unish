@@ -247,7 +247,7 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 					if e != nil {
 						return nil
 					}
-					rel, _ := filepath.Rel(hc.Dir, path)
+					rel, _ := filepath.Rel(full, path)
 					if info.IsDir() {
 						for _, xd := range excludeDirs {
 							if strings.Contains(rel, xd) || filepath.Base(path) == xd {
@@ -278,7 +278,13 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 							return nil
 						}
 					}
-					files = append(files, filepath.ToSlash(rel))
+					displayPath := ""
+					if p == "." {
+						displayPath = "./" + filepath.ToSlash(rel)
+					} else {
+						displayPath = filepath.ToSlash(filepath.Join(p, rel))
+					}
+					files = append(files, displayPath)
 					return nil
 				})
 			} else {
