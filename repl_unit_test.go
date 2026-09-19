@@ -594,3 +594,102 @@ func TestSearchOverlay(t *testing.T) {
 		t.Fatalf("cancel redraw: %q", sb.String())
 	}
 }
+
+func TestKeyReaderYankUndo(t *testing.T) {
+	ks := feedKeys("\x19\x1f")
+	if len(ks) != 2 || ks[0].code != keyCtrlY || ks[1].code != keyCtrlUnderscore {
+		t.Fatalf("yank/undo keys: %+v", ks)
+	}
+	ks = feedKeys("\x1by")
+	if len(ks) != 1 || ks[0].code != keyAltY {
+		t.Fatalf("alt-y: %+v", ks)
+	}
+	// Bracketed paste markers.
+	ks = feedKeys("\x1b[200~hello\x1b[201~")
+	if len(ks) != 7 { // start + h e l l o + end
+		t.Fatalf("paste markers: %+v", ks)
+	}
+	if ks[0].code != keyPasteStart || ks[6].code != keyPasteEnd {
+		t.Fatalf("paste start/end: %+v", ks)
+	}
+	for _, k := range ks[1:6] {
+		if k.r == 0 {
+			t.Fatalf("paste body not literal: %+v", ks)
+		}
+	}
+}
+
+func TestKillRingYankPop(t *testing.T) {
+	rp := &repl{hist: newHistStore(), kbd: &keyReader{}, out: io.Discard, errOut: io.Discard}
+	rp.kill("foo")
+	rp.kill("bar")
+	if len(rp.killRing) != 2 {
+		t.Fatalf("ring=%v", rp.killRing)
+	}
+	var lb lineBuf
+	// Yank inserts newest.
+	s := rp.killRing[len(rp.killRing)-1]
+	rp.killIdx = len(rp.killRing) - 1
+	rp.killLastLen = len([]rune(s))
+	lb.insertStr(s)
+	if lb.String() != "bar" {
+		t.Fatalf("yank: %q", lb.String())
+	}
+	// Alt-Y replaces with previous.
+	for i := 0; i < rp.killLastLen && lb.pos > 0; i++ {
+		lb.pos--
+	}
+	lb.text = append(lb.text[:lb.pos], lb.text[lb.pos+rp.killLastLen:]...)
+	rp.killIdx--
+	s = rp.killRing[rp.killIdx]
+	rp.killLastLen = len([]rune(s))
+	lb.insertStr(s)
+	if lb.String() != "foo" {
+		t.Fatalf("yank-pop: %q", lb.String())
+	}
+	// anyEdit breaks the chain.
+	rp.anyEdit()
+	if rp.killIdx != -1 {
+		t.Fatal("anyEdit should reset yank chain")
+	}
+}
+
+func TestUndo(t *testing.T) {
+	rp := &repl{hist: newHistStore(), kbd: &keyReader{}, out: io.Discard, errOut: io.Discard}
+	var lb lineBuf
+	lb.insertStr("hello")
+	rp.pushUndo(&lb) // snapshot "hello"
+	lb.insertStr(" world")
+	if !rp.doUndo(&lb) || lb.String() != "hello" {
+		t.Fatalf("undo: %q", lb.String())
+	}
+	if rp.doUndo(&lb) {
+		t.Fatal("second undo should fail (only one snapshot)")
+	}
+	// Failed edit must not push: backspace at 0.
+	var empty lineBuf
+	rp.pushUndo(&empty)
+	if len(rp.undoStack) == 0 {
+		t.Fatal("push should snapshot even empty")
+	}
+}
+
+func TestInsertPaste(t *testing.T) {
+	rp := &repl{hist: newHistStore(), kbd: &keyReader{}, out: io.Discard, errOut: io.Discard}
+	var lb lineBuf
+	lb.insertStr("echo ")
+	rp.insertPaste(&lb, "a\tb\nc")
+	if lb.String() != "echo a\tb\nc" {
+		t.Fatalf("paste: %q", lb.String())
+	}
+	var lb2 lineBuf
+	rp.insertPaste(&lb2, "cmd\n") // trailing newline stripped
+	if lb2.String() != "cmd" {
+		t.Fatalf("paste trailing NL: %q", lb2.String())
+	}
+	var lb3 lineBuf
+	rp.insertPaste(&lb3, "a\r\nb\rc")
+	if lb3.String() != "a\nb\nc" {
+		t.Fatalf("paste CRLF: %q", lb3.String())
+	}
+}

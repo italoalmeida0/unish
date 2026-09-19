@@ -53,7 +53,17 @@ type repl struct {
 	tabCount       int
 	lastTab        string
 	tabShown       bool
+	killRing       []string // kill ring (newest last), bash-like
+	killIdx        int      // yank pop position (-1 = not yanking)
+	killLastLen    int      // runes inserted by last yank (for Alt-Y replace)
+	undoStack      []undoState
 	mu             sync.Mutex
+}
+
+// undoState snapshots the line for Ctrl-_ undo.
+type undoState struct {
+	text []rune
+	pos  int
 }
 
 // envSnapshot copies the runner's live variables (writeEnv overlay is

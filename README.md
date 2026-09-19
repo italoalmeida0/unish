@@ -73,6 +73,9 @@ No args on a terminal (or `unish -i`) starts a readline shell:
 
 - **Emacs editing**: arrows/Home/End/Delete, `^A/^E/^B/^F/^K/^U/^W`,
   `Alt-B/F/D`, `^T`, `^L`, UTF-8 + CJK wide chars, `\e` colors in PS1
+- **Kill-ring + undo + paste**: `^K/^U/^W/Alt-D` kill to the ring,
+  `^Y` yanks, `Alt-Y` cycles, `^_` undoes; bracketed paste inserts
+  literally (multiline included, no mid-paste submit)
 - **History**: `~/.unish_history` (HISTFILE/HISTSIZE/HISTFILESIZE),
   HISTCONTROL, `history` builtin (`-c/-d/-s/-p/-a/-n/-r/-w`),
   `!`/`!!`/`!n`/`!-n`/`!str`/`!?str?` expansion, `Ctrl-R` search

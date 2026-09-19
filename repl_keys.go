@@ -36,6 +36,11 @@ const (
 	keyCtrlRight
 	keyCtrlR
 	keyCtrlS
+	keyCtrlY
+	keyCtrlUnderscore
+	keyAltY
+	keyPasteStart
+	keyPasteEnd
 	keyCtrlA
 	keyCtrlE
 	keyCtrlB
@@ -115,6 +120,12 @@ func (k *keyReader) next() (vtKey, bool) {
 	case 0x13:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlS}, true
+	case 0x19:
+		k.buf = k.buf[1:]
+		return vtKey{code: keyCtrlY}, true
+	case 0x1f:
+		k.buf = k.buf[1:]
+		return vtKey{code: keyCtrlUnderscore}, true
 	case 0x14:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlT}, true
@@ -161,6 +172,8 @@ func (k *keyReader) nextEsc() (vtKey, bool) {
 				return vtKey{code: keyAltF}, true
 			case 'd', 'D':
 				return vtKey{code: keyAltD}, true
+			case 'y', 'Y':
+				return vtKey{code: keyAltY}, true
 			case 0x7f:
 				k.buf = k.buf[1:] // already consumed ESC; fix below
 				// consumed ESC + DEL
@@ -216,6 +229,10 @@ func (k *keyReader) nextEsc() (vtKey, bool) {
 				return vtKey{code: keyDelete, bytes: raw}, true
 			case "4", "8":
 				return vtKey{code: keyEnd, bytes: raw}, true
+			case "200":
+				return vtKey{code: keyPasteStart, bytes: raw}, true
+			case "201":
+				return vtKey{code: keyPasteEnd, bytes: raw}, true
 			}
 		}
 		return vtKey{code: keyUnknown, bytes: raw}, true

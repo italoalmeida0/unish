@@ -312,9 +312,76 @@ const (
 	readCtrlD
 )
 
+// kill pushes text onto the kill ring (bash appends consecutive kills;
+// we keep it simple: every kill pushes, capped at 32 entries).
+func (rp *repl) kill(s string) {
+	if s == "" {
+		return
+	}
+	rp.killRing = append(rp.killRing, s)
+	if len(rp.killRing) > 32 {
+		rp.killRing = rp.killRing[len(rp.killRing)-32:]
+	}
+	rp.killIdx = -1
+	rp.killLastLen = 0
+}
+
+// pushUndo snapshots the line before a mutating key (cap 64).
+func (rp *repl) pushUndo(lb *lineBuf) {
+	snap := undoState{text: append([]rune(nil), lb.text...), pos: lb.pos}
+	n := len(rp.undoStack)
+	if n > 0 && string(rp.undoStack[n-1].text) == string(snap.text) && rp.undoStack[n-1].pos == snap.pos {
+		return
+	}
+	rp.undoStack = append(rp.undoStack, snap)
+	if len(rp.undoStack) > 64 {
+		rp.undoStack = rp.undoStack[len(rp.undoStack)-64:]
+	}
+}
+
+func (rp *repl) doUndo(lb *lineBuf) bool {
+	n := len(rp.undoStack)
+	if n == 0 {
+		return false
+	}
+	s := rp.undoStack[n-1]
+	rp.undoStack = rp.undoStack[:n-1]
+	lb.text = append([]rune(nil), s.text...)
+	if s.pos < 0 {
+		s.pos = 0
+	}
+	if s.pos > len(lb.text) {
+		s.pos = len(lb.text)
+	}
+	lb.pos = s.pos
+	return true
+}
+
+// anyEdit resets yank-pop state: a non-yank key breaks the Alt-Y chain.
+func (rp *repl) anyEdit() {
+	rp.killIdx = -1
+	rp.killLastLen = 0
+}
+
+// insertPaste inserts bracketed-paste content literally: newlines become
+// real newlines in the buffer (multiline continuation handles them via
+// the normal incomplete() path after submit), tabs stay tabs (no
+// completion), and no history expansion applies.
+func (rp *repl) insertPaste(lb *lineBuf, s string) {
+	// Strip a single trailing newline terminals often include.
+	s = strings.TrimSuffix(s, "\n")
+	s = strings.ReplaceAll(s, "\r\n", "\n")
+	s = strings.ReplaceAll(s, "\r", "\n")
+	lb.insertStr(s)
+}
+
 // readEditedLine reads one (single-line buffer) edited line.
 func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (string, readCtrl) {
-	var killBuf string
+	rp.killIdx = -1
+	rp.killLastLen = 0
+	rp.undoStack = nil
+	var pasting bool
+	var pasteBuf strings.Builder
 	tmp := make([]byte, 256)
 	for {
 		n, err := rp.inFile.Read(tmp)
@@ -331,7 +398,31 @@ func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (st
 				break
 			}
 			rp.tabCountReset(k)
+			// Bracketed paste: consume literally (no submit, no Tab
+			// completion, no history expansion mid-paste).
+			if pasting {
+				if k.code == keyPasteEnd {
+					pasting = false
+					rp.pushUndo(lb)
+					rp.insertPaste(lb, pasteBuf.String())
+					rp.anyEdit()
+					redraw()
+				}
+				// Enter inside paste is literal text, not submit.
+				if k.code == keyEnter {
+					pasteBuf.WriteByte('\n')
+				} else if k.r != 0 {
+					pasteBuf.WriteRune(k.r)
+				}
+				continue
+			}
 			switch {
+			case k.code == keyPasteStart:
+				pasting = true
+				pasteBuf.Reset()
+				continue
+			case k.code == keyPasteEnd:
+				continue // stray end marker: ignore
 			case k.code == keyEnter:
 				if rp.searchMode {
 					rp.searchAccept(rn, lb)
@@ -357,15 +448,21 @@ func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (st
 					rp.searchBackspace(rn, lb)
 					continue
 				}
+				rp.pushUndo(lb)
 				if lb.backspace() {
+					rp.anyEdit()
 					redraw()
 				} else {
+					rp.undoStack = rp.undoStack[:len(rp.undoStack)-1]
 					bell(rp.out)
 				}
 			case k.code == keyDelete:
+				rp.pushUndo(lb)
 				if lb.deleteAt() {
+					rp.anyEdit()
 					redraw()
 				} else {
+					rp.undoStack = rp.undoStack[:len(rp.undoStack)-1]
 					bell(rp.out)
 				}
 			case k.code == keyLeft || k.code == keyCtrlB:
@@ -433,16 +530,24 @@ func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (st
 					bell(rp.out)
 				}
 			case k.code == keyCtrlK:
-				killBuf = lb.killToEnd()
+				rp.pushUndo(lb)
+				rp.kill(lb.killToEnd())
+				rp.anyEdit()
 				redraw()
 			case k.code == keyCtrlU:
-				killBuf = lb.killToStart()
+				rp.pushUndo(lb)
+				rp.kill(lb.killToStart())
+				rp.anyEdit()
 				redraw()
 			case k.code == keyCtrlW:
-				killBuf = lb.killWordBack()
+				rp.pushUndo(lb)
+				rp.kill(lb.killWordBack())
+				rp.anyEdit()
 				redraw()
 			case k.code == keyAltD:
-				killBuf = lb.killWordFwd()
+				rp.pushUndo(lb)
+				rp.kill(lb.killWordFwd())
+				rp.anyEdit()
 				redraw()
 			case k.code == keyAltB || k.code == keyCtrlLeft:
 				lb.moveWordBack()
@@ -451,11 +556,59 @@ func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (st
 				lb.moveWordFwd()
 				redraw()
 			case k.code == keyAltBackspace:
-				killBuf = lb.killWordBack()
+				rp.pushUndo(lb)
+				rp.kill(lb.killWordBack())
+				rp.anyEdit()
 				redraw()
 			case k.code == keyCtrlT:
+				rp.pushUndo(lb)
 				lb.transpose()
+				rp.anyEdit()
 				redraw()
+			case k.code == keyCtrlY:
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
+				if len(rp.killRing) == 0 {
+					bell(rp.out)
+					continue
+				}
+				rp.pushUndo(lb)
+				s := rp.killRing[len(rp.killRing)-1]
+				rp.killIdx = len(rp.killRing) - 1
+				rp.killLastLen = len([]rune(s))
+				lb.insertStr(s)
+				redraw()
+			case k.code == keyAltY:
+				if rp.searchMode || rp.killIdx < 0 || len(rp.killRing) == 0 {
+					bell(rp.out)
+					continue
+				}
+				// Replace last yank with previous ring entry (cycling).
+				for i := 0; i < rp.killLastLen && lb.pos > 0; i++ {
+					lb.pos--
+				}
+				lb.text = append(lb.text[:lb.pos], lb.text[lb.pos+rp.killLastLen:]...)
+				rp.killIdx--
+				if rp.killIdx < 0 {
+					rp.killIdx = len(rp.killRing) - 1
+				}
+				s := rp.killRing[rp.killIdx]
+				rp.killLastLen = len([]rune(s))
+				lb.insertStr(s)
+				redraw()
+			case k.code == keyCtrlUnderscore:
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
+				if rp.doUndo(lb) {
+					rp.anyEdit()
+					redraw()
+				} else {
+					bell(rp.out)
+				}
 			case k.code == keyCtrlL:
 				// Clear screen, redraw prompt+line.
 				fmt.Fprint(rp.out, "\x1b[H\x1b[2J")
@@ -474,7 +627,6 @@ func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (st
 					continue
 				}
 				rp.doTab(lb, rn, redraw)
-				_ = killBuf
 			case k.r != 0:
 				if rp.searchMode {
 					if k.code == keyEscape {
@@ -487,7 +639,9 @@ func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (st
 				if k.code == keyEscape {
 					continue // lone Alt ignored
 				}
+				rp.pushUndo(lb)
 				lb.insert(k.r)
+				rp.anyEdit()
 				redraw()
 			default:
 				// Unknown escape: ignore.
