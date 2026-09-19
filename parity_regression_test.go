@@ -14,10 +14,10 @@ package main
 //     and structural output.
 
 import (
-	"os/exec"
 	"bytes"
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -863,5 +863,147 @@ func TestParityMisc(t *testing.T) {
 	out, _, err = runParityScript(t, dir, "printf 'hello' | gzip | zcat")
 	if exitCode(err) != 0 || out != "hello" {
 		t.Errorf("zcat = %q code %d", out, exitCode(err))
+	}
+}
+
+func TestParityLongLines(t *testing.T) {
+	dir := t.TempDir()
+	// REGRESSION (vscode real corpus): lines longer than 1MB must NOT be
+	// dropped. bufio.Scanner capped at 1MB and silently skipped a 1.3MB
+	// minified line (grep found 31894 instead of 31895 exports).
+	long := strings.Repeat("x", 2_000_000) + "NEEDLE" + strings.Repeat("y", 100) + "\n"
+	mustWrite(t, filepath.Join(dir, "long.txt"), long)
+	out, _, err := runParityScript(t, dir, "grep -c NEEDLE long.txt")
+	if exitCode(err) != 0 || out != "1\n" {
+		t.Errorf("grep long line = %q code %d; want 1", out, exitCode(err))
+	}
+	out, _, err = runParityScript(t, dir, "grep NEEDLE long.txt | wc -c")
+	if exitCode(err) != 0 || strings.TrimSpace(out) != "2000107" {
+		t.Errorf("grep long passthrough = %q code %d", out, exitCode(err))
+	}
+	// Every other line-oriented tool must survive long lines too.
+	for _, src := range []string{
+		"head -n 1 long.txt | wc -c",
+		"tail -n 1 long.txt | wc -c",
+		"sort long.txt | wc -c",
+		"cat long.txt | wc -c",
+		"cut -c1-10 long.txt | wc -c",
+		"rev long.txt | wc -c",
+		"tac long.txt | wc -c",
+		"uniq long.txt | wc -c",
+		"nl long.txt | wc -c",
+		"head -c 100 long.txt | wc -c",
+	} {
+		out, serr, err := runParityScript(t, dir, src)
+		if exitCode(err) != 0 || serr != "" || strings.TrimSpace(out) == "" || strings.TrimSpace(out) == "0" {
+			t.Errorf("%s = out %q err %q code %d", src, out, serr, exitCode(err))
+		}
+	}
+}
+
+func TestParityNewFlags(t *testing.T) {
+	dir := t.TempDir()
+	// grep -a/--text accepted (binary-as-text is the default).
+	out, _, err := runParityScript(t, dir, "printf 'hi\\n' | grep -a hi; printf 'hi\\n' | grep --text hi")
+	if exitCode(err) != 0 || out != "hi\nhi\n" {
+		t.Errorf("grep -a/--text = %q code %d", out, exitCode(err))
+	}
+	// kill -s/-n separate-arg signal selection.
+	_, serr, err := runParityScript(t, dir, "kill -s TERM 99999999")
+	if exitCode(err) != 1 || !strings.Contains(serr, "No such process") {
+		t.Errorf("kill -s TERM = err %q code %d", serr, exitCode(err))
+	}
+	_, serr, err = runParityScript(t, dir, "kill -n 9 99999999")
+	if exitCode(err) != 1 || !strings.Contains(serr, "No such process") {
+		t.Errorf("kill -n 9 = err %q code %d", serr, exitCode(err))
+	}
+	// hash: shell builtins hash trivially; unish builtins are not found.
+	_, _, err = runParityScript(t, dir, "hash echo; hash printf")
+	if exitCode(err) != 0 {
+		t.Errorf("hash builtins code = %d; want 0", exitCode(err))
+	}
+	_, serr, err = runParityScript(t, dir, "hash ls")
+	if exitCode(err) != 1 || !strings.Contains(serr, "not found") {
+		t.Errorf("hash ls = err %q code %d", serr, exitCode(err))
+	}
+	// ulimit combined hardness+resource flags.
+	out, _, err = runParityScript(t, dir, "ulimit -Sn; ulimit -Hn")
+	if exitCode(err) != 0 || len(strings.Split(strings.TrimSpace(out), "\n")) != 2 {
+		t.Errorf("ulimit -Sn/-Hn = %q code %d", out, exitCode(err))
+	}
+	// sort -o writes to file; -V version-sorts; -s accepted.
+	out, _, err = runParityScript(t, dir, "printf 'b\\na\\n' | sort -o sorted.txt; cat sorted.txt")
+	if exitCode(err) != 0 || out != "a\nb\n" {
+		t.Errorf("sort -o = %q code %d", out, exitCode(err))
+	}
+	out, _, _ = runParityScript(t, dir, "printf 'v1.10\\nv1.2\\n' | sort -V")
+	if out != "v1.2\nv1.10\n" {
+		t.Errorf("sort -V = %q", out)
+	}
+	// join -v suppresses joined lines.
+	mustWrite(t, filepath.Join(dir, "j1.txt"), "1 a\n2 b\n3 c\n")
+	mustWrite(t, filepath.Join(dir, "j2.txt"), "2 x\n3 y\n")
+	out, _, err = runParityScript(t, dir, "join -v 1 j1.txt j2.txt")
+	if exitCode(err) != 0 || out != "1 a\n" {
+		t.Errorf("join -v = %q code %d", out, exitCode(err))
+	}
+	// find -newer compares mtimes.
+	_, _, err = runParityScript(t, dir, "touch -d '2020-01-01' old.txt; touch new.txt")
+	if exitCode(err) != 0 {
+		t.Fatalf("setup touch: %v", err)
+	}
+	out, _, _ = runParityScript(t, dir, "find . -maxdepth 1 -newer old.txt -name 'new.txt'")
+	if !strings.Contains(out, "new.txt") {
+		t.Errorf("find -newer = %q", out)
+	}
+	// touch -r copies mtime from reference.
+	_, _, err = runParityScript(t, dir, "printf hi > ref.txt; touch -r ref.txt copy.txt")
+	if exitCode(err) != 0 {
+		t.Errorf("touch -r code = %d", exitCode(err))
+	}
+	// ls -m/-C/-x/-i accepted.
+	out, _, err = runParityScript(t, dir, "mkdir -p h1; touch h1/b h1/a h1/c; ls -m h1; ls -C h1; ls -x h1; ls -i h1 | head -3")
+	if exitCode(err) != 0 || !strings.Contains(out, "a, b, c") {
+		t.Errorf("ls flags = %q code %d", out, exitCode(err))
+	}
+	// tar --exclude=all yields empty valid archive, rc 0.
+	_, _, err = runParityScript(t, dir, "mkdir -p t1; echo hi > t1/a.txt; tar -cf t.tar --exclude=t1 t1")
+	if exitCode(err) != 0 {
+		t.Errorf("tar --exclude code = %d", exitCode(err))
+	}
+	// tr -t truncates SET1.
+	out, _, _ = runParityScript(t, dir, "printf 'abc\\n' | tr -t 'abcd' 'XY'")
+	if out != "XYc\n" {
+		t.Errorf("tr -t = %q", out)
+	}
+	// base64 -i accepted.
+	out, _, err = runParityScript(t, dir, "printf 'hi' | base64 | base64 -d -i; echo")
+	if exitCode(err) != 0 || out != "hi\n" {
+		t.Errorf("base64 -i = %q code %d", out, exitCode(err))
+	}
+	// uniq --group separates groups with blank lines.
+	out, _, _ = runParityScript(t, dir, "printf 'a\\na\\nb\\nb\\nc\\n' | uniq --group")
+	if out != "a\na\n\nb\nb\n\nc\n" {
+		t.Errorf("uniq --group = %q", out)
+	}
+	// hexdump -s on a pipe warns Illegal seek, exit 1 (GNU).
+	_, serr, err = runParityScript(t, dir, "printf 'abcdef' | hexdump -C -s 3")
+	if exitCode(err) != 1 || !strings.Contains(serr, "Illegal seek") {
+		t.Errorf("hexdump -s pipe = err %q code %d", serr, exitCode(err))
+	}
+	// hexdump -e byte format.
+	out, _, _ = runParityScript(t, dir, "printf 'AB' | hexdump -e '1/1 \"%02x \"'; echo")
+	if out != "41 42 \n" {
+		t.Errorf("hexdump -e = %q", out)
+	}
+	// split -n creates N chunk files.
+	_, _, err = runParityScript(t, dir, "seq 1 6 > sp.txt; split -n 2 sp.txt spp_; ls spp_* | wc -l")
+	if exitCode(err) != 0 {
+		t.Errorf("split -n code = %d", exitCode(err))
+	}
+	// mv -v GNU wording.
+	out, _, _ = runParityScript(t, dir, "echo new > mv1.txt; mv -v mv1.txt mv2.txt")
+	if out != "renamed 'mv1.txt' -> 'mv2.txt'\n" {
+		t.Errorf("mv -v = %q", out)
 	}
 }

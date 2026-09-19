@@ -1,14 +1,13 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
-	"net"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -346,7 +345,7 @@ var flagSpecs = map[string]flagSpec{
 			"include": "include", "exclude-dir": "exclude-dir", "color": "",
 			"line-regexp": "x", "word-regexp": "w", "with-filename": "H",
 			"no-messages": "s",
-			"label": "label",
+			"label":       "label",
 		},
 	},
 	"head": {bools: "qv", values: "nc", long: map[string]string{
@@ -369,7 +368,7 @@ var flagSpecs = map[string]flagSpec{
 		"max-line-length": "L",
 	}},
 	"tee": {bools: "a", values: "", long: map[string]string{"append": "a"}},
-	"tr":  {bools: "dsc", values: "", long: map[string]string{
+	"tr": {bools: "dsc", values: "", long: map[string]string{
 		"delete": "d", "squeeze-repeats": "s", "complement": "c",
 	}},
 	"cut": {bools: "s", values: "dfcb", long: map[string]string{
@@ -409,7 +408,7 @@ var flagSpecs = map[string]flagSpec{
 	"df": {bools: "hkP", values: "", long: map[string]string{
 		"human-readable": "h",
 	}},
-	"ps": {bools: "aefu", values: "", long: map[string]string{}},
+	"ps":   {bools: "aefu", values: "", long: map[string]string{}},
 	"free": {bools: "mhg", values: "", long: map[string]string{}},
 	"stat": {bools: "", values: "c", long: map[string]string{}},
 	"ss": {bools: "tulnpa", values: "", long: map[string]string{
@@ -490,12 +489,12 @@ var flagSpecs = map[string]flagSpec{
 	"strings": {bools: "ao", values: "nt", long: map[string]string{
 		"radix": "t",
 	}},
-	"md5sum":  {bools: "bt", values: ""},
-	"sha1sum": {bools: "bt", values: ""},
+	"md5sum":    {bools: "bt", values: ""},
+	"sha1sum":   {bools: "bt", values: ""},
 	"sha256sum": {bools: "bt", values: ""},
-	"readlink": {bools: "fm", values: ""},
-	"realpath": {bools: "em", values: ""},
-	"basename": {bools: "a", values: "s"},
+	"readlink":  {bools: "fm", values: ""},
+	"realpath":  {bools: "em", values: ""},
+	"basename":  {bools: "a", values: "s"},
 	"od": {bools: "Anvxcdu", values: "tNfwjA", long: map[string]string{
 		"format": "t", "address-radix": "A", "output-duplicates": "",
 		"read-bytes": "N", "skip-bytes": "j", "width": "w",
@@ -758,8 +757,7 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	ln := 0
 	prevBlank := false
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			blank := line == ""
@@ -888,10 +886,10 @@ func cmdWhich(_ context.Context, hc interp.HandlerContext, args []string) error 
 
 func isKnownCoreutil(name string) bool {
 	switch name {
-		case "ls", "cat", "cp", "mv", "rm", "mkdir", "touch",
-			"chmod", "find", "mktemp", "xargs", "gzip", "gunzip",
-			"gzcat", "tar", "base64", "shasum":
-			return true
+	case "ls", "cat", "cp", "mv", "rm", "mkdir", "touch",
+		"chmod", "find", "mktemp", "xargs", "gzip", "gunzip",
+		"gzcat", "tar", "base64", "shasum":
+		return true
 	}
 	return false
 }

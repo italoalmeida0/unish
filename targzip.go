@@ -1,8 +1,8 @@
 package main
 
 import (
-	"bytes"
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"flag"
@@ -31,6 +31,8 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs.BoolVar(keepOld, "keep-old-files", false, "")
 	absNames := fs.Bool("P", false, "")
 	fs.BoolVar(absNames, "absolute-names", false, "")
+	excludes := []string{}
+	fs.Var(stringListFlag(&excludes), "exclude", "")
 	file := fs.String("f", "", "")
 	dir := fs.String("C", "", "")
 	if err := fs.Parse(rawArgs); err != nil {
@@ -57,7 +59,7 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	archive := resolve(hc.Dir, *file)
 	switch {
 	case *create:
-		return tarCreate(hc, archive, base, fs.Args(), *zip, *verb)
+		return tarCreate(hc, archive, base, filterTarExcludes(fs.Args(), excludes), *zip, *verb)
 	case *extract:
 		return tarExtract(hc, archive, base, fs.Args(), *zip, *verb)
 	default:
@@ -83,8 +85,18 @@ func tarOpenWriter(hc interp.HandlerContext, archive string, zip bool) (io.Write
 
 func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, zip, verb bool) error {
 	if len(paths) == 0 {
-		fmt.Fprintln(hc.Stderr, "tar: missing operand")
-		return flag.ErrHelp
+		// GNU: excluding everything yields an empty (valid) archive, rc 0.
+		f, gz, tw, err := tarOpenWriter(hc, archive, zip)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "tar:", err)
+			return exitError{1}
+		}
+		tw.Close()
+		if gz != nil {
+			gz.Close()
+		}
+		f.Close()
+		return nil
 	}
 	f, gz, tw, err := tarOpenWriter(hc, archive, zip)
 	if err != nil {
@@ -454,4 +466,28 @@ func isWithinDir(base, target string) bool {
 		return false
 	}
 	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+func filterTarExcludes(paths, excludes []string) []string {
+	if len(excludes) == 0 {
+		return paths
+	}
+	var out []string
+	for _, p := range paths {
+		skip := false
+		for _, e := range excludes {
+			e = strings.Trim(e, "'\"")
+			if e == "" {
+				continue
+			}
+			if p == e || strings.HasPrefix(p, strings.TrimSuffix(e, "/")+"/") {
+				skip = true
+				break
+			}
+		}
+		if !skip {
+			out = append(out, p)
+		}
+	}
+	return out
 }

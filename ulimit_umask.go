@@ -76,8 +76,11 @@ func cmdUlimit(_ context.Context, hc interp.HandlerContext, args []string) error
 			showAll = true
 		case a == "-n" || a == "-u" || a == "-f" || a == "-c" || a == "-d" || a == "-s" || a == "-v" || a == "-m":
 			resource = strings.TrimPrefix(a, "-")
-		case len(a) > 1 && a[0] == '-' && isDigits(a[1:]):
-			// Combined like -Hn/-Sn: ignore hardness prefix, take resource.
+		case (len(a) == 3 && a[0] == '-' && (a[1] == 'H' || a[1] == 'S')) ||
+			(len(a) == 4 && a[0] == '-' && a[1] == 'H' && a[2] == 'S') ||
+			(len(a) == 4 && a[0] == '-' && a[1] == 'S' && a[2] == 'H'):
+			// Combined hardness+resource like -Sn/-Hn/-HSn: hardness
+			// is accepted and ignored; resource is the last letter.
 			resource = a[len(a)-1:]
 		case a == "-H" || a == "-S":
 		case strings.HasPrefix(a, "-"):

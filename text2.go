@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"context"
 	"encoding/binary"
 	"flag"
@@ -449,6 +448,7 @@ func writeOdInt(sb *strings.Builder, kind string, v uint64, sv int64, size int) 
 		fmt.Fprintf(sb, "%*d", w, v)
 	}
 }
+
 type stringListFlagT struct{ p *[]string }
 
 func stringListFlag(p *[]string) flag.Value { return stringListFlagT{p} }
@@ -501,8 +501,7 @@ func cmdNl(_ context.Context, hc interp.HandlerContext, args []string) error {
 	n := *start
 	w := int(*width)
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			if number(line == "") {
@@ -600,8 +599,7 @@ func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	defer closeAll()
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			rs := []rune(sc.Text())
 			for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
@@ -790,8 +788,7 @@ func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error
 	}
 	defer closeAll()
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			var sb strings.Builder
@@ -848,8 +845,7 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 	}
 	defer closeAll()
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			var sb strings.Builder
@@ -918,6 +914,8 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 	af2 := fs.Bool("a2", false, "")
 	af := []string{}
 	fs.Var(stringListFlag(&af), "a", "")
+	suppress := []string{}
+	fs.Var(stringListFlag(&suppress), "v", "")
 	outFmt := fs.String("o", "", "")
 	ignoreCase := fs.Bool("i", false, "")
 	fs.BoolVar(ignoreCase, "ignore-case", false, "")
@@ -950,6 +948,19 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 				printUnpaired[1] = true
 			} else if p == "2" {
 				printUnpaired[2] = true
+			}
+		}
+	}
+	// GNU -v FILENUM: like -a FILENUM but suppress joined output lines.
+	suppressJoined := false
+	for _, a := range suppress {
+		for _, p := range strings.Fields(a) {
+			if p == "1" {
+				printUnpaired[1] = true
+				suppressJoined = true
+			} else if p == "2" {
+				printUnpaired[2] = true
+				suppressJoined = true
 			}
 		}
 	}
@@ -992,8 +1003,7 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 	readTable := func(path string) ([][]string, error) {
 		if path == "-" {
 			var rows [][]string
-			sc := bufio.NewScanner(hc.Stdin)
-			sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+			sc := newLineReader(hc.Stdin)
 			for sc.Scan() {
 				rows = append(rows, splitter(sc.Text()))
 			}
@@ -1006,8 +1016,7 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		defer f.Close()
 		var rows [][]string
-		sc := bufio.NewScanner(f)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(f)
 		for sc.Scan() {
 			rows = append(rows, splitter(sc.Text()))
 		}
@@ -1143,6 +1152,10 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 					break
 				}
 				j2++
+			}
+			if suppressJoined {
+				i, j = i2, j2
+				continue
 			}
 			for a := i; a < i2; a++ {
 				for b := j; b < j2; b++ {

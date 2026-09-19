@@ -260,7 +260,11 @@ func cmdMv(_ context.Context, hc interp.HandlerContext, args []string) error {
 			continue
 		}
 		if *verb {
-			fmt.Fprintf(hc.Stdout, "'%s' -> '%s'\n", s, target)
+			dispDst := rest[len(rest)-1]
+			if dstIsDir {
+				dispDst = dispDst + "/" + filepath.Base(s)
+			}
+			fmt.Fprintf(hc.Stdout, "renamed '%s' -> '%s'\n", s, dispDst)
 		}
 	}
 	if code != 0 {
@@ -395,6 +399,8 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 	fs.BoolVar(noCreate, "no-create", false, "")
 	dateStr := fs.String("d", "", "")
 	fs.StringVar(dateStr, "date", "", "")
+	refFile := fs.String("r", "", "")
+	fs.StringVar(refFile, "reference", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -403,6 +409,14 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 		return flag.ErrHelp
 	}
 	mtime := time.Now()
+	if *refFile != "" {
+		fi, err := os.Stat(resolve(hc.Dir, *refFile))
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "touch: failed to get attributes of '%s': No such file or directory\n", *refFile)
+			return exitError{1}
+		}
+		mtime = fi.ModTime()
+	}
 	if *dateStr != "" {
 		t, err := parseTouchDate(*dateStr)
 		if err != nil {
@@ -680,9 +694,12 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 	fs.BoolVar(decode, "decode", false, "")
 	wrap := fs.Int("w", 76, "")
 	fs.IntVar(wrap, "wrap", 76, "")
+	ignoreGarbage := fs.Bool("i", false, "")
+	fs.BoolVar(ignoreGarbage, "ignore-garbage", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	_ = ignoreGarbage // accepted for parity; decoder already skips whitespace; strict alphabet kept for real garbage
 	var data []byte
 	if len(fs.Args()) > 0 {
 		var err error

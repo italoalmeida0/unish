@@ -112,8 +112,17 @@ func cmdHashTable(_ context.Context, hc interp.HandlerContext, args []string) er
 		}
 		return nil
 	}
-	// `hash name...`: record current locations.
+	// `hash name...`: record current locations. Like bash, shell
+	// builtins hash trivially (rc 0, no table entry needed);
+	// unish builtins are NOT hashable (bash: not found).
 	for _, n := range names {
+		if interp.IsBuiltin(n) {
+			continue
+		}
+		if lookupExtra(n) != nil {
+			fmt.Fprintf(hc.Stderr, "hash: %s: not found\n", n)
+			return exitError{1}
+		}
 		if p, err := findExec(hc, n); err == nil {
 			e, ok := globalHash.entries[n]
 			if !ok {

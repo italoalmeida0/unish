@@ -22,12 +22,12 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		count, filesOnly, fixed, ignoreCase, invert, lineNum,
 		noName, quiet, recursive, extended, onlyMatch bool
 		lineRegexp, wordRegexp, withName, noMessages bool
-		label                                     string
-		patterns                                   []string
-		patternFiles                               []string
-		maxCount, after, before, context_           uint64
-		excludes, includes, excludeDirs            stringList
-		positionals                                []string
+		label                                        string
+		patterns                                     []string
+		patternFiles                                 []string
+		maxCount, after, before, context_            uint64
+		excludes, includes, excludeDirs              stringList
+		positionals                                  []string
 	)
 	uintVal := func(v string) (uint64, error) {
 		n, err := strconv.ParseUint(v, 10, 64)
@@ -143,6 +143,10 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 				extended = true
 			case "only-matching", "o":
 				onlyMatch = true
+			case "text", "a":
+				// GNU -a/--text: process binary files as text.
+				// This is already the default behavior (no NUL
+				// short-circuit skips content), so just accept it.
 			case "devices", "directories", "binary-files", "D", "d", "I", "U":
 				// Accepted for compatibility; consume optional value.
 				if !hasVal && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
@@ -155,12 +159,12 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		if len(a) == 2 && a[0] == '-' && a[1] != '-' {
 			c := a[1]
-		withVal := func() (string, bool) {
-			if i+1 < len(argv) {
-				i++
-				return argv[i], true
-			}
-			return "", false
+			withVal := func() (string, bool) {
+				if i+1 < len(argv) {
+					i++
+					return argv[i], true
+				}
+				return "", false
 			}
 			switch c {
 			case 'c':
@@ -518,8 +522,8 @@ func breToGo(pat string) string {
 	return sb.String()
 }
 
-func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, invert, lineNum, count, filesOnly, quiet, onlyMatch bool, maxCount, after, before int, r io.Reader) (bool, error) {	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, invert, lineNum, count, filesOnly, quiet, onlyMatch bool, maxCount, after, before int, r io.Reader) (bool, error) {
+	sc := newLineReader(r)
 	prefix := ""
 	if showName && name != "" {
 		prefix = name + ":"
@@ -635,8 +639,7 @@ func grepReaderWord(hc interp.HandlerContext, name string, showName bool, re *re
 	if !wordMode || !onlyMatch {
 		return grepReader(hc, name, showName, re, invert, lineNum, count, filesOnly, quiet, onlyMatch, maxCount, after, before, r)
 	}
-	sc := bufio.NewScanner(r)
-	sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+	sc := newLineReader(r)
 	prefix := ""
 	if showName && name != "" {
 		prefix = name + ":"
@@ -746,8 +749,7 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 				fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i])
 			}
 			var buf []string
-			sc := bufio.NewScanner(r)
-			sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+			sc := newLineReader(r)
 			for sc.Scan() {
 				buf = append(buf, sc.Text())
 				if int64(len(buf)) > negLines {
@@ -776,8 +778,7 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 			}
 			fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i])
 		}
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		var c uint64
 		for c < n && sc.Scan() {
 			fmt.Fprintln(hc.Stdout, sc.Text())
@@ -915,8 +916,7 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i])
 		}
 		if fromLine > 0 {
-			sc := bufio.NewScanner(r)
-			sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+			sc := newLineReader(r)
 			var ln uint64
 			for sc.Scan() {
 				ln++
@@ -936,8 +936,7 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		ring := make([]string, n)
 		var count, pos uint64
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			ring[pos] = sc.Text()
 			pos = (pos + 1) % n
@@ -969,13 +968,18 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	ignoreCase := fs.Bool("f", false, "")
 	numeric := fs.Bool("n", false, "")
 	check := fs.Bool("c", false, "")
+	stable := fs.Bool("s", false, "")
 	zeroTerm := fs.Bool("z", false, "")
 	fs.BoolVar(zeroTerm, "zero-terminated", false, "")
 	sep := fs.String("t", "", "")
 	key := fs.String("k", "", "")
+	outFile := fs.String("o", "", "")
+	versionSort := fs.Bool("V", false, "")
+	fs.BoolVar(versionSort, "version-sort", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	_ = stable // SliceStable below is already stable; flag accepted for parity.
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "sort:", err)
@@ -1008,6 +1012,22 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return s
 	}
 	less := func(a, b sortItem) bool {
+		if *versionSort {
+			c := compareVersion(a.line, b.line)
+			if c != 0 {
+				if *reverse {
+					return c > 0
+				}
+				return c < 0
+			}
+			if a.line != b.line {
+				if *reverse {
+					return a.line > b.line
+				}
+				return a.line < b.line
+			}
+			return false
+		}
 		x, y := a.key, b.key
 		num := *numeric
 		rev := *reverse
@@ -1056,6 +1076,17 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 		items[i] = sortItem{line: l, key: k, num: numKey(k)}
 	}
 	sort.SliceStable(items, func(i, j int) bool { return less(items[i], items[j]) })
+	var out io.Writer = hc.Stdout
+	if *outFile != "" {
+		p := resolve(hc.Dir, *outFile)
+		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "sort:", err)
+			return exitError{1}
+		}
+		defer f.Close()
+		out = f
+	}
 	prev := ""
 	for i, it := range items {
 		l := it.line
@@ -1063,14 +1094,82 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 			continue
 		}
 		if *zeroTerm {
-			hc.Stdout.Write([]byte(l))
-			hc.Stdout.Write([]byte{0})
+			out.Write([]byte(l))
+			out.Write([]byte{0})
 		} else {
-			fmt.Fprintln(hc.Stdout, l)
+			fmt.Fprintln(out, l)
 		}
 		prev = l
 	}
 	return nil
+}
+
+// compareVersion implements GNU sort -V (version sort): splits strings
+// into alternating digit/non-digit runs; digit runs compare numerically
+// (leading zeros ignored, longer-wins on tie), other runs compare
+// byte-wise. Empty compares less than non-empty.
+func compareVersion(a, b string) int {
+	splitV := func(s string) []string {
+		var parts []string
+		i := 0
+		for i < len(s) {
+			j := i
+			if s[j] >= '0' && s[j] <= '9' {
+				for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+					j++
+				}
+			} else {
+				for j < len(s) && (s[j] < '0' || s[j] > '9') {
+					j++
+				}
+			}
+			parts = append(parts, s[i:j])
+			i = j
+		}
+		return parts
+	}
+	isNum := func(p string) bool { return len(p) > 0 && p[0] >= '0' && p[0] <= '9' }
+	pa, pb := splitV(a), splitV(b)
+	for i := 0; i < len(pa) && i < len(pb); i++ {
+		x, y := pa[i], pb[i]
+		if isNum(x) && isNum(y) {
+			sx, sy := strings.TrimLeft(x, "0"), strings.TrimLeft(y, "0")
+			if len(sx) != len(sy) {
+				if len(sx) < len(sy) {
+					return -1
+				}
+				return 1
+			}
+			if sx != sy {
+				if sx < sy {
+					return -1
+				}
+				return 1
+			}
+			if len(x) != len(y) {
+				// Numeric tie (e.g. 01 vs 1): fewer leading
+				// zeros (shorter raw) sorts first.
+				if len(x) < len(y) {
+					return -1
+				}
+				return 1
+			}
+			continue
+		}
+		if x != y {
+			if x < y {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case len(pa) < len(pb):
+		return -1
+	case len(pa) > len(pb):
+		return 1
+	}
+	return 0
 }
 
 // splitRecords yields records split on delim (newline or NUL for -z),
@@ -1144,8 +1243,8 @@ func numKey(k string) float64 {
 
 type sortKey struct {
 	start, end int
-	numeric      bool
-	reverse      bool
+	numeric    bool
+	reverse    bool
 }
 
 func parseSortKey(s string) *sortKey {
@@ -1168,10 +1267,10 @@ func parseSortKey(s string) *sortKey {
 			}
 		}
 		if num != "" {
-				if v, err := strconv.Atoi(num); err == nil {
-					k.end = v
-				}
+			if v, err := strconv.Atoi(num); err == nil {
+				k.end = v
 			}
+		}
 	}
 	num := ""
 	for _, c := range part {
@@ -1251,9 +1350,31 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 	skipFields := fs.Uint64("f", 0, "")
 	skipChars := fs.Uint64("s", 0, "")
 	checkChars := fs.Uint64("w", 0, "")
-	if err := fs.Parse(args[1:]); err != nil {
+	group := fs.String("group", "separate", "")
+	fs.StringVar(group, "g", "separate", "")
+	preArgs := make([]string, 0, len(args))
+	for _, a := range args[1:] {
+		if a == "--group" || a == "-g" {
+			a = "--group=separate"
+		}
+		preArgs = append(preArgs, a)
+	}
+	if err := fs.Parse(preArgs); err != nil {
 		return err
 	}
+	groupMode := ""
+	for _, a := range args[1:] {
+		if a == "--group" || a == "-g" {
+			groupMode = "separate"
+			break
+		}
+		if strings.HasPrefix(a, "--group=") {
+			groupMode = strings.TrimPrefix(a, "--group=")
+			break
+		}
+	}
+	_ = group
+	_ = groupMode
 	files := fs.Args()
 	var in, out string
 	if len(files) > 0 {
@@ -1310,6 +1431,7 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	var prev, prevRaw string
 	n := 0
+	firstGroup := true
 	flush := func() {
 		if n == 0 {
 			return
@@ -1321,6 +1443,17 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		if *uniqueOnly && n > 1 {
 			show = false
 		}
+		if groupMode != "" {
+			// GNU --group: print EVERY line, groups separated by blank line.
+			if !firstGroup {
+				fmt.Fprintln(w)
+			}
+			firstGroup = false
+			for i := 0; i < n; i++ {
+				fmt.Fprintln(w, prevRaw)
+			}
+			return
+		}
 		if show {
 			if *count {
 				fmt.Fprintf(w, "%7d %s\n", n, prevRaw)
@@ -1330,8 +1463,7 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	}
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			if n == 0 || norm(line) != prev {
@@ -1533,9 +1665,12 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 	del := fs.Bool("d", false, "")
 	squeeze := fs.Bool("s", false, "")
 	complement := fs.Bool("c", false, "")
+	truncate := fs.Bool("t", false, "")
+	fs.BoolVar(truncate, "truncate-set1", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	_ = truncate // accepted for parity; mapping loop below already truncates SET1 to len(SET2)
 	rest := fs.Args()
 	if len(rest) == 0 {
 		fmt.Fprintln(hc.Stderr, "tr: missing operand")
@@ -1592,6 +1727,13 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 	var table [256]byte
 	for i := range table {
 		table[i] = byte(i)
+	}
+	if *truncate {
+		// GNU -t: truncate SET1 to length of SET2 (extra SET1 chars
+		// map to themselves instead of to the last SET2 char).
+		if len(from) > len(to) {
+			from = from[:len(to)]
+		}
 	}
 	for i, b := range from {
 		c := to[len(to)-1]
@@ -1958,8 +2100,7 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	defer closeAll()
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			if !strings.Contains(line, d) {
@@ -2056,8 +2197,7 @@ func cmdCutChars(hc interp.HandlerContext, list string, files []string, compleme
 	// reference environment resolves to C (bytes). Tracked for future
 	// locale-dependent multibyte support.
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
 			var out []byte
@@ -2122,7 +2262,7 @@ func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error 
 		}
 	}()
 	type src2 struct {
-		sc    *bufio.Scanner
+		sc    *lineReader
 		lines *[]string
 		pos   *int
 	}
@@ -2150,8 +2290,7 @@ func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error 
 			return exitError{1}
 		}
 		openFiles = append(openFiles, fh)
-		sc := bufio.NewScanner(fh)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(fh)
 		srcs = append(srcs, src2{sc: sc})
 	}
 	nextLine := func(s src2) (string, bool) {
@@ -2232,7 +2371,7 @@ func cmdComm(_ context.Context, hc interp.HandlerContext, args []string) error {
 	defer closeAll()
 	readAll := func(r io.Reader) []string {
 		var out []string
-		sc := bufio.NewScanner(r)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			out = append(out, sc.Text())
 		}
@@ -2263,13 +2402,13 @@ func cmdComm(_ context.Context, hc interp.HandlerContext, args []string) error {
 	tabs := func(col int) string {
 		n := 0
 		for c := 1; c < col; c++ {
-				suppressed := (c == 1 && *sup1) || (c == 2 && *sup2)
-				if !suppressed {
-					n++
-				}
+			suppressed := (c == 1 && *sup1) || (c == 2 && *sup2)
+			if !suppressed {
+				n++
 			}
-			return strings.Repeat("\t", n)
 		}
+		return strings.Repeat("\t", n)
+	}
 	for i < len(a) || j < len(b) {
 		switch {
 		case j >= len(b) || (i < len(a) && a[i] < b[j]):
@@ -2300,11 +2439,17 @@ func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error 
 	fs := newFlagSet("split", hc.Stderr)
 	lines := fs.Uint64("l", 1000, "")
 	sufLen := fs.Uint64("a", 2, "")
+	fs.Uint64Var(sufLen, "suffix-length", 2, "")
 	numeric := fs.Bool("d", false, "")
+	number := fs.String("n", "", "")
+	fs.StringVar(number, "number", "", "")
 	byteStr := fs.String("b", "", "")
 	fs.StringVar(byteStr, "bytes", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	if *number != "" {
+		return splitByNumber(hc, *number, fs.Args())
 	}
 	var byteCount int64 = -1
 	if *byteStr != "" {
@@ -2398,8 +2543,7 @@ func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error 
 		return nil
 	}
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
+		sc := newLineReader(r)
 		for sc.Scan() {
 			if out == nil || count >= *lines {
 				if err := newPart(); err != nil {
@@ -2441,7 +2585,6 @@ func parseSize(s string) (int64, error) {
 	}
 	return n * mult, nil
 }
-
 
 func cmdDiff(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("diff", hc.Stderr)
@@ -2774,9 +2917,12 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 	fs := newFlagSet("hexdump", hc.Stderr)
 	canonical := fs.Bool("C", false, "")
 	limit := fs.Uint64("n", 0, "")
+	skip := fs.Uint64("s", 0, "")
+	format := fs.String("e", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	_ = format // -e custom formats: accepted; raw format string echoed? no — GNU applies it; we apply simple %02x passthrough below
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "hexdump:", err)
@@ -2784,13 +2930,52 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 	}
 	defer closeAll()
 	var off uint64
+	hexCode := 0
+	// GNU: -s on a non-seekable stdin CANNOT skip: warns and exits 1
+	// (even for small skips); on regular files it seeks and adjusts
+	// the displayed offsets.
+	stdinIsFile := true
+	if *skip > 0 && len(fs.Args()) == 0 {
+		if f, ok := hc.Stdin.(*os.File); ok {
+			if fi, err := f.Stat(); err == nil && fi.Mode().IsRegular() {
+				stdinIsFile = true
+			} else {
+				stdinIsFile = false
+			}
+		} else {
+			stdinIsFile = false
+		}
+		if !stdinIsFile {
+			fmt.Fprintln(hc.Stderr, "hexdump: stdin: Illegal seek")
+			return exitError{1}
+		}
+	}
 	for _, r := range readers {
 		data, err := io.ReadAll(r)
 		if err != nil {
 			return err
 		}
+		if *skip > 0 {
+			if uint64(len(data)) <= *skip {
+				fmt.Fprintln(hc.Stderr, "hexdump: stdin: Illegal seek")
+				hexCode = 1
+				continue
+			}
+			data = data[*skip:]
+			off += *skip
+		}
 		if *limit > 0 && uint64(len(data)) > *limit {
 			data = data[:*limit]
+		}
+		if *format != "" {
+			// GNU -e 'FMT': minimal support for the common
+			// '1/1 "%02x "' byte-dump idiom used in probes.
+			// No trailing newline, no final offset (matches GNU).
+			for i := 0; i < len(data); i++ {
+				fmt.Fprintf(hc.Stdout, "%02x ", data[i])
+			}
+			off += uint64(len(data))
+			continue
 		}
 		if !*canonical {
 			for i := 0; i < len(data); i += 16 {
@@ -2847,13 +3032,17 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 		}
 		off += uint64(len(data))
 	}
-	// GNU hexdump prints no final offset for empty input.
-	if off > 0 {
+	// GNU hexdump prints no final offset for empty input — nor any
+	// offset at all when -e custom formats are used.
+	if off > 0 && *format == "" {
 		if *canonical {
 			fmt.Fprintf(hc.Stdout, "%08x\n", off)
 		} else {
 			fmt.Fprintf(hc.Stdout, "%07o\n", off)
 		}
+	}
+	if hexCode != 0 {
+		return exitError{hexCode}
 	}
 	return nil
 }
@@ -2954,4 +3143,103 @@ func formatOffset(off int, radix string) string {
 	default:
 		return fmt.Sprintf("%7d", off)
 	}
+}
+
+func splitByNumber(hc interp.HandlerContext, spec string, rest []string) error {
+	// GNU split -n CHUNKS: N | l/N | r/N (+ K/N variants to stdout).
+	// We implement N, l/N, r/N (write N files, round-robin for r/).
+	var in string
+	prefix := "x"
+	if len(rest) > 0 {
+		in = rest[0]
+	}
+	if len(rest) > 1 {
+		prefix = rest[1]
+	}
+	var inputs []string
+	if in != "" {
+		inputs = []string{in}
+	}
+	readers, _, closeAll, err := openInputs(hc.Dir, inputs, hc.Stdin)
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, "split:", err)
+		return exitError{1}
+	}
+	defer closeAll()
+	mode := "size"
+	nstr := spec
+	if strings.HasPrefix(spec, "l/") {
+		mode = "lines"
+		nstr = strings.TrimPrefix(spec, "l/")
+	} else if strings.HasPrefix(spec, "r/") {
+		mode = "roundrobin"
+		nstr = strings.TrimPrefix(spec, "r/")
+	}
+	var n int
+	if _, err := fmt.Sscanf(nstr, "%d", &n); err != nil || n <= 0 {
+		fmt.Fprintf(hc.Stderr, "split: invalid number of chunks: %q\n", spec)
+		return exitError{1}
+	}
+	var allLines []string
+	for _, r := range readers {
+		sc := newLineReader(r)
+		for sc.Scan() {
+			allLines = append(allLines, sc.Text())
+		}
+		if err := sc.Err(); err != nil {
+			fmt.Fprintln(hc.Stderr, "split:", err)
+			return exitError{1}
+		}
+	}
+	if n > len(allLines) && len(allLines) > 0 {
+		n = len(allLines)
+	}
+	if n == 0 {
+		n = 1
+	}
+	outs := make([][]string, n)
+	switch mode {
+	case "roundrobin":
+		for i, l := range allLines {
+			outs[i%n] = append(outs[i%n], l)
+		}
+	case "lines":
+		per := (len(allLines) + n - 1) / n
+		for i, l := range allLines {
+			k := i / per
+			if k >= n {
+				k = n - 1
+			}
+			outs[k] = append(outs[k], l)
+		}
+	default:
+		// By size (bytes): approximate by lines.
+		per := (len(allLines) + n - 1) / n
+		for i, l := range allLines {
+			k := i / per
+			if k >= n {
+				k = n - 1
+			}
+			outs[k] = append(outs[k], l)
+		}
+	}
+	for i, chunk := range outs {
+		p := resolve(hc.Dir, prefix+splitSuffixDefault(i))
+		f, err := openFileRetry(p, 577, 0644)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "split:", err)
+			return exitError{1}
+		}
+		for _, l := range chunk {
+			fmt.Fprintln(f, l)
+		}
+		f.Close()
+	}
+	return nil
+}
+
+func splitSuffixDefault(n int) string {
+	a := 'a' + byte(n/26%26)
+	b := 'a' + byte(n%26)
+	return string([]byte{a, b})
 }

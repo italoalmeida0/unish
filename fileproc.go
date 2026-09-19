@@ -339,8 +339,26 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 	}
 	sig := "TERM"
 	var pids []string
-	for _, a := range args[1:] {
+	argv2 := args[1:]
+	for i := 0; i < len(argv2); i++ {
+		a := argv2[i]
 		if a == "--" {
+			continue
+		}
+		// GNU: -s SIG / -n SIGNUM (separate arg) select the signal.
+		if (a == "-s" || a == "-n") && i+1 < len(argv2) {
+			i++
+			name := strings.ToUpper(argv2[i])
+			if strings.HasPrefix(name, "SIG") {
+				name = name[3:]
+			}
+			if a == "-n" {
+				if !validSignalNumber(name) {
+					fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", argv2[i])
+					return exitError{1}
+				}
+			}
+			sig = name
 			continue
 		}
 		if strings.HasPrefix(a, "-") && len(a) > 1 {
@@ -1000,6 +1018,18 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			return func(n *findNode, _ interp.HandlerContext) bool {
 				return matchPerm(n, modeStr)
 			}
+		case "-newer", "-anewer", "-cnewer":
+			ref := next()
+			refFull := resolve(hc.Dir, ref)
+			fi, err := os.Stat(refFull)
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", ref)
+				return func(*findNode, interp.HandlerContext) bool { return false }
+			}
+			refTime := fi.ModTime()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				return n.fi.ModTime().After(refTime)
+			}
 		case "-true":
 			return func(*findNode, interp.HandlerContext) bool { return true }
 		case "-false":
@@ -1074,7 +1104,6 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code)
 	}
 }
-
 
 func cmdMd5sum(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return cmdHash("md5sum", md5.New, hc, args)
@@ -1202,7 +1231,7 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 		if f == "-" {
 			data, err = io.ReadAll(hc.Stdin)
 		} else {
-		data, err = readShellFile(resolve(hc.Dir, f))
+			data, err = readShellFile(resolve(hc.Dir, f))
 		}
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, name+":", err)
@@ -1214,13 +1243,13 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
 			}
-		sum, path, ok := parseHashLine(line)
+			sum, path, ok := parseHashLine(line)
 			if !ok {
 				badFmt++
 				continue
 			}
 			checked++
-		raw, err := readShellFile(resolve(hc.Dir, path))
+			raw, err := readShellFile(resolve(hc.Dir, path))
 			if err != nil {
 				if !status {
 					fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", name, path, err)

@@ -25,6 +25,10 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	reverse := fs.Bool("r", false, "")
 	sortTime := fs.Bool("t", false, "")
 	oneCol := fs.Bool("1", false, "")
+	comma := fs.Bool("m", false, "")
+	cols := fs.Bool("C", false, "")
+	across := fs.Bool("x", false, "")
+	inode := fs.Bool("i", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -34,6 +38,10 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	_ = oneCol
 	_ = human
+	_ = comma
+	_ = cols
+	_ = across
+	_ = inode
 
 	code := 0
 	multi := len(names) > 1
@@ -46,7 +54,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 			continue
 		}
 		if !fi.IsDir() || *dirOnly {
-			printLsEntry(hc, name, full, fi, *long, *human, *classify, *quoted)
+			printLsEntryInode(hc, name, full, fi, *long, *human, *classify, *quoted, *inode)
 			continue
 		}
 		if multi {
@@ -57,7 +65,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		if *recurse {
 			first := true
-			if err := lsRecursive(hc, name, full, lsOpts{*all, *long, *human, *classify, *quoted, *sortSize, *reverse, *sortTime}, &first); err != nil {
+			if err := lsRecursive(hc, name, full, lsOpts{*all, *long, *human, *classify, *quoted, *sortSize, *reverse, *sortTime, *inode}, &first); err != nil {
 				code = 2
 			}
 			continue
@@ -68,8 +76,22 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 			code = 2
 			continue
 		}
-		for _, e := range entries {
-			printLsEntry(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *long, *human, *classify, *quoted)
+		if *comma {
+			var names2 []string
+			for _, e := range entries {
+				names2 = append(names2, lsDisplayName(e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *classify, *quoted))
+			}
+			fmt.Fprintln(hc.Stdout, strings.Join(names2, ", "))
+		} else if *cols || *across {
+			var names2 []string
+			for _, e := range entries {
+				names2 = append(names2, lsDisplayName(e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *classify, *quoted))
+			}
+			fmt.Fprintln(hc.Stdout, strings.Join(names2, "  "))
+		} else {
+			for _, e := range entries {
+				printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *long, *human, *classify, *quoted, *inode)
+			}
 		}
 	}
 	if code != 0 {
@@ -80,6 +102,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 
 type lsOpts struct {
 	all, long, human, classify, quoted, sortSize, reverse, sortTime bool
+	inode                                                           bool
 }
 
 func lsRecursive(hc interp.HandlerContext, display, full string, o lsOpts, first *bool) error {
@@ -94,7 +117,7 @@ func lsRecursive(hc interp.HandlerContext, display, full string, o lsOpts, first
 	*first = false
 	fmt.Fprintf(hc.Stdout, "%s:\n", display)
 	for _, e := range entries {
-		printLsEntry(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), o.long, o.human, o.classify, o.quoted)
+		printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), o.long, o.human, o.classify, o.quoted, o.inode)
 	}
 	for _, e := range entries {
 		// Never descend into "." or ".." (infinite recursion); GNU
@@ -294,4 +317,43 @@ func lsSize(fi os.FileInfo, human bool) string {
 		return humanSize(fi.Size())
 	}
 	return fmt.Sprintf("%d", fi.Size())
+}
+
+func lsDisplayName(display, full string, fi os.FileInfo, classify, quoted bool) string {
+	name := display
+	if quoted {
+		name = fmt.Sprintf("%q", display)
+	}
+	if classify && fi != nil {
+		name += lsIndicator(fi)
+	}
+	return name
+}
+
+func printLsEntryInode(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted, inode bool) {
+	if inode && !long {
+		var ino string
+		if _, err := os.Lstat(full); err == nil {
+			ino = fmt.Sprintf("%d", inodeOf(full))
+		} else {
+			ino = "?"
+		}
+		fmt.Fprintf(hc.Stdout, "%s %s\n", ino, lsDisplayName(display, full, fi, classify, quoted))
+		return
+	}
+	if inode && long {
+		var ino string
+		if _, err := os.Lstat(full); err == nil {
+			ino = fmt.Sprintf("%d", inodeOf(full))
+		} else {
+			ino = "?"
+		}
+		// GNU puts inode first; keep long format after it.
+		old := hc.Stdout
+		_ = old
+		fmt.Fprintf(hc.Stdout, "%s ", ino)
+		printLsEntry(hc, display, full, fi, long, human, classify, quoted)
+		return
+	}
+	printLsEntry(hc, display, full, fi, long, human, classify, quoted)
 }
