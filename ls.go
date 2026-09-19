@@ -97,6 +97,12 @@ func lsRecursive(hc interp.HandlerContext, display, full string, o lsOpts, first
 		printLsEntry(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), o.long, o.human, o.classify, o.quoted)
 	}
 	for _, e := range entries {
+		// Never descend into "." or ".." (infinite recursion); GNU
+		// ls -R skips them for descent while still DISPLAYING them
+		// under -a.
+		if e.Name() == "." || e.Name() == ".." {
+			continue
+		}
 		if e.IsDir() {
 			if err := lsRecursive(hc, display+"/"+e.Name(), filepath.Join(full, e.Name()), o, first); err != nil {
 				return err
@@ -212,6 +218,12 @@ func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo
 	if !long || fi == nil {
 		fmt.Fprintln(hc.Stdout, name)
 		return
+	}
+	// GNU `ls -l` renders symlinks as "name -> target".
+	if fi.Mode()&os.ModeSymlink != 0 {
+		if target, err := os.Readlink(full); err == nil {
+			name += " -> " + target
+		}
 	}
 	fmt.Fprintf(hc.Stdout, "%s %d %s %s %s %s %s\n",
 		lsPerm(fi), 1, lsUser(), lsGroup(), lsSize(fi, human),

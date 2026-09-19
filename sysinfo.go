@@ -144,6 +144,23 @@ func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	sort.Slice(procs, func(i, j int) bool { return procs[i].pid < procs[j].pid })
+	if !full {
+		// GNU `ps` / `ps -e` default format lists "PID TTY TIME CMD".
+		// With no args GNU shows only the session; with -e/-a/-A it
+		// shows every process. unish is single-process for builtins,
+		// so plain `ps` reports self; -e lists all known processes.
+		if len(args) == 1 {
+			fmt.Fprintln(hc.Stdout, "    PID TTY          TIME CMD")
+			me := os.Getpid()
+			fmt.Fprintf(hc.Stdout, "%7d %-12s %8s %s\n", me, "?", "00:00:00", "unish")
+			return nil
+		}
+		fmt.Fprintln(hc.Stdout, "    PID TTY          TIME CMD")
+		for _, p := range procs {
+			fmt.Fprintf(hc.Stdout, "%7d %-12s %8s %s\n", p.pid, p.tty, p.time, p.cmd)
+		}
+		return nil
+	}
 	if full {
 		fmt.Fprintln(hc.Stdout, "UID          PID    PPID  C STIME TTY          TIME CMD")
 		for _, p := range procs {
@@ -184,7 +201,8 @@ func cmdFree(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return err
 	}
 	mi := memInfo()
-	div := int64(1)
+	// GNU free prints KiB by default.
+	div := int64(1024)
 	if *mega {
 		div = 1024 * 1024
 	} else if *giga {
@@ -544,16 +562,30 @@ func cmdId(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("id", hc.Stderr)
 	uidOnly := fs.Bool("u", false, "")
 	gidOnly := fs.Bool("g", false, "")
-	if err := fs.Parse(args[1:]); err != nil {
+	name := fs.Bool("n", false, "")
+	fs.BoolVar(name, "name", false, "")
+	real := fs.Bool("r", false, "")
+	fs.BoolVar(real, "real", false, "")
+	fs.Bool("a", false, "")
+	if err := fs.Parse(splitAttached("id", args)[1:]); err != nil {
 		return err
 	}
 	uid, user, gid, group := identity()
+	_ = real
 	if *uidOnly {
-		fmt.Fprintln(hc.Stdout, uid)
+		if *name {
+			fmt.Fprintln(hc.Stdout, user)
+		} else {
+			fmt.Fprintln(hc.Stdout, uid)
+		}
 		return nil
 	}
 	if *gidOnly {
-		fmt.Fprintln(hc.Stdout, gid)
+		if *name {
+			fmt.Fprintln(hc.Stdout, group)
+		} else {
+			fmt.Fprintln(hc.Stdout, gid)
+		}
 		return nil
 	}
 	fmt.Fprintf(hc.Stdout, "uid=%d(%s) gid=%d(%s) groups=%d(%s)\n", uid, user, gid, group, gid, group)
@@ -580,29 +612,29 @@ func cmdTty(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return nil
 		}
 	}
-	fmt.Fprintln(hc.Stderr, "tty: not a tty")
+	fmt.Fprintln(hc.Stdout, "not a tty")
 	return exitError{1}
 }
 
 func cmdLogname(_ context.Context, hc interp.HandlerContext, args []string) error {
 	_ = args
-	for _, k := range []string{"LOGNAME", "USER", "USERNAME"} {
-		if v := shellGetenv(hc, k); v != "" {
-			if i := strings.LastIndexAny(v, `\/`); i >= 0 {
-				v = v[i+1:]
-			}
-			if v != "" {
-				fmt.Fprintln(hc.Stdout, v)
-				return nil
-			}
-		}
+	// GNU logname prints the utmp login name and fails when there is no
+	// login session (e.g. non-interactive containers), even if $USER or
+	// $LOGNAME is set. unish has no utmp access, so it succeeds only when
+	// LOGNAME is explicitly present AND stdin is a terminal (closest
+	// observable proxy for an interactive login session).
+	loginTTY := false
+	if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
+		loginTTY = true
 	}
-	if u, err := userCurrent(); err == nil && u != "" {
-		if i := strings.LastIndexAny(u, `\/`); i >= 0 {
-			u = u[i+1:]
+	if v := shellGetenv(hc, "LOGNAME"); v != "" && loginTTY {
+		if i := strings.LastIndexAny(v, `\/`); i >= 0 {
+			v = v[i+1:]
 		}
-		fmt.Fprintln(hc.Stdout, u)
-		return nil
+		if v != "" {
+			fmt.Fprintln(hc.Stdout, v)
+			return nil
+		}
 	}
 	fmt.Fprintln(hc.Stderr, "logname: no login name")
 	return exitError{1}

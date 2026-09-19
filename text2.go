@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"math"
-	"os"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -108,13 +107,20 @@ func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
 		specs = []string{"o2"}
 	}
 	type unit struct {
-		kind string
-		size int
+		kind   string
+		size   int
+		gutter bool
 	}
+	showGutter := false
 	var units []unit
 	for _, s := range specs {
 		kind := ""
 		size := -1
+		gutter := false
+		if strings.HasSuffix(s, "z") {
+			gutter = true
+			s = s[:len(s)-1]
+		}
 		for _, r := range s {
 			switch {
 			case r >= '0' && r <= '9':
@@ -150,7 +156,10 @@ func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
 				fmt.Fprintf(hc.Stderr, "od: invalid type %q\n", s)
 				return exitError{1}
 			}
-			units = append(units, unit{ks, sz})
+			units = append(units, unit{ks, sz, gutter})
+			if gutter {
+				showGutter = true
+			}
 		}
 	}
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
@@ -231,6 +240,26 @@ func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
 					writeOdVal(&sb, u.kind, val)
 				}
 			}
+		}
+		if showGutter {
+			// Align gutter as GNU does: pad missing bytes (3 cols each
+			// for x1) plus 2 spaces, then ">printable<".
+			missing := perLine - len(chunk)
+			if missing > 0 {
+				sb.WriteString(strings.Repeat("   ", missing))
+				sb.WriteString("  ")
+			} else {
+				sb.WriteString("  ")
+			}
+			sb.WriteString(">")
+			for _, b := range chunk {
+				if b >= 32 && b < 127 {
+					sb.WriteByte(b)
+				} else {
+					sb.WriteByte('.')
+				}
+			}
+			sb.WriteByte('<')
 		}
 		sb.WriteByte('\n')
 		off += uint64(len(chunk))
@@ -479,10 +508,10 @@ func cmdNl(_ context.Context, hc interp.HandlerContext, args []string) error {
 			if number(line == "") {
 				fmt.Fprintf(hc.Stdout, "%*d%s%s\n", w, n, *sep, line)
 				n += int64(*incr)
-			} else if *body == "n" {
-				fmt.Fprintf(hc.Stdout, "%*s%s\n", w+1, "", line)
 			} else {
-				fmt.Fprintln(hc.Stdout, line)
+				// GNU nl prints unnumbered lines (blank under -b t,
+				// all lines under -b n) as width+1 spaces + content.
+				fmt.Fprintf(hc.Stdout, "%*s%s\n", w+1, "", line)
 			}
 		}
 		if err := sc.Err(); err != nil {
@@ -611,12 +640,32 @@ func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	defer closeAll()
 	for _, r := range readers {
-		sc := bufio.NewScanner(r)
-		sc.Buffer(make([]byte, 1024*1024), 1024*1024)
-		for sc.Scan() {
-			line := sc.Text()
+		data, err := io.ReadAll(r)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "fold:", err)
+			return exitError{1}
+		}
+		trailingNL := len(data) > 0 && data[len(data)-1] == '\n'
+		text := string(data)
+		if trailingNL {
+			text = text[:len(text)-1]
+		}
+		lines := []string{}
+		if len(data) > 0 {
+			lines = strings.Split(text, "\n")
+		}
+		emit := func(s string, last bool) {
+			// GNU fold preserves a missing trailing newline.
+			if last && !trailingNL {
+				fmt.Fprint(hc.Stdout, s)
+			} else {
+				fmt.Fprintln(hc.Stdout, s)
+			}
+		}
+		for li, line := range lines {
+			lastLine := li == len(lines)-1
 			if line == "" {
-				fmt.Fprintln(hc.Stdout, "")
+				emit("", lastLine)
 				continue
 			}
 			type cell struct {
@@ -672,11 +721,7 @@ func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
 			for _, c := range cells[start:] {
 				sb.WriteString(c.s)
 			}
-			fmt.Fprintln(hc.Stdout, sb.String())
-		}
-		if err := sc.Err(); err != nil {
-			fmt.Fprintln(hc.Stderr, "fold:", err)
-			return exitError{1}
+			emit(sb.String(), lastLine)
 		}
 	}
 	return nil
@@ -785,7 +830,7 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 	fs.StringVar(tabs, "tabs", "8", "")
 	all := fs.Bool("a", false, "")
 	fs.BoolVar(all, "all", false, "")
-	firstOnly := fs.Bool("first-only", false, "")
+	fs.Bool("first-only", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -794,8 +839,8 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 		fmt.Fprintln(hc.Stderr, "unexpand:", err)
 		return exitError{1}
 	}
-	convertAll := *all || !*firstOnly && *all
-	_ = convertAll
+	// GNU default: convert only LEADING blank runs; -a converts all.
+	convertAll := *all
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "unexpand:", err)
@@ -828,7 +873,7 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 					j++
 				}
 				n := j - i
-				if *firstOnly && sb.Len() > 0 {
+				if !convertAll && sb.Len() > 0 {
 					sb.WriteString(line[i:j])
 					col += n
 				} else if n >= 2 {
@@ -955,7 +1000,7 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return rows, sc.Err()
 		}
 		p := resolve(hc.Dir, path)
-		f, err := os.Open(p)
+		f, err := openShellFile(p)
 		if err != nil {
 			return nil, err
 		}
@@ -1047,6 +1092,27 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		emit(map[int]string{1: mustKey(row, k1), 2: mustKey(row, k2)}[which], row, nil)
 	}
+	// GNU join requires sorted input: warn and exit 1 on disorder,
+	// while still printing matches found so far.
+	joinCode := 0
+	checkOrder := func(t [][]string, k int, file string) {
+		prev := ""
+		for n, row := range t {
+			kk, ok := keyOf(row, k)
+			if !ok {
+				continue
+			}
+			if n > 0 && strings.Compare(norm(kk), norm(prev)) < 0 {
+				fmt.Fprintf(hc.Stderr, "join: %s:%d: is not sorted: %s\n", file, n+1, strings.Join(row, " "))
+				fmt.Fprintln(hc.Stderr, "join: input is not in sorted order")
+				joinCode = 1
+				return
+			}
+			prev = kk
+		}
+	}
+	checkOrder(t1, k1, pos[0])
+	checkOrder(t2, k2, pos[1])
 	i, j := 0, 0
 	for i < len(t1) && j < len(t2) {
 		k1s, ok1 := keyOf(t1[i], k1)
@@ -1105,6 +1171,9 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 		if printUnpaired[2] {
 			emitUnpaired(2, t2[j])
 		}
+	}
+	if joinCode != 0 {
+		return exitError{joinCode}
 	}
 	return nil
 }

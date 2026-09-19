@@ -99,8 +99,10 @@ func main() {
 		interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
 		interp.CallHandler(callOverride),
 		interp.ExecHandlers(
+			trackExec,
 			extraHandler,
 		),
+		interp.ProcSubstHandler(procSubstHandler),
 	}
 	if len(params) > 0 {
 		runnerOpts = append(runnerOpts, interp.Params(params...))

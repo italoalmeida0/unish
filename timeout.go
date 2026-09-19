@@ -38,6 +38,17 @@ func cmdTimeout(ctx context.Context, hc interp.HandlerContext, args []string) er
 		return flag.ErrHelp
 	}
 	cmdArgs := rest[1:]
+	if dur == 0 {
+		// GNU: DURATION 0 disables the timeout; run directly.
+		if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
+			return cmd.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
+		}
+		tp, err := startTimeoutProc(hc, cmdArgs)
+		if err != nil {
+			return err
+		}
+		return tp.wait()
+	}
 	sig := strings.ToUpper(strings.TrimPrefix(strings.TrimPrefix(*sigName, "-"), "SIG"))
 
 	tctx, cancel := context.WithTimeout(ctx, dur)
@@ -175,6 +186,7 @@ func startTimeoutProc(hc interp.HandlerContext, cmdArgs []string) (*timeoutProc,
 		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", cmdArgs[0], err)
 		return nil, exitError{127}
 	}
+	globalJobs.track(c, cmdArgs)
 	return &timeoutProc{cmd: c}, nil
 }
 

@@ -30,6 +30,7 @@ func init() {
 		extraCmd{"gzip", cmdGzip},
 		extraCmd{"gunzip", cmdGunzip},
 		extraCmd{"gzcat", cmdGzcat},
+		extraCmd{"zcat", cmdGzcat},
 	)
 }
 
@@ -44,6 +45,9 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs.BoolVar(verb, "verbose", false, "")
 	noClobber := fs.Bool("n", false, "")
 	fs.BoolVar(noClobber, "no-clobber", false, "")
+	noDeref := fs.Bool("P", false, "")
+	fs.BoolVar(noDeref, "no-dereference", false, "")
+	fs.Bool("d", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -60,6 +64,10 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "cp: target is not a directory")
 		return exitError{1}
 	}
+	// GNU cp -n prints a portability warning to stderr (once per invocation).
+	if *noClobber {
+		fmt.Fprintln(hc.Stderr, "cp: warning: behavior of -n is non-portable and may change in future; use --update=none instead")
+	}
 	code := 0
 	for _, s := range srcs {
 		src := resolve(hc.Dir, s)
@@ -67,12 +75,18 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 		if dstIsDir {
 			target = filepath.Join(dst, filepath.Base(src))
 		}
+		// GNU: "cp: 'a' and 'b' are the same file" (exit 1).
+		if sameFile(src, target) {
+			fmt.Fprintf(hc.Stderr, "cp: '%s' and '%s' are the same file\n", s, rest[len(rest)-1])
+			code = 1
+			continue
+		}
 		if *noClobber {
 			if _, err := os.Stat(target); err == nil {
 				continue
 			}
 		}
-		if err := copyOne(src, target, *rec, *force); err != nil {
+		if err := copyOne(src, target, *rec, *force, *noDeref); err != nil {
 			fmt.Fprintf(hc.Stderr, "cp: %v\n", err)
 			code = 1
 			continue
@@ -87,7 +101,7 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func copyOne(src, dst string, rec, force bool) error {
+func copyOne(src, dst string, rec, force, noDeref bool) error {
 	fi, err := os.Lstat(src)
 	if err != nil {
 		return err
@@ -98,7 +112,7 @@ func copyOne(src, dst string, rec, force bool) error {
 		}
 		return copyDir(src, dst, force)
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
+	if fi.Mode()&os.ModeSymlink != 0 && noDeref {
 		link, err := os.Readlink(src)
 		if err != nil {
 			return err
@@ -107,6 +121,10 @@ func copyOne(src, dst string, rec, force bool) error {
 			os.Remove(dst)
 		}
 		return os.Symlink(link, dst)
+	}
+	// GNU default: follow the link, copying content into a new file.
+	if st, err := os.Stat(src); err == nil {
+		fi = st
 	}
 	return copyFile(src, dst, fi.Mode(), force)
 }
@@ -208,6 +226,12 @@ func cmdMv(_ context.Context, hc interp.HandlerContext, args []string) error {
 				}
 			}
 		}
+		// GNU: "mv: 'a' and 'b' are the same file" (exit 1).
+		if sameFile(src, target) {
+			fmt.Fprintf(hc.Stderr, "mv: '%s' and '%s' are the same file\n", s, rest[len(rest)-1])
+			code = 1
+			continue
+		}
 		if *force {
 			os.Remove(target)
 		}
@@ -249,8 +273,12 @@ func cmdRm(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("rm", hc.Stderr)
 	rec := fs.Bool("r", false, "")
 	fs.BoolVar(rec, "R", false, "")
+	fs.BoolVar(rec, "recursive", false, "")
 	force := fs.Bool("f", false, "")
+	fs.BoolVar(force, "force", false, "")
 	verb := fs.Bool("v", false, "")
+	fs.BoolVar(verb, "verbose", false, "")
+	noPreserve := fs.Bool("no-preserve-root", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -260,7 +288,16 @@ func cmdRm(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return nil
 		}
 		fmt.Fprintln(hc.Stderr, "rm: missing operand")
-		return flag.ErrHelp
+		fmt.Fprintln(hc.Stderr, "Try 'rm --help' for more information.")
+		return exitError{1}
+	}
+	// GNU --preserve-root (default): refuse `rm -rf /`.
+	for _, p := range rest {
+		if *rec && !*noPreserve && isRootPath(hc.Dir, p) {
+			fmt.Fprintln(hc.Stderr, "rm: it is dangerous to operate recursively on '/'")
+			fmt.Fprintln(hc.Stderr, "rm: use --no-preserve-root to override this failsafe")
+			return exitError{1}
+		}
 	}
 	code := 0
 	for _, p := range rest {
@@ -333,7 +370,12 @@ func cmdMkdir(_ context.Context, hc interp.HandlerContext, args []string) error 
 					continue
 				}
 			}
-			fmt.Fprintf(hc.Stderr, "mkdir: cannot create directory '%s': %v\n", p, err)
+			// GNU wording: "mkdir: cannot create directory 'd': File exists".
+			if os.IsExist(err) {
+				fmt.Fprintf(hc.Stderr, "mkdir: cannot create directory \u2018%s\u2019: File exists\n", p)
+			} else {
+				fmt.Fprintf(hc.Stderr, "mkdir: cannot create directory '%s': %v\n", p, err)
+			}
 			code = 1
 			continue
 		}
@@ -362,14 +404,13 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	mtime := time.Now()
 	if *dateStr != "" {
-		if t, err := time.Parse(time.RFC3339, *dateStr); err == nil {
-			mtime = t
-		} else if t, err := time.Parse("2006-01-02 15:04:05", *dateStr); err == nil {
-			mtime = t
-		} else {
-			fmt.Fprintf(hc.Stderr, "touch: invalid date '%s'\n", *dateStr)
+		t, err := parseTouchDate(*dateStr)
+		if err != nil {
+			// GNU wording: "touch: invalid date format '...'".
+			fmt.Fprintf(hc.Stderr, "touch: invalid date format \u2018%s\u2019\n", *dateStr)
 			return exitError{1}
 		}
+		mtime = t
 	}
 	code := 0
 	for _, p := range fs.Args() {
@@ -443,7 +484,17 @@ func cmdChmod(_ context.Context, hc interp.HandlerContext, args []string) error 
 			continue
 		}
 		if err := apply(full, p); err != nil {
-			fmt.Fprintf(hc.Stderr, "chmod: %v\n", err)
+			// GNU wording: "chmod: invalid mode: 'X'\nTry 'chmod --help' for more information."
+			msg := err.Error()
+			if strings.HasPrefix(msg, "invalid mode") {
+				fmt.Fprintf(hc.Stderr, "chmod: invalid mode: \u2018%s\u2019\n", modeStr)
+				fmt.Fprintln(hc.Stderr, "Try 'chmod --help' for more information.")
+			} else if perr, ok := err.(*os.PathError); ok {
+				fmt.Fprintf(hc.Stderr, "chmod: cannot access '%s': No such file or directory\n", p)
+				_ = perr
+			} else {
+				fmt.Fprintf(hc.Stderr, "chmod: %v\n", err)
+			}
 			code = 1
 		}
 	}
@@ -527,7 +578,6 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		return err
 	}
 	_ = maxProcs
-	_ = noRun
 	rest := fs.Args()
 	if len(rest) == 0 {
 		rest = []string{"echo"}
@@ -562,6 +612,17 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		items = strings.Fields(string(data))
 	}
 	if len(items) == 0 {
+		// GNU xargs runs the command ONCE with no arguments on empty
+		// input, unless -r/--no-run-if-empty is given.
+		if *noRun {
+			return nil
+		}
+		if err := runSubcommand(ctx, hc, rest); err != nil {
+			if es, ok := err.(exitError); ok && es.code == 127 {
+				return err
+			}
+			return exitError{1}
+		}
 		return nil
 	}
 	batch := *maxArgs
@@ -625,7 +686,7 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 	var data []byte
 	if len(fs.Args()) > 0 {
 		var err error
-		data, err = os.ReadFile(resolve(hc.Dir, fs.Args()[0]))
+		data, err = readShellFile(resolve(hc.Dir, fs.Args()[0]))
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "base64:", err)
 			return exitError{1}
@@ -661,3 +722,69 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 }
 
 var _ = runtime.GOOS
+
+// parseTouchDate parses GNU touch -d operands: RFC3339, "2006-01-02",
+// "2006-01-02 15:04:05", "@epoch", and common variants.
+func parseTouchDate(s string) (time.Time, error) {
+	formats := []string{
+		time.RFC3339,
+		"2006-01-02T15:04:05",
+		"2006-01-02 15:04:05",
+		"2006-01-02 15:04",
+		"2006-01-02",
+		"01/02/2006",
+		"01/02/2006 15:04:05",
+		"20060102",
+		time.ANSIC,
+		time.RubyDate,
+		time.RFC1123,
+		time.RFC1123Z,
+		time.RFC822,
+		time.RFC822Z,
+		time.Kitchen,
+	}
+	for _, f := range formats {
+		if t, err := time.Parse(f, s); err == nil {
+			return t, nil
+		}
+	}
+	if strings.HasPrefix(s, "@") {
+		if n, err := strconv.ParseInt(s[1:], 10, 64); err == nil {
+			return time.Unix(n, 0), nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("invalid date")
+}
+
+// sameFile reports whether two paths resolve to the same file.
+func sameFile(a, b string) bool {
+	fa, err1 := os.Stat(a)
+	fb, err2 := os.Stat(b)
+	if err1 != nil || err2 != nil {
+		// Fall back to lexical identity (covers missing-dst cases
+		// like `cp a.txt a.txt` where dst == src path).
+		aa, _ := filepath.Abs(a)
+		bb, _ := filepath.Abs(b)
+		return aa == bb && err1 == nil
+	}
+	return os.SameFile(fa, fb)
+}
+
+// isRootPath reports whether p resolves to the filesystem root (or the
+// shell's drive root on Windows). Used for rm --preserve-root.
+func isRootPath(dir, p string) bool {
+	if p == "/" {
+		return true
+	}
+	full := resolve(dir, p)
+	// Normalize: root has no parent.
+	parent := filepath.Dir(full)
+	if parent == full {
+		return true
+	}
+	// Windows drive root like C:\ (resolve may produce it for "/").
+	if len(full) == 3 && full[1] == ':' && (full[2] == '\\' || full[2] == '/') {
+		return true
+	}
+	return false
+}

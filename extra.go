@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"net"
 	"os/user"
 	"path/filepath"
 	"runtime"
@@ -97,8 +98,18 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		if args[0] == "ls" {
 			args = filterLsArgs(args)
 		}
+		// Job-control builtins with real-pid semantics live here so
+		// they bypass mvdan/sh's fake-id-only implementations.
+		// (trackExec also routes them; this covers direct chains.)
 		cmd := lookupExtra(args[0])
 		if cmd == nil {
+			// Not one of ours: run as an external with job tracking
+			// so background jobs get real PIDs ($! killable/waitable).
+			// Fall back to the next handler when tracking can't start
+			// it (e.g. shell builtins like `command`, `exec`).
+			if err, handled := runExternalTracked(ctx, args); handled {
+				return err
+			}
 			return next(ctx, args)
 		}
 		for _, a := range args[1:] {
@@ -110,6 +121,12 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		}
 		hc := interp.HandlerCtx(ctx)
 		err := cmd.main(ctx, hc, splitAttached(args[0], args))
+		if isPipeClosed(err) || isPipeClosed(ctx.Err()) {
+			// SIGPIPE semantics: downstream closed the pipe early
+			// (e.g. `seq 1 5 | head -n 0`). GNU tools exit 0 silently;
+			// never surface "write |1: The pipe is being closed".
+			return nil
+		}
 		if err != nil {
 			switch {
 			case ctx.Err() == context.DeadlineExceeded:
@@ -129,6 +146,58 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	}
 }
 
+// runExternalTracked starts args[0] as a real OS process with job-table
+// tracking. Returns (err, true) when it handled the command; (nil, false)
+// when the command is a shell builtin/function that must go through the
+// normal handler chain.
+func runExternalTracked(ctx context.Context, args []string) (error, bool) {
+	hc := interp.HandlerCtx(ctx)
+	// Never shadow shell builtins, functions, or our own commands:
+	// those must keep their in-process semantics (env changes, etc.).
+	if interp.IsBuiltin(args[0]) || lookupExtra(args[0]) != nil {
+		return nil, false
+	}
+	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
+	if err != nil {
+		return nil, false
+	}
+	cmd := exec.CommandContext(ctx, path, args[1:]...)
+	cmd.Dir = hc.Dir
+	cmd.Stdin = hc.Stdin
+	cmd.Stdout = hc.Stdout
+	cmd.Stderr = hc.Stderr
+	// Exported shell variables, like the default handler.
+	cmd.Env = shellExecEnv(hc)
+	if err := cmd.Start(); err != nil {
+		return nil, false
+	}
+	j := globalJobs.track(cmd, args)
+	hashRecord(args[0], path)
+	// Wait synchronously (foreground). Background statements run this
+	// whole handler in a goroutine already, so no extra work needed.
+	<-j.done
+	if j.err != nil {
+		if ee, ok := j.err.(*exec.ExitError); ok {
+			return interp.NewExitStatus(uint8(ee.ExitCode())), true
+		}
+		return j.err, true
+	}
+	return nil, true
+}
+
+// shellExecEnv builds the environment for external processes from the
+// shell's exported variables (mirrors interp's unexported execEnv).
+func shellExecEnv(hc interp.HandlerContext) []string {
+	list := make([]string, 0, 64)
+	hc.Env.Each(func(name string, vr expand.Variable) bool {
+		if vr.Exported && vr.IsSet() && vr.Kind == expand.String {
+			list = append(list, name+"="+vr.Str)
+		}
+		return true
+	})
+	return list
+}
+
 func filterLsArgs(args []string) []string {
 	out := args[:1:1]
 	for _, a := range args[1:] {
@@ -143,14 +212,74 @@ func filterLsArgs(args []string) []string {
 }
 
 func callOverride(ctx context.Context, args []string) ([]string, error) {
-	if len(args) == 0 || args[0] != "kill" {
+	if len(args) == 0 {
 		return args, nil
 	}
-	hc := interp.HandlerCtx(ctx)
-	if err := cmdKill(ctx, hc, splitAttached("kill", args)); err != nil {
-		return []string{"false"}, nil
+	switch args[0] {
+	case "kill":
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdKill(ctx, hc, splitAttached("kill", args)); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "umask":
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdUmask(ctx, hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "ulimit":
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdUlimit(ctx, hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "printf":
+		// Bypass mvdan/sh's printf (no precision specs like %.0s).
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdPrintf(ctx, hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "hash":
+		// Bypass mvdan/sh's hash (empty-table notice differs) with a
+		// real implementation backed by the hash table below.
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdHashTable(ctx, hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "type":
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdTypeDesc(ctx, hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "jobs":
+		// Bypass mvdan/sh's stub ("unsupported builtin") with a real
+		// implementation backed by the job table.
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdJobs(hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
+	case "wait":
+		// Tracked externals wait here; everything else flows through
+		// to mvdan/sh's builtin (in-process jobs, real pids, errors).
+		// NOTE: ["true"]/["false"] stand in for exit 0/1 because a
+		// CallHandler cannot return arbitrary codes; exact waited
+		// statuses surface via `wait $!; echo $?` == 0/1 only.
+		// Full-fidelity codes need `wait` as an ExecHandler — see
+		// cmdWaitTracked note.
+		if code, handled := cmdWaitTracked(ctx, args); handled {
+			if code != 0 {
+				return []string{"false"}, nil
+			}
+			return []string{"true"}, nil
+		}
+		return args, nil
 	}
-	return []string{"true"}, nil
+	return args, nil
 }
 
 func resolve(dir, p string) string {
@@ -205,7 +334,7 @@ type flagSpec struct {
 
 var flagSpecs = map[string]flagSpec{
 	"grep": {
-		bools:  "clFivnhqrRaEo",
+		bools:  "clFivnhqrRaEoxwsH",
 		values: "emABCf",
 		long: map[string]string{
 			"count": "c", "files-with-matches": "l", "fixed-strings": "F",
@@ -215,6 +344,9 @@ var flagSpecs = map[string]flagSpec{
 			"before-context": "B", "context": "C", "only-matching": "o",
 			"extended-regexp": "E", "file": "f", "exclude": "exclude",
 			"include": "include", "exclude-dir": "exclude-dir", "color": "",
+			"line-regexp": "x", "word-regexp": "w", "with-filename": "H",
+			"no-messages": "s",
+			"label": "label",
 		},
 	},
 	"head": {bools: "qv", values: "nc", long: map[string]string{
@@ -224,12 +356,13 @@ var flagSpecs = map[string]flagSpec{
 		"lines": "n", "bytes": "c", "quiet": "q", "silent": "q",
 		"verbose": "v", "follow": "f",
 	}},
-	"sort": {bools: "rufnc", values: "tk", long: map[string]string{
+	"sort": {bools: "rufncz", values: "tk", long: map[string]string{
 		"reverse": "r", "unique": "u", "ignore-case": "f", "numeric-sort": "n",
-		"check": "c", "key": "k",
+		"check": "c", "key": "k", "zero-terminated": "z",
 	}},
-	"uniq": {bools: "cdui", values: "", long: map[string]string{
+	"uniq": {bools: "cdui", values: "fsw", long: map[string]string{
 		"count": "c", "repeated": "d", "unique": "u", "ignore-case": "i",
+		"skip-fields": "f", "skip-chars": "s", "check-chars": "w",
 	}},
 	"wc": {bools: "lwcmL", values: "", long: map[string]string{
 		"lines": "l", "words": "w", "bytes": "c", "chars": "m",
@@ -239,9 +372,10 @@ var flagSpecs = map[string]flagSpec{
 	"tr":  {bools: "dsc", values: "", long: map[string]string{
 		"delete": "d", "squeeze-repeats": "s", "complement": "c",
 	}},
-	"cut": {bools: "s", values: "dfc", long: map[string]string{
-		"delimiter": "d", "fields": "f", "characters": "c",
-		"only-delimited": "s",
+	"cut": {bools: "s", values: "dfcb", long: map[string]string{
+		"delimiter": "d", "fields": "f", "characters": "c", "bytes": "b",
+		"only-delimited": "s", "complement": "complement",
+		"output-delimiter": "output-delimiter",
 	}},
 	"paste": {bools: "s", values: "d", long: map[string]string{
 		"delimiters": "d", "serial": "s",
@@ -256,18 +390,21 @@ var flagSpecs = map[string]flagSpec{
 		"size": "S", "reverse": "r", "time": "t",
 	}},
 	"comm": {bools: "123", values: ""},
-	"split": {bools: "d", values: "la", long: map[string]string{
-		"lines": "l", "suffix-length": "a",
+	"split": {bools: "d", values: "lab", long: map[string]string{
+		"lines": "l", "suffix-length": "a", "bytes": "b",
 	}},
-	"diff": {bools: "qu", values: "", long: map[string]string{
+	"diff": {bools: "qu", values: "L", long: map[string]string{
 		"brief": "q", "report-identical-files": "s", "unified": "u",
+		"label": "L",
 	}},
 	"cmp": {bools: "sl", values: "n", long: map[string]string{
 		"silent": "s", "quiet": "s",
 	}},
-	"id": {bools: "ug", values: "", long: map[string]string{}},
-	"du": {bools: "sh", values: "", long: map[string]string{
-		"summarize": "s", "human-readable": "h",
+	"id": {bools: "ugnra", values: "", long: map[string]string{
+		"name": "n", "real": "r",
+	}},
+	"du": {bools: "shb", values: "", long: map[string]string{
+		"summarize": "s", "human-readable": "h", "bytes": "b",
 	}},
 	"df": {bools: "hkP", values: "", long: map[string]string{
 		"human-readable": "h",
@@ -294,8 +431,9 @@ var flagSpecs = map[string]flagSpec{
 	"nice": {bools: "", values: "n", long: map[string]string{
 		"adjustment": "n",
 	}},
-	"cp": {bools: "rfvn", values: "", long: map[string]string{
+	"cp": {bools: "rfvnPd", values: "", long: map[string]string{
 		"recursive": "r", "force": "f", "verbose": "v", "no-clobber": "n",
+		"no-dereference": "P",
 	}},
 	"mv": {bools: "funv", values: "", long: map[string]string{
 		"force": "f", "update": "u", "no-clobber": "n", "verbose": "v",
@@ -328,26 +466,30 @@ var flagSpecs = map[string]flagSpec{
 	"base64": {bools: "d", values: "w", long: map[string]string{
 		"decode": "d", "wrap": "w",
 	}},
-	"tar": {bools: "cxtzv", values: "fC", long: map[string]string{}},
+	"tar": {bools: "cxtzvkP", values: "fC", long: map[string]string{
+		"keep-old-files": "k", "absolute-names": "P",
+	}},
 	"gzip": {bools: "kcf", values: "", long: map[string]string{
 		"keep": "k", "stdout": "c", "force": "f",
 	}},
 	"gunzip": {bools: "kcf", values: "", long: map[string]string{
 		"keep": "k", "stdout": "c", "force": "f",
 	}},
-	"mktemp": {bools: "d", values: "p", long: map[string]string{
-		"directory": "d", "tmpdir": "p",
+	"mktemp": {bools: "dut", values: "p", long: map[string]string{
+		"directory": "d", "tmpdir": "p", "dry-run": "u",
 	}},
 	"ln": {bools: "sf", values: "", long: map[string]string{
 		"symbolic": "s", "force": "f",
 	}},
-	"date": {bools: "u", values: "", long: map[string]string{"universal": "u"}},
+	"date": {bools: "u", values: "d", long: map[string]string{"universal": "u", "utc": "u", "date": "d"}},
 	"uname": {bools: "amnrsv", values: "", long: map[string]string{
 		"all": "a", "machine": "m", "nodename": "n",
 		"release": "r", "sysname": "s",
 	}},
 	"hexdump": {bools: "C", values: "n"},
-	"strings": {bools: "a", values: "n"},
+	"strings": {bools: "ao", values: "nt", long: map[string]string{
+		"radix": "t",
+	}},
 	"md5sum":  {bools: "bt", values: ""},
 	"sha1sum": {bools: "bt", values: ""},
 	"sha256sum": {bools: "bt", values: ""},
@@ -388,8 +530,18 @@ func splitAttached(cmd string, args []string) []string {
 	var movable, rest []string
 	movable = append(movable, args[0])
 	argv := args[1:]
+	endFlags := false
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
+		if endFlags {
+			rest = append(rest, a)
+			continue
+		}
+		if a == "--" {
+			endFlags = true
+			rest = append(rest, a)
+			continue
+		}
 		if strings.HasPrefix(a, "--") && len(a) > 2 {
 			name := a[2:]
 			val := ""
@@ -439,6 +591,15 @@ func splitAttached(cmd string, args []string) []string {
 			movable = append(movable, "-"+string(a[1]), a[2:])
 			continue
 		}
+		// Value flags with negative-number values: "-n -1" (head/tail).
+		// Go's flag package would treat "-1" as a flag; glue it as the
+		// value so `head -n -1` / `tail -n -1` parse like GNU.
+		if len(a) == 2 && a[0] == '-' && strings.ContainsRune(spec.values, rune(a[1])) &&
+			i+1 < len(argv) && len(argv[i+1]) > 1 && argv[i+1][0] == '-' && argv[i+1][1] >= '0' && argv[i+1][1] <= '9' {
+			movable = append(movable, a, argv[i+1])
+			i++
+			continue
+		}
 		if len(a) > 2 && a[0] == '-' && a[1] != '-' && isFlagChar(cmd, a[1]) {
 			if expanded, ok := cascadeBools(spec, a[1:]); ok {
 				movable = append(movable, expanded...)
@@ -484,7 +645,20 @@ func isASCIILetter(c byte) bool {
 func parseN(args []string, def uint64) (uint64, []string) {
 	n := def
 	rest := args[:0:0]
+	skipNext := false
 	for _, a := range args {
+		// Don't treat the VALUE of -n/-c (e.g. "-1" in "-n -1") as an
+		// attached count; it belongs to the flag.
+		if skipNext {
+			skipNext = false
+			rest = append(rest, a)
+			continue
+		}
+		if a == "-n" || a == "-c" {
+			skipNext = true
+			rest = append(rest, a)
+			continue
+		}
 		if len(a) > 1 && a[0] == '-' && a[1] >= '0' && a[1] <= '9' {
 			if v, err := parseUint(a[1:]); err == nil {
 				n = v
@@ -511,7 +685,7 @@ func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader
 	if len(args) == 0 {
 		return []io.Reader{stdin}, []string{""}, func() {}, nil
 	}
-	var files []*os.File
+	var files []io.Closer
 	closeAll = func() {
 		for _, f := range files {
 			f.Close()
@@ -520,11 +694,11 @@ func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader
 	for _, a := range args {
 		if a == "-" {
 			readers = append(readers, stdin)
-			names = append(names, "")
+			names = append(names, "standard input")
 			continue
 		}
 		p := resolve(dir, a)
-		f, e := os.Open(p)
+		f, e := openShellFile(p)
 		if e != nil {
 			closeAll()
 			return nil, nil, func() {}, e
@@ -560,11 +734,11 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs.BoolVar(squeeze, "squeeze-blank", false, "")
 	fs.BoolVar(showEnds, "show-ends", false, "")
 	fs.BoolVar(showTabs, "show-tabs", false, "")
-	if *showAll {
-		*showEnds, *showTabs = true, true
-	}
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	if *showAll {
+		*showEnds, *showTabs = true, true
 	}
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
@@ -663,7 +837,9 @@ func cmdEcho(_ context.Context, hc interp.HandlerContext, args []string) error {
 }
 
 func cmdClear(_ context.Context, hc interp.HandlerContext, _ []string) error {
-	fmt.Fprint(hc.Stdout, "\033[H\033[2J")
+	// Matches `clear` (ncurses) non-interactive output: home + erase
+	// display + erase scrollback.
+	fmt.Fprint(hc.Stdout, "\033[H\033[2J\033[3J")
 	return nil
 }
 
@@ -671,10 +847,31 @@ func cmdWhich(_ context.Context, hc interp.HandlerContext, args []string) error 
 	if len(args) < 2 {
 		return flag.ErrHelp
 	}
+	// Like /usr/bin/which: when PATH is explicitly set but contains no
+	// existing directory, nothing can be found (exit 1), even builtins.
+	pathSet := false
+	pathUsable := false
+	if v := hc.Env.Get("PATH"); v.IsSet() {
+		pv := v.Str
+		pathSet = true
+		for _, d := range strings.Split(pv, string(os.PathListSeparator)) {
+			if d == "" {
+				d = "."
+			}
+			if fi, err := os.Stat(resolve(hc.Dir, d)); err == nil && fi.IsDir() {
+				pathUsable = true
+				break
+			}
+		}
+	}
 	code := 0
 	for _, name := range args[1:] {
 		if p, err := findExec(hc, name); err == nil {
 			fmt.Fprintln(hc.Stdout, p)
+			continue
+		}
+		if pathSet && !pathUsable {
+			code = 1
 			continue
 		}
 		if lookupExtra(name) != nil || isKnownCoreutil(name) || interp.IsBuiltin(name) {
@@ -804,13 +1001,56 @@ func cmdNproc(_ context.Context, hc interp.HandlerContext, _ []string) error {
 	return nil
 }
 
-func cmdHostname(_ context.Context, hc interp.HandlerContext, _ []string) error {
+func cmdHostname(_ context.Context, hc interp.HandlerContext, args []string) error {
 	h, err := os.Hostname()
 	if err != nil {
 		return err
 	}
+	for _, a := range args[1:] {
+		// GNU `hostname -f/--fqdn/--long`: canonical FQDN when known.
+		if a == "-f" || a == "--fqdn" || a == "--long" {
+			if fqdn, err := hostnameFQDN(h); err == nil && fqdn != "" {
+				fmt.Fprintln(hc.Stdout, fqdn)
+				return nil
+			}
+			fmt.Fprintln(hc.Stdout, h)
+			return nil
+		}
+	}
 	fmt.Fprintln(hc.Stdout, h)
 	return nil
+}
+
+// hostnameFQDN resolves the canonical FQDN: hostname + DNS domain when
+// the name isn't already qualified, else the hostname itself.
+func hostnameFQDN(h string) (string, error) {
+	if strings.Contains(h, ".") {
+		return h, nil
+	}
+	fixCase := func(fqdn string) string {
+		// GNU keeps the hostname's own letter case
+		// ("ItaloSurface.localdomain", not DNS-lowercased).
+		if len(fqdn) > len(h) && strings.EqualFold(fqdn[:len(h)], h) && fqdn[len(h)] == '.' {
+			return h + fqdn[len(h):]
+		}
+		return fqdn
+	}
+	if cname, err := net.LookupCNAME(h); err == nil {
+		if c := strings.TrimSuffix(strings.TrimSpace(cname), "."); c != "" {
+			return fixCase(c), nil
+		}
+	}
+	// Fall back to /etc/hosts-style search for a qualified alias.
+	if addrs, err := net.LookupHost(h); err == nil && len(addrs) > 0 {
+		if names, err := net.LookupAddr(addrs[0]); err == nil {
+			for _, n := range names {
+				if c := strings.TrimSuffix(strings.TrimSpace(n), "."); strings.Contains(c, ".") {
+					return fixCase(c), nil
+				}
+			}
+		}
+	}
+	return h, nil
 }
 
 func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -828,9 +1068,17 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 	if name == "" {
 		name = runtime.GOOS
 	}
+	// Report the kernel machine name (uname -m), not the Go architecture
+	// label: arm64 and x86_64 kernels report "aarch64"/"x86_64".
+	machineName := map[string]string{
+		"amd64": "x86_64", "arm64": "aarch64", "386": "i686",
+	}[runtime.GOARCH]
+	if machineName == "" {
+		machineName = runtime.GOARCH
+	}
 	if *all {
 		host, _ := os.Hostname()
-		fmt.Fprintf(hc.Stdout, "%s %s unish 1.0 %s\n", name, host, runtime.GOARCH)
+		fmt.Fprintf(hc.Stdout, "%s %s %s %s %s\n", name, host, kernelRelease(), kernelVersion(), machineName)
 		return nil
 	}
 	var parts []string
@@ -842,14 +1090,36 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 		parts = append(parts, host)
 	}
 	if *release {
-		parts = append(parts, "unish")
+		parts = append(parts, kernelRelease())
 	}
 	if *version {
-		parts = append(parts, "1.0")
+		parts = append(parts, kernelVersion())
 	}
 	if *machine {
-		parts = append(parts, runtime.GOARCH)
+		parts = append(parts, machineName)
 	}
 	fmt.Fprintln(hc.Stdout, strings.Join(parts, " "))
 	return nil
+}
+
+// isPipeClosed reports whether err is a broken-pipe / closed-pipe write
+// error (Windows: "write |1: The pipe is being closed"; unix: EPIPE).
+// Callers use it to implement SIGPIPE semantics: a writer whose downstream
+// reader exited early (head -n 0, yes | head, ...) exits silently.
+func isPipeClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	for _, s := range []string{
+		"The pipe is being closed",
+		"broken pipe",
+		"pipe is closed",
+		"EPIPE",
+	} {
+		if strings.Contains(msg, s) {
+			return true
+		}
+	}
+	return false
 }

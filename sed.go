@@ -111,7 +111,8 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	prog, err := parseSed(strings.Join(progParts, "\n"), *extended)
 	if err != nil {
-		fmt.Fprintln(hc.Stderr, "sed:", err)
+		// GNU wording: "sed: -e expression #1, char 1: unknown command: `['".
+		fmt.Fprintf(hc.Stderr, "sed: -e expression #1, char 1: %v\n", dropSedPrefix(err))
 		return exitError{1}
 	}
 	inplaceFlag := inplaceOn || hasIFlag(args)
@@ -370,7 +371,7 @@ func parseSedLine(line string, extended bool) ([]*sedCmd, error) {
 		c.arg = strings.TrimSpace(rest)
 	case 'd', 'D', 'p', 'P', 'n', 'N', 'h', 'H', 'g', 'G', 'x', 'l', '=', '}':
 	default:
-		return nil, fmt.Errorf("unknown command '%c'", name)
+		return nil, fmt.Errorf("unknown command: `%c'", name)
 	}
 	return []*sedCmd{c}, nil
 }
@@ -605,14 +606,19 @@ type sedRunner struct {
 	subbed   bool
 	out      io.Writer
 	pending  []pendingOut
+	trailNL  bool
 }
 
 func (r *sedRunner) runStream(prog []*sedCmd, rd io.Reader) {
-	sc := bufio.NewScanner(rd)
-	sc.Buffer(make([]byte, 4*1024*1024), 4*1024*1024)
+	data, _ := io.ReadAll(rd)
+	trailingNL := len(data) > 0 && data[len(data)-1] == '\n'
 	var lines []string
-	for sc.Scan() {
-		lines = append(lines, sc.Text())
+	if len(data) > 0 {
+		text := string(data)
+		if trailingNL {
+			text = text[:len(text)-1]
+		}
+		lines = strings.Split(text, "\n")
 	}
 	if r.out == nil {
 		r.out = r.hc.Stdout
@@ -622,6 +628,7 @@ func (r *sedRunner) runStream(prog []*sedCmd, rd io.Reader) {
 		r.out = bufio.NewWriterSize(r.out, 64*1024)
 		ownBuf = true
 	}
+	r.trailNL = trailingNL
 	if r.ranges == nil {
 		r.ranges = map[int]bool{}
 	}
@@ -682,7 +689,11 @@ func (r *sedRunner) runCycle(prog []*sedCmd, pc int, idx *int, lines []string) i
 		}
 	}
 	if !r.quiet {
-		fmt.Fprintln(r.out, r.pat)
+		if r.lastLine && !r.trailNL {
+			fmt.Fprint(r.out, r.pat)
+		} else {
+			fmt.Fprintln(r.out, r.pat)
+		}
 	}
 	r.flushPending()
 	return cycleNext
@@ -1183,4 +1194,14 @@ func sedInplace(hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, 
 		return exitError{code}
 	}
 	return nil
+}
+
+// dropSedPrefix strips our internal "unknown command " prefix so the call
+// site can emit the full GNU diagnostic.
+func dropSedPrefix(err error) string {
+	msg := err.Error()
+	if strings.HasPrefix(msg, "unknown command ") {
+		return msg[len("unknown command "):]
+	}
+	return msg
 }

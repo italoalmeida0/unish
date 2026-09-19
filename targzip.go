@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"archive/tar"
 	"compress/gzip"
 	"context"
@@ -26,6 +27,10 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	list := fs.Bool("t", false, "")
 	zip := fs.Bool("z", false, "")
 	verb := fs.Bool("v", false, "")
+	keepOld := fs.Bool("k", false, "")
+	fs.BoolVar(keepOld, "keep-old-files", false, "")
+	absNames := fs.Bool("P", false, "")
+	fs.BoolVar(absNames, "absolute-names", false, "")
 	file := fs.String("f", "", "")
 	dir := fs.String("C", "", "")
 	if err := fs.Parse(rawArgs); err != nil {
@@ -110,6 +115,20 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 				return err
 			}
 			hdr.Name = rel
+			if info.IsDir() && !strings.HasSuffix(hdr.Name, "/") {
+				hdr.Name += "/"
+			}
+			// GNU tar stores user/group names; Go leaves them empty.
+			// Fill from the current identity for -tv parity.
+			if _, user, _, group := identity(); true {
+				_ = user
+				if hdr.Uname == "" {
+					hdr.Uname = user
+				}
+				if hdr.Gname == "" {
+					hdr.Gname = group
+				}
+			}
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
@@ -125,7 +144,7 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 				}
 			}
 			if verb {
-				fmt.Fprintln(hc.Stdout, rel)
+				fmt.Fprintln(hc.Stdout, hdr.Name)
 			}
 			return nil
 		})
@@ -142,7 +161,7 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 }
 
 func tarOpenReader(archive string, zip bool) (io.ReadCloser, *gzip.Reader, *tar.Reader, error) {
-	f, err := os.Open(archive)
+	f, err := openShellFile(archive)
 	if err != nil {
 		return nil, nil, nil, err
 	}
@@ -150,12 +169,22 @@ func tarOpenReader(archive string, zip bool) (io.ReadCloser, *gzip.Reader, *tar.
 	var r io.Reader = f
 	if !zip {
 		var magic [2]byte
-		if n, _ := f.Read(magic[:]); n == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		if n, _ := io.ReadFull(f, magic[:]); n == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
 			zip = true
 		}
-		f.Seek(0, io.SeekStart)
+		// No Seek (procsub-aware handle): re-prepend sniffed bytes.
+		r = io.MultiReader(bytes.NewReader(magic[:]), f)
 	}
 	if zip {
+		// Zip path needs the raw stream from the start; re-read via
+		// readShellFile when we consumed magic bytes... simplest: if we
+		// sniffed, reopen. Archives are rarely procsub; reopen is cheap.
+		f.Close()
+		f2, err := openShellFile(archive)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		f = f2
 		gz, err = gzip.NewReader(f)
 		if err != nil {
 			f.Close()
@@ -192,7 +221,18 @@ func tarExtract(hc interp.HandlerContext, archive, base string, only []string, z
 		if len(want) > 0 && !want[hdr.Name] {
 			continue
 		}
-		target := filepath.Join(base, filepath.FromSlash(hdr.Name))
+		// Zip-Slip defense (GNU strips leading "/" and "../"): refuse
+		// entries that would escape the destination directory.
+		name := filepath.FromSlash(hdr.Name)
+		if filepath.IsAbs(name) || strings.HasPrefix(name, "/") {
+			fmt.Fprintf(hc.Stderr, "tar: removing leading '/' from member names\n")
+			name = strings.TrimLeft(name, "/\\")
+		}
+		target := filepath.Join(base, name)
+		if !isWithinDir(base, target) {
+			fmt.Fprintf(hc.Stderr, "tar: skipping '%s': outside destination\n", hdr.Name)
+			continue
+		}
 		switch hdr.Typeflag {
 		case tar.TypeDir:
 			os.MkdirAll(target, os.FileMode(hdr.Mode))
@@ -237,7 +277,17 @@ func tarList(hc interp.HandlerContext, archive string, zip, verb bool) error {
 			return exitError{1}
 		}
 		if verb {
-			fmt.Fprintf(hc.Stdout, "%s %8d %s\n", hdr.FileInfo().Mode(), hdr.Size, hdr.Name)
+			user := hdr.Uname
+			if user == "" {
+				user = fmt.Sprintf("%d", hdr.Uid)
+			}
+			group := hdr.Gname
+			if group == "" {
+				group = fmt.Sprintf("%d", hdr.Gid)
+			}
+			fmt.Fprintf(hc.Stdout, "%s %s/%s %9d %s %s\n",
+				hdr.FileInfo().Mode(), user, group, hdr.Size,
+				hdr.ModTime.Format("2006-01-02 15:04"), hdr.Name)
 		} else {
 			fmt.Fprintln(hc.Stdout, hdr.Name)
 		}
@@ -295,7 +345,13 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 			}
 			if err := gunzipFile(hc, full, resolve(hc.Dir, out), *stdout || name == "gzcat"); err != nil {
 				if !*force {
-					fmt.Fprintf(hc.Stderr, "%s: %v\n", name, err)
+					// GNU wording: "gzip: bad.gz: not in gzip format".
+					if isGzipFormatError(err) {
+						// GNU emits a leading blank line before this diagnostic.
+						fmt.Fprintf(hc.Stderr, "\ngzip: %s: not in gzip format\n", p)
+					} else {
+						fmt.Fprintf(hc.Stderr, "%s: %v\n", name, err)
+					}
 					code = 1
 				}
 				continue
@@ -305,7 +361,7 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 			}
 		} else {
 			out := full + ".gz"
-			if err := gzipFile(full, out, *stdout); err != nil {
+			if err := gzipFile(hc, full, out, *stdout); err != nil {
 				fmt.Fprintf(hc.Stderr, "%s: %v\n", name, err)
 				code = 1
 				continue
@@ -321,14 +377,14 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 	return nil
 }
 
-func gzipFile(src, dst string, toStdout bool) error {
+func gzipFile(hc interp.HandlerContext, src, dst string, toStdout bool) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 	if toStdout {
-		gw := gzip.NewWriter(os.Stdout)
+		gw := gzip.NewWriter(hc.Stdout)
 		_, err = io.Copy(gw, in)
 		gw.Close()
 		return err
@@ -372,4 +428,30 @@ func gunzipFile(hc interp.HandlerContext, src, dst string, toStdout bool) error 
 		return err
 	}
 	return cerr
+}
+
+// isGzipFormatError reports whether err is a gzip magic-header error
+// (corrupt/non-gzip input), which GNU reports as "not in gzip format".
+func isGzipFormatError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "invalid header") ||
+		strings.Contains(msg, "unexpected EOF") ||
+		strings.Contains(msg, "unexpected end")
+}
+
+// isWithinDir reports whether target resides inside base (after cleaning).
+func isWithinDir(base, target string) bool {
+	absBase, err1 := filepath.Abs(base)
+	absTarget, err2 := filepath.Abs(target)
+	if err1 != nil || err2 != nil {
+		return false
+	}
+	rel, err := filepath.Rel(absBase, absTarget)
+	if err != nil {
+		return false
+	}
+	return rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }

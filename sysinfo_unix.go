@@ -3,6 +3,7 @@
 package main
 
 import (
+	"os/user"
 	"fmt"
 	"net"
 	"os"
@@ -182,7 +183,9 @@ func loadAvg() (float64, float64, float64) {
 func identity() (uid int, user string, gid int, group string) {
 	uid = os.Getuid()
 	gid = os.Getgid()
-	return uid, fmt.Sprintf("%d", uid), gid, fmt.Sprintf("%d", gid)
+	user = lookupUserName(uid)
+	group = lookupGroupName(gid)
+	return uid, user, gid, group
 }
 
 func ttyName() string { return "" }
@@ -387,3 +390,17 @@ func parseIPv6Hex(s string) (string, error) {
 
 var _ = runtime.GOOS
 var _ = filepath.Separator
+
+func lookupUserName(uid int) string {
+	if u, err := user.LookupId(fmt.Sprintf("%d", uid)); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return fmt.Sprintf("%d", uid)
+}
+
+func lookupGroupName(gid int) string {
+	if g, err := user.LookupGroupId(fmt.Sprintf("%d", gid)); err == nil && g.Name != "" {
+		return g.Name
+	}
+	return fmt.Sprintf("%d", gid)
+}

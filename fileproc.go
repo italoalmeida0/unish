@@ -26,8 +26,21 @@ func cmdDirname(_ context.Context, hc interp.HandlerContext, args []string) erro
 		return flag.ErrHelp
 	}
 	for _, p := range args[1:] {
-		d := filepath.Dir(strings.TrimSuffix(p, "/"))
-		fmt.Fprintln(hc.Stdout, filepath.ToSlash(d))
+		// GNU dirname preserves a leading "./" prefix; Go's
+		// filepath.Dir cleans it away (Dir("./a/b") == "a").
+		prefix := ""
+		q := p
+		if strings.Trim(q, "/") != "" {
+			q = strings.TrimSuffix(p, "/")
+		}
+		if strings.HasPrefix(q, "./") {
+			prefix = "./"
+		}
+		d := filepath.ToSlash(filepath.Dir(q))
+		if prefix != "" && d != "." && d != "/" {
+			d = prefix + strings.TrimPrefix(d, "/")
+		}
+		fmt.Fprintln(hc.Stdout, d)
 	}
 	return nil
 }
@@ -65,10 +78,12 @@ func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) err
 	if len(fs.Args()) == 0 {
 		return flag.ErrHelp
 	}
+	// GNU realpath resolves the lexical path even when the target does
+	// not exist (like `realpath -m`); only -e requires existence.
 	code := 0
 	for _, p := range fs.Args() {
 		full := resolve(hc.Dir, p)
-		if !*missing {
+		if *exists {
 			if _, err := os.Stat(full); err != nil {
 				fmt.Fprintln(hc.Stderr, "realpath:", err)
 				code = 1
@@ -130,7 +145,7 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 			var err error
 			dst, err = os.Readlink(full)
 			if err != nil {
-				fmt.Fprintln(hc.Stderr, "readlink:", err)
+				// GNU readlink on a non-symlink fails silently (exit 1).
 				code = 1
 				continue
 			}
@@ -166,12 +181,21 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		var err error
 		if *sym {
-			err = os.Symlink(resolve(hc.Dir, src), target)
+			err = os.Symlink(src, target)
 		} else {
 			err = os.Link(resolve(hc.Dir, src), target)
 		}
 		if err != nil {
-			fmt.Fprintln(hc.Stderr, "ln:", err)
+			// GNU wording: "ln: failed to create symbolic link 'DST': File exists".
+			if os.IsExist(err) {
+				kind := "hard link"
+				if *sym {
+					kind = "symbolic link"
+				}
+				fmt.Fprintf(hc.Stderr, "ln: failed to create %s '%s': File exists\n", kind, rest[len(rest)-1])
+			} else {
+				fmt.Fprintln(hc.Stderr, "ln:", err)
+			}
 			return exitError{1}
 		}
 	}
@@ -182,6 +206,8 @@ func cmdDu(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("du", hc.Stderr)
 	summary := fs.Bool("s", false, "")
 	human := fs.Bool("h", false, "")
+	apparent := fs.Bool("b", false, "")
+	fs.BoolVar(apparent, "bytes", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -191,19 +217,67 @@ func cmdDu(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	for _, p := range paths {
 		full := resolve(hc.Dir, p)
+		// GNU du without -L does not follow a symlink operand: it
+		// reports 0 blocks for the link itself.
+		if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			if *human {
+				fmt.Fprintf(hc.Stdout, "%s\t%s\n", humanDu(0), p)
+			} else {
+				fmt.Fprintf(hc.Stdout, "0\t%s\n", p)
+			}
+			continue
+		}
+		// GNU du reports disk usage (blocks), minimum 4K per file/dir
+		// entry on most filesystems; unish approximates with apparent
+		// sizes rounded up to 4K blocks for parity on small trees.
 		var total int64
+		var entries int64
 		filepath.Walk(full, func(_ string, info os.FileInfo, err error) error {
-			if err == nil && !info.IsDir() {
+			if err != nil {
+				return nil
+			}
+			entries++
+			if !info.IsDir() {
 				total += info.Size()
 			}
 			return nil
 		})
-		if *human {
-			fmt.Fprintf(hc.Stdout, "%s\t%s\n", humanSize(total), p)
-		} else {
-			fmt.Fprintf(hc.Stdout, "%d\t%s\n", total/1024+1, p)
+		blocks := (total + 4095) / 4096
+		if blocks < 1 {
+			blocks = 1
+		}
+		// +1 block per directory entry (d itself, subdirs), min like du.
+		var dirs int64
+		filepath.Walk(full, func(_ string, info os.FileInfo, err error) error {
+			if err == nil && info.IsDir() {
+				dirs++
+			}
+			return nil
+		})
+		_ = entries
+		// GNU sums one 4K block per file plus one per directory.
+		fblocks := (total + 4095) / 4096
+		if total > 0 && fblocks < 1 {
+			fblocks = 1
+		}
+		if total == 0 {
+			fblocks = 0
+		}
+		if *apparent {
+			// GNU du -b: apparent size in bytes (exact, portable).
+			fmt.Fprintf(hc.Stdout, "%d\t%s\n", total, p)
+			continue
+		}
+		kb := (fblocks + dirs) * 4
+		if kb < 4 {
+			kb = 4
 		}
 		_ = summary
+		if *human {
+			fmt.Fprintf(hc.Stdout, "%s\t%s\n", humanDu(kb*1024), p)
+		} else {
+			fmt.Fprintf(hc.Stdout, "%d\t%s\n", kb, p)
+		}
 	}
 	return nil
 }
@@ -228,9 +302,16 @@ func cmdSleep(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	}
 	var total time.Duration
 	for _, a := range args[1:] {
+		// GNU sleep rejects negative intervals as invalid options.
+		if strings.HasPrefix(a, "-") {
+			fmt.Fprintf(hc.Stderr, "sleep: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+			fmt.Fprintln(hc.Stderr, "Try 'sleep --help' for more information.")
+			return exitError{1}
+		}
 		d, err := parseDurationLoose(a)
 		if err != nil {
-			fmt.Fprintln(hc.Stderr, "sleep: invalid time interval:", a)
+			fmt.Fprintf(hc.Stderr, "sleep: invalid time interval \u2018%s\u2019\n", a)
+			fmt.Fprintln(hc.Stderr, "Try 'sleep --help' for more information.")
 			return exitError{1}
 		}
 		total += d
@@ -259,12 +340,28 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 	sig := "TERM"
 	var pids []string
 	for _, a := range args[1:] {
-		if strings.HasPrefix(a, "-") && len(a) > 1 && (a[1] < '0' || a[1] > '9') {
-			sig = strings.ToUpper(strings.TrimPrefix(a, "-"))
-			if strings.HasPrefix(sig, "SIG") {
-				sig = sig[3:]
-			}
+		if a == "--" {
 			continue
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			name := strings.ToUpper(strings.TrimPrefix(a, "-"))
+			if strings.HasPrefix(name, "SIG") {
+				name = name[3:]
+			}
+			// -N (all digits): signal number if valid, else GNU
+			// reports "invalid signal specification".
+			if isDigits(name) {
+				if validSignalNumber(name) {
+					sig = name
+					continue
+				}
+				fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", strings.TrimPrefix(a, "-"))
+				return exitError{1}
+			}
+			if a[1] < '0' || a[1] > '9' {
+				sig = name
+				continue
+			}
 		}
 		pids = append(pids, a)
 	}
@@ -274,20 +371,39 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 	}
 	code := 0
 	for _, p := range pids {
+		// Job table first: fake $! ids ("g1"), real tracked pids,
+		// and jobspecs (%1, %%/\%+, \%-, \%name, \%?substr).
+		if j := globalJobs.resolveJobSpec(p); j != nil && j.proc != nil {
+			if err := killProc(j.proc, sig); err != nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", j.pid, killErrText(err))
+				code = 1
+			}
+			continue
+		}
 		pid, err := strconv.Atoi(p)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "kill:", err)
 			code = 1
 			continue
 		}
+		// Untracked numeric pid (possibly a fake id that never ran
+		// anything external): newest-live-child fallback keeps
+		// `kill $!` useful right after `cmd &`.
+		if j := globalJobs.byPID(pid); j != nil && j.proc != nil {
+			if err := killProc(j.proc, sig); err != nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", j.pid, killErrText(err))
+				code = 1
+			}
+			continue
+		}
 		proc, err := os.FindProcess(pid)
 		if err != nil {
-			fmt.Fprintln(hc.Stderr, "kill:", err)
+			fmt.Fprintf(hc.Stderr, "kill: (%d) - No such process\n", pid)
 			code = 1
 			continue
 		}
 		if err := killProc(proc, sig); err != nil {
-			fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", pid, err)
+			fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", pid, killErrText(err))
 			code = 1
 		}
 	}
@@ -299,11 +415,35 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 
 func cmdDate(_ context.Context, hc interp.HandlerContext, args []string) error {
 	now := time.Now()
+	// Honor TZ from the environment like GNU date (at minimum UTC and
+	// IANA zones when tzdata is available).
+	if tz := shellGetenv(hc, "TZ"); tz != "" {
+		if tz == "UTC" || tz == "UTC0" || tz == "Z" {
+			now = now.UTC()
+		} else if loc, err := time.LoadLocation(tz); err == nil {
+			now = now.In(loc)
+		}
+	}
 	var format string
-	for _, a := range args[1:] {
+	argv := splitAttached("date", args)[1:]
+	for k := 0; k < len(argv); k++ {
+		a := argv[k]
 		switch {
 		case a == "-u" || a == "--utc" || a == "--universal":
 			now = now.UTC()
+		case a == "-d" || a == "--date":
+			if k+1 >= len(argv) {
+				fmt.Fprintln(hc.Stderr, "date: option requires an argument -- 'd'")
+				return exitError{1}
+			}
+			k++
+			t, err := parseTouchDate(argv[k])
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "date: invalid date '%s'\n", argv[k])
+				return exitError{1}
+			}
+			// Keep wall clock, like GNU -d (no forced zone shift).
+			now = t
 		case strings.HasPrefix(a, "+"):
 			format = a[1:]
 		}
@@ -424,9 +564,15 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 	fs := newFlagSet("mktemp", hc.Stderr)
 	isDir := fs.Bool("d", false, "")
 	tmpdir := fs.String("p", "", "")
+	dryRun := fs.Bool("u", false, "")
+	fs.BoolVar(dryRun, "dry-run", false, "")
+	fs.Bool("t", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	// GNU mktemp -t: interpret template as relative to $TMPDIR (compat).
+	// The template still comes from positional args; -t only changes the
+	// directory interpretation, which already defaults to os.TempDir().
 	dir := *tmpdir
 	if dir == "" {
 		dir = os.TempDir()
@@ -439,11 +585,39 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 	}
 	if *tmpdir == "" {
 		if d := filepath.Dir(pattern); d != "." && d != "" {
-			dir = resolve(hc.Dir, d)
+			// A template directory of /tmp (or any absolute POSIX path
+			// that does not exist, e.g. on Windows) falls back to the
+			// OS temp dir, matching GNU's "create in /tmp" intent.
+			cand := resolve(hc.Dir, d)
+			if st, err := os.Stat(cand); err != nil || !st.IsDir() {
+				if filepath.IsAbs(d) || strings.HasPrefix(d, "/") {
+					cand = os.TempDir()
+				}
+			}
+			dir = cand
 			pattern = filepath.Base(pattern)
 		}
 	}
 	prefix, suffix := splitMktempPattern(pattern)
+	if *dryRun {
+		name, err := os.MkdirTemp("", "")
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "mktemp:", err)
+			return exitError{1}
+		}
+		os.Remove(name)
+		// Derive a non-created name with same pattern in target dir.
+		f, err := os.CreateTemp(dir, prefix+"*"+suffix)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "mktemp:", err)
+			return exitError{1}
+		}
+		nm := f.Name()
+		f.Close()
+		os.Remove(nm)
+		fmt.Fprintln(hc.Stdout, filepath.ToSlash(nm))
+		return nil
+	}
 	if *isDir {
 		name, err := os.MkdirTemp(dir, prefix+"*"+suffix)
 		if err != nil {
@@ -609,18 +783,28 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-name":
 			pat := next()
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				if ok, _ := filepath.Match(pat, n.fi.Name()); ok {
+				// GNU matches -name against the basename of the path
+				// as given ("." for the root), not the resolved name.
+				base := n.fi.Name()
+				if b := pathBase(n.display); b != "" {
+					base = b
+				}
+				if ok, _ := filepath.Match(pat, base); ok {
 					return true
 				}
 				if strings.HasPrefix(pat, ".") && !strings.ContainsAny(pat, "*?[") {
-					return strings.HasSuffix(n.fi.Name(), pat)
+					return strings.HasSuffix(base, pat)
 				}
 				return false
 			}
 		case "-iname":
 			pat := strings.ToLower(next())
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				name := strings.ToLower(n.fi.Name())
+				base := n.fi.Name()
+				if b := pathBase(n.display); b != "" {
+					base = b
+				}
+				name := strings.ToLower(base)
 				if ok, _ := filepath.Match(pat, name); ok {
 					return true
 				}
@@ -811,6 +995,11 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 				}
 				return true
 			}
+		case "-perm":
+			modeStr := next()
+			return func(n *findNode, _ interp.HandlerContext) bool {
+				return matchPerm(n, modeStr)
+			}
 		case "-true":
 			return func(*findNode, interp.HandlerContext) bool { return true }
 		case "-false":
@@ -930,9 +1119,25 @@ func cmdShasum(_ context.Context, hc interp.HandlerContext, args []string) error
 func cmdHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet(name, hc.Stderr)
 	fs.Bool("b", false, "")
+	fs.Bool("binary", false, "")
 	fs.Bool("t", false, "")
+	fs.Bool("text", false, "")
+	check := fs.Bool("c", false, "")
+	fs.BoolVar(check, "check", false, "")
+	quiet := fs.Bool("quiet", false, "")
+	status := fs.Bool("status", false, "")
+	strict := fs.Bool("strict", false, "")
+	fs.Bool("tag", false, "")
+	warn := fs.Bool("w", false, "")
+	fs.BoolVar(warn, "warn", false, "")
+	_ = quiet
+	_ = status
+	_ = strict
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	if *check {
+		return runHashCheck(name, newHash, hc, fs.Args(), *quiet, *status)
 	}
 	return runHash(name, newHash, hc, fs.Args())
 }
@@ -946,7 +1151,7 @@ func runHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, fi
 		var r io.Reader = hc.Stdin
 		label := "-"
 		if f != "-" {
-			fh, err := os.Open(resolve(hc.Dir, f))
+			fh, err := openShellFile(resolve(hc.Dir, f))
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, name+":", err)
 				code = 1
@@ -979,3 +1184,262 @@ func runHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, fi
 }
 
 var _ = runtime.GOOS
+
+// runHashCheck implements `md5sum/sha*sum -c FILE`: reads checksum lines
+// ("<hex> [* ]<path>") and verifies each file, printing "path: OK" or
+// "path: FAILED" like GNU. Returns exit 0 iff all checked files match.
+func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string, quiet, status bool) error {
+	if len(files) == 0 {
+		files = []string{"-"}
+	}
+	code := 0
+	checked := 0
+	failed := 0
+	badFmt := 0
+	for _, f := range files {
+		var data []byte
+		var err error
+		if f == "-" {
+			data, err = io.ReadAll(hc.Stdin)
+		} else {
+		data, err = readShellFile(resolve(hc.Dir, f))
+		}
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, name+":", err)
+			code = 1
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n") {
+			line = strings.TrimRight(line, "\r")
+			if line == "" || strings.HasPrefix(line, "#") {
+				continue
+			}
+		sum, path, ok := parseHashLine(line)
+			if !ok {
+				badFmt++
+				continue
+			}
+			checked++
+		raw, err := readShellFile(resolve(hc.Dir, path))
+			if err != nil {
+				if !status {
+					fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", name, path, err)
+				}
+				code = 1
+				failed++
+				continue
+			}
+			h := newHash()
+			h.Write(raw)
+			got := hex.EncodeToString(h.Sum(nil))
+			if !strings.EqualFold(got, sum) {
+				if !status {
+					if !quiet {
+						fmt.Fprintf(hc.Stdout, "%s: FAILED\n", path)
+					}
+					fmt.Fprintf(hc.Stderr, "%s: WARNING: 1 computed checksum did NOT match\n", name)
+				}
+				code = 1
+				failed++
+				continue
+			}
+			if !status && !quiet {
+				fmt.Fprintf(hc.Stdout, "%s: OK\n", path)
+			}
+		}
+	}
+	if checked == 0 {
+		for _, f := range files {
+			if f != "-" {
+				fmt.Fprintf(hc.Stderr, "%s: %s: no properly formatted checksum lines found\n", name, f)
+			}
+		}
+		return exitError{1}
+	}
+	_ = failed
+	_ = badFmt
+	if code != 0 {
+		return exitError{code}
+	}
+	return nil
+}
+
+// parseHashLine splits a GNU checksum line: "<hex>[ *]<path>" or BSD
+// "ALGO (path) = <hex>". Returns sum, path, ok.
+func parseHashLine(line string) (string, string, bool) {
+	if i := strings.Index(line, " = "); i >= 0 {
+		left, sum := line[:i], strings.TrimSpace(line[i+3:])
+		if o := strings.Index(left, "("); o >= 0 {
+			if c := strings.LastIndex(left, ")"); c > o {
+				if isHex(sum) {
+					return sum, left[o+1 : c], true
+				}
+			}
+		}
+	}
+	fields := strings.Fields(line)
+	if len(fields) < 2 {
+		return "", "", false
+	}
+	sum := fields[0]
+	if !isHex(sum) {
+		return "", "", false
+	}
+	rest := strings.TrimSpace(line[len(sum):])
+	if rest == "" {
+		return "", "", false
+	}
+	// GNU separates sum and path with "  " (text), " *" (binary),
+	// or " *" with escaped backslash/line: strip one leading marker.
+	rest = strings.TrimPrefix(rest, "*")
+	rest = strings.TrimPrefix(rest, " ")
+	if rest == "" {
+		return "", "", false
+	}
+	return sum, rest, true
+}
+
+func isHex(s string) bool {
+	if len(s) < 8 || len(s)%2 != 0 {
+		return false
+	}
+	for _, c := range s {
+		if !(c >= '0' && c <= '9' || c >= 'a' && c <= 'f' || c >= 'A' && c <= 'F') {
+			return false
+		}
+	}
+	return true
+}
+
+// humanDu formats bytes GNU-du -h style: "4.0K", "1.2M" (powers of 1024,
+// one decimal, K/M/G suffix without "iB").
+func humanDu(n int64) string {
+	if n < 1024 {
+		// GNU rounds sub-K sizes up into K display via block count;
+		// direct byte values under 1K show as e.g. "4.0K" after blocks.
+		return fmt.Sprintf("%.1fK", float64(n)/1024)
+	}
+	units := []string{"K", "M", "G", "T", "P", "E"}
+	v := float64(n) / 1024
+	u := 0
+	for v >= 1024 && u < len(units)-1 {
+		v /= 1024
+		u++
+	}
+	if v >= 10 {
+		return fmt.Sprintf("%.0f%s", v, units[u])
+	}
+	return fmt.Sprintf("%.1f%s", v, units[u])
+}
+
+func isDigits(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, c := range s {
+		if c < '0' || c > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// validSignalNumber reports whether n names a real signal (1-64,
+// excluding 32-33 on Linux). Used for `kill -N` parsing like GNU.
+func validSignalNumber(n string) bool {
+	v, err := strconv.Atoi(n)
+	if err != nil {
+		return false
+	}
+	if v >= 1 && v <= 31 {
+		return true
+	}
+	if v >= 34 && v <= 64 {
+		return true
+	}
+	return false
+}
+
+// matchPerm implements find -perm MODE: exact match (644), all-bits
+// (-mode), any-bit (/mode). Symbolic specs (u+x) match when all listed
+// bits are present.
+func matchPerm(n *findNode, spec string) bool {
+	perm := n.fi.Mode().Perm()
+	if strings.HasPrefix(spec, "-") {
+		want, err := strconv.ParseUint(spec[1:], 8, 32)
+		if err != nil {
+			return false
+		}
+		return uint32(perm)&uint32(want) == uint32(want)
+	}
+	if strings.HasPrefix(spec, "/") {
+		want, err := strconv.ParseUint(spec[1:], 8, 32)
+		if err != nil {
+			return false
+		}
+		return uint32(perm)&uint32(want) != 0
+	}
+	if want, err := strconv.ParseUint(spec, 8, 32); err == nil {
+		return uint32(perm) == uint32(want)
+	}
+	// Symbolic: all of u=rwx,g=..,o=.. bits present (best-effort).
+	want := os.FileMode(0)
+	for _, clause := range strings.Split(spec, ",") {
+		op := strings.IndexAny(clause, "+-=")
+		if op < 0 {
+			return false
+		}
+		who, perms := clause[:op], clause[op+1:]
+		if who == "" || who == "a" {
+			who = "ugo"
+		}
+		var bits os.FileMode
+		for _, c := range perms {
+			switch c {
+			case 'r':
+				bits |= 0o444
+			case 'w':
+				bits |= 0o222
+			case 'x':
+				bits |= 0o111
+			}
+		}
+		mask := os.FileMode(0)
+		for _, c := range who {
+			switch c {
+			case 'u':
+				mask |= 0o700
+			case 'g':
+				mask |= 0o070
+			case 'o':
+				mask |= 0o007
+			}
+		}
+		want |= bits & mask
+	}
+	return perm&want == want
+}
+
+// pathBase returns the basename of a find display path ("." for roots
+// like "." or "./").
+func pathBase(display string) string {
+	d := strings.TrimSuffix(display, "/")
+	if d == "." || d == "" {
+		return "."
+	}
+	if i := strings.LastIndex(d, "/"); i >= 0 {
+		return d[i+1:]
+	}
+	return d
+}
+
+// killErrText maps OS kill errors to GNU-style diagnostics.
+func killErrText(err error) string {
+	msg := err.Error()
+	if strings.Contains(msg, "already finished") || strings.Contains(msg, "not found") ||
+		strings.Contains(msg, "OpenProcess") || strings.Contains(msg, "parameter is incorrect") ||
+		strings.Contains(msg, "Access is denied") {
+		return "No such process"
+	}
+	return msg
+}
