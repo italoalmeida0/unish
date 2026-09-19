@@ -1228,7 +1228,7 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 	for _, f := range files {
 		var data []byte
 		var err error
-		if f == "-" {
+		if f == "-" || f == "/dev/stdin" {
 			data, err = io.ReadAll(hc.Stdin)
 		} else {
 			data, err = readShellFile(resolve(hc.Dir, f))

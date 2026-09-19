@@ -453,7 +453,7 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	} else {
 		for _, f := range files {
-			if f == "" {
+			if f == "" || f == "-" || f == "/dev/stdin" {
 				emit("", hc.Stdin)
 				continue
 			}
@@ -2270,7 +2270,7 @@ func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error 
 	var shared []string
 	var sharedPos int
 	for _, f := range files {
-		if f == "-" {
+		if f == "-" || f == "/dev/stdin" {
 			if !stdinBuffered {
 				data, err := io.ReadAll(hc.Stdin)
 				if err != nil {
@@ -2602,9 +2602,26 @@ func cmdDiff(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "diff: need 2 files")
 		return flag.ErrHelp
 	}
+	// GNU: repeated stdin operands (`- -`, `/dev/stdin /dev/stdin`)
+	// read SUCCESSIVE chunks — but a pipe delivers one stream, so the
+	// first read consumes everything and later ones see EOF (empty).
+	// Buffer stdin once and hand out each read a successive LINE-chunk
+	// would be wrong for diff (byte-exact compare); instead buffer once
+	// and give every stdin operand the SAME full content (matches the
+	// observable GNU result for identical-input compares).
+	var stdinData []byte
+	stdinBuffered := false
 	readOne := func(name string) ([]byte, error) {
-		if name == "-" {
-			return io.ReadAll(hc.Stdin)
+		if name == "-" || name == "/dev/stdin" {
+			if !stdinBuffered {
+				var err error
+				stdinData, err = io.ReadAll(hc.Stdin)
+				if err != nil {
+					return nil, err
+				}
+				stdinBuffered = true
+			}
+			return stdinData, nil
 		}
 		return readShellFile(resolve(hc.Dir, name))
 	}

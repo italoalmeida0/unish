@@ -708,9 +708,8 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	_ = ignoreGarbage // accepted for parity; decoder already skips whitespace; strict alphabet kept for real garbage
 	var data []byte
-	if len(fs.Args()) > 0 {
+	if len(fs.Args()) > 0 && fs.Args()[0] != "-" && fs.Args()[0] != "/dev/stdin" {
 		var err error
 		data, err = readShellFile(resolve(hc.Dir, fs.Args()[0]))
 		if err != nil {
@@ -725,8 +724,13 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 		}
 	}
 	if *decode {
-		clean := strings.Join(strings.Fields(string(data)), "")
-		out, err := base64.StdEncoding.DecodeString(clean)
+		s := string(data)
+		if *ignoreGarbage {
+			s = stripNonAlphabet(s)
+		} else {
+			s = strings.Join(strings.Fields(s), "")
+		}
+		out, err := base64.StdEncoding.DecodeString(s)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "base64: invalid input")
 			return exitError{1}
@@ -748,6 +752,22 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 }
 
 var _ = runtime.GOOS
+
+// stripNonAlphabet drops every byte outside the base64 alphabet (plus
+// '=' padding), for `base64 -d -i/--ignore-garbage` (GNU recovers from
+// non-alphabet bytes in the stream instead of failing).
+func stripNonAlphabet(s string) string {
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= 'A' && c <= 'Z' || c >= 'a' && c <= 'z' ||
+			c >= '0' && c <= '9' || c == '+' || c == '/' || c == '=' {
+			sb.WriteByte(c)
+		}
+	}
+	return sb.String()
+}
 
 // parseTouchDate parses GNU touch -d operands: RFC3339, "2006-01-02",
 // "2006-01-02 15:04:05", "@epoch", and common variants.

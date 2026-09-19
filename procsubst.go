@@ -256,6 +256,10 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 // releases the substitution (deleting it when last) on Close; callers
 // must Close it (all builtins defer-close their inputs).
 func openShellFile(path string) (io.ReadWriteCloser, error) {
+	// /dev/stdin (and friends) do not exist on Windows: callers pass
+	// hc.Stdin through devStdinReader instead of openShellFile, so this
+	// is only reached on unix (real /dev/stdin) or odd spellings —
+	// keep the direct open so the true OS error surfaces.
 	if st := winProcSubstLookup(path); st != nil {
 		<-st.producerDone
 		f, err := openRetry(path)

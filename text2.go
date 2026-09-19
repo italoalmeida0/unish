@@ -1001,7 +1001,7 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 		joiner = *sep
 	}
 	readTable := func(path string) ([][]string, error) {
-		if path == "-" {
+		if path == "-" || path == "/dev/stdin" {
 			var rows [][]string
 			sc := newLineReader(hc.Stdin)
 			for sc.Scan() {

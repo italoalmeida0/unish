@@ -282,7 +282,7 @@ func callOverride(ctx context.Context, args []string) ([]string, error) {
 }
 
 func resolve(dir, p string) string {
-	if p == "" || p == "-" || filepath.IsAbs(p) || dir == "" {
+	if p == "" || p == "-" || p == "/dev/stdin" || filepath.IsAbs(p) || dir == "" {
 		return p
 	}
 	if runtime.GOOS == "windows" && len(p) > 0 && (p[0] == '/' || p[0] == '\\') {
@@ -691,7 +691,7 @@ func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader
 		}
 	}
 	for _, a := range args {
-		if a == "-" {
+		if a == "-" || a == "/dev/stdin" {
 			readers = append(readers, stdin)
 			names = append(names, "standard input")
 			continue

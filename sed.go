@@ -131,7 +131,7 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		r.runStream(prog, hc.Stdin)
 	} else {
 		for _, in := range inputs {
-			if in == "-" {
+			if in == "-" || in == "/dev/stdin" {
 				r.runStream(prog, hc.Stdin)
 				continue
 			}

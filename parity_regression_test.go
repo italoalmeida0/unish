@@ -1041,3 +1041,25 @@ func TestParityRmDotGuard(t *testing.T) {
 		t.Errorf("keep.txt should have been removed, stat err = %v", err)
 	}
 }
+
+func TestParityDevStdin(t *testing.T) {
+	dir := t.TempDir()
+	// /dev/stdin as operand (incl. repeated) — must work on Windows too,
+	// where the OS has no such file.
+	out, _, err := runParityScript(t, dir, "printf 'hi' | base64 -i /dev/stdin")
+	if exitCode(err) != 0 || out != "aGk=\n" {
+		t.Errorf("base64 -i /dev/stdin = %q code %d", out, exitCode(err))
+	}
+	out, _, err = runParityScript(t, dir, "printf 'a\\nb\\n' | grep b /dev/stdin")
+	if exitCode(err) != 0 || out != "b\n" {
+		t.Errorf("grep /dev/stdin = %q code %d", out, exitCode(err))
+	}
+	out, _, err = runParityScript(t, dir, "printf 'a\\n' | diff - /dev/stdin; printf 'a\\n' | diff /dev/stdin /dev/stdin")
+	if exitCode(err) != 0 || out != "" {
+		t.Errorf("diff /dev/stdin = %q code %d", out, exitCode(err))
+	}
+	out, _, err = runParityScript(t, dir, "printf 'aG!k=' | base64 -d -i; echo")
+	if exitCode(err) != 0 || out != "hi\n" {
+		t.Errorf("base64 -d -i garbage = %q code %d", out, exitCode(err))
+	}
+}
