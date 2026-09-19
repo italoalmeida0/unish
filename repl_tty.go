@@ -80,11 +80,17 @@ func runInteractive() int {
 		return rp.plainLoop()
 	}
 	// Try raw mode; on failure fall back too.
+	// On Windows, stdin may be piped while CONIN$ exists (child with
+	// redirected pipes): rawOnHandle stashes the console file in
+	// conInFile and reads come from there.
 	restore, ok := termRawOn()
 	if !ok {
 		return rp.plainLoop()
 	}
 	defer restore()
+	if conInFile != nil {
+		rp.inFile = conInFile
+	}
 	rp.rawOn = true
 	code := rp.ttyLoop()
 	// Persist new history (append, like bash).
@@ -213,13 +219,17 @@ func (rp *repl) acceptLine(line string) int {
 // ttyLoop is the raw-mode readline loop.
 func (rp *repl) ttyLoop() int {
 	var lb lineBuf
-	var promptDisp, promptRaw string
+	var promptDisp string
+	rn := newLineRenderer(rp.out, "", rp.width)
 	redraw := func() {}
 	redraw = func() {
-		renderPrompt(rp.out, promptDisp, promptRaw, &lb, rp.width)
+		rn.prompt = promptDisp
+		rn.draw(lb.text, lb.pos)
 	}
 	for {
-		promptDisp, promptRaw = rp.prompt(true)
+		promptDisp, _ = rp.prompt(true)
+		rn.prompt = promptDisp
+		rn.invalidate() // new prompt (PROMPT_COMMAND may change it)
 		lb.clear()
 		rp.histIdx = len(rp.hist.items)
 		rp.liveSaved = ""
@@ -231,7 +241,7 @@ func (rp *repl) ttyLoop() int {
 			rp.pendingVerify = false
 		}
 		redraw()
-		line, ctrl := rp.readEditedLine(&lb, promptDisp, promptRaw, redraw)
+		line, ctrl := rp.readEditedLine(&lb, rn, redraw)
 		if ctrl == readCtrlD && lb.String() == "" {
 			fmt.Fprintln(rp.out)
 			break
@@ -243,12 +253,16 @@ func (rp *repl) ttyLoop() int {
 		full := line
 		// Multiline continuation.
 		for incomplete(full) {
-			p2d, p2r := rp.prompt(false)
+			p2d, _ := rp.prompt(false)
 			var lb2 lineBuf
+			// Commit the current row: move to a fresh line so the
+			// previous block is never redrawn over.
 			fmt.Fprintln(rp.out)
-			renderPrompt(rp.out, p2d, p2r, &lb2, rp.width)
-			cont, c2 := rp.readEditedLine(&lb2, p2d, p2r, func() {
-				renderPrompt(rp.out, p2d, p2r, &lb2, rp.width)
+			rn2 := newLineRenderer(rp.out, p2d, rp.width)
+			rn2.draw(lb2.text, lb2.pos)
+			cont, c2 := rp.readEditedLine(&lb2, rn2, func() {
+				rn2.prompt = p2d
+				rn2.draw(lb2.text, lb2.pos)
 			})
 			if c2 == readCtrlC {
 				full = ""
@@ -299,7 +313,7 @@ const (
 )
 
 // readEditedLine reads one (single-line buffer) edited line.
-func (rp *repl) readEditedLine(lb *lineBuf, promptDisp, promptRaw string, redraw func()) (string, readCtrl) {
+func (rp *repl) readEditedLine(lb *lineBuf, rn *lineRenderer, redraw func()) (string, readCtrl) {
 	var killBuf string
 	tmp := make([]byte, 256)
 	for {
@@ -319,13 +333,18 @@ func (rp *repl) readEditedLine(lb *lineBuf, promptDisp, promptRaw string, redraw
 			rp.tabCountReset(k)
 			switch {
 			case k.code == keyEnter:
-				return lb.String(), readOK
-			case k.code == keyCtrlC:
-				fmt.Fprintln(rp.out)
 				if rp.searchMode {
-					rp.searchMode = false
+					rp.searchAccept(rn, lb)
 					continue
 				}
+				return lb.String(), readOK
+			case k.code == keyCtrlC:
+				if rp.searchMode {
+					rp.searchCancel(rn, lb, redraw)
+					continue
+				}
+				rn.clear()
+				fmt.Fprintln(rp.out)
 				return "", readCtrlC
 			case k.code == keyCtrlD:
 				if len(lb.text) == 0 {
@@ -335,44 +354,84 @@ func (rp *repl) readEditedLine(lb *lineBuf, promptDisp, promptRaw string, redraw
 				redraw()
 			case k.code == keyBackspace:
 				if rp.searchMode {
-					rp.searchBackspace(redraw)
+					rp.searchBackspace(rn, lb)
 					continue
 				}
-				lb.backspace()
-				redraw()
+				if lb.backspace() {
+					redraw()
+				} else {
+					bell(rp.out)
+				}
 			case k.code == keyDelete:
-				lb.deleteAt()
-				redraw()
+				if lb.deleteAt() {
+					redraw()
+				} else {
+					bell(rp.out)
+				}
 			case k.code == keyLeft || k.code == keyCtrlB:
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
 				if lb.pos > 0 {
 					lb.pos--
 					redraw()
+				} else {
+					bell(rp.out)
 				}
 			case k.code == keyRight || k.code == keyCtrlF:
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
 				if lb.pos < len(lb.text) {
 					lb.pos++
 					redraw()
+				} else {
+					bell(rp.out)
 				}
 			case k.code == keyHome || k.code == keyCtrlA:
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
+				if lb.pos == 0 {
+					bell(rp.out)
+					continue
+				}
 				lb.pos = 0
 				redraw()
 			case k.code == keyEnd || k.code == keyCtrlE:
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
+				if lb.pos == len(lb.text) {
+					bell(rp.out)
+					continue
+				}
 				lb.pos = len(lb.text)
 				redraw()
 			case k.code == keyUp || k.code == keyCtrlP:
 				if rp.searchMode {
-					rp.searchPrev(redraw)
+					rp.searchPrev(rn, lb)
 					continue
 				}
-				rp.histMove(-1, lb)
-				redraw()
+				if rp.histMove(-1, lb) {
+					redraw()
+				} else {
+					bell(rp.out)
+				}
 			case k.code == keyDown || k.code == keyCtrlN:
 				if rp.searchMode {
-					rp.searchNext(redraw)
+					rp.searchNext(rn, lb)
 					continue
 				}
-				rp.histMove(1, lb)
-				redraw()
+				if rp.histMove(1, lb) {
+					redraw()
+				} else {
+					bell(rp.out)
+				}
 			case k.code == keyCtrlK:
 				killBuf = lb.killToEnd()
 				redraw()
@@ -402,15 +461,27 @@ func (rp *repl) readEditedLine(lb *lineBuf, promptDisp, promptRaw string, redraw
 				fmt.Fprint(rp.out, "\x1b[H\x1b[2J")
 				redraw()
 			case k.code == keyCtrlR:
-				rp.searchStart(lb, redraw)
+				rp.searchStart(rn, lb)
+			case k.code == keyCtrlS:
+				if rp.searchMode {
+					rp.searchNext(rn, lb)
+				} else {
+					bell(rp.out)
+				}
 			case k.code == keyTab:
-				rp.doTab(lb, redraw)
+				if rp.searchMode {
+					bell(rp.out)
+					continue
+				}
+				rp.doTab(lb, rn, redraw)
 				_ = killBuf
-			case k.code == keyCtrlC:
-				return "", readCtrlC
 			case k.r != 0:
 				if rp.searchMode {
-					rp.searchType(k.r, lb, redraw)
+					if k.code == keyEscape {
+						rp.searchCancel(rn, lb, redraw)
+						continue
+					}
+					rp.searchType(k.r, rn, lb)
 					continue
 				}
 				if k.code == keyEscape {
@@ -434,16 +505,20 @@ func (rp *repl) tabCountReset(k vtKey) {
 }
 
 // histMove browses history (-1 older, +1 newer), stashing live line.
-func (rp *repl) histMove(dir int, lb *lineBuf) {
+// Reports whether the line changed (caller bells when false).
+func (rp *repl) histMove(dir int, lb *lineBuf) bool {
 	if len(rp.hist.items) == 0 {
-		return
+		return false
 	}
 	if rp.histIdx == len(rp.hist.items) {
 		rp.liveSaved = lb.String()
 	}
 	ni := rp.histIdx + dir
 	if ni < 0 || ni > len(rp.hist.items) {
-		return
+		return false
+	}
+	if ni == rp.histIdx {
+		return false
 	}
 	rp.histIdx = ni
 	lb.clear()
@@ -452,17 +527,19 @@ func (rp *repl) histMove(dir int, lb *lineBuf) {
 	} else {
 		lb.insertStr(rp.hist.items[ni])
 	}
+	return true
 }
 
 // doTab performs completion: first Tab completes common prefix,
-// second Tab on same word lists alternatives.
-func (rp *repl) doTab(lb *lineBuf, redraw func()) {
+// second Tab on same word lists alternatives in columns.
+func (rp *repl) doTab(lb *lineBuf, rn *lineRenderer, redraw func()) {
 	line := lb.String()
 	start, word := wordAt(line, lb.pos)
 	repl, cands := completeWord(line, lb.pos, rp.r, nil)
 	_ = start
 	if len(cands) == 0 {
-		return // bell? stay silent like bash with no matches (actually rings; skip)
+		bell(rp.out)
+		return
 	}
 	if repl != "" && repl != word {
 		// Replace word with completion.
@@ -472,8 +549,7 @@ func (rp *repl) doTab(lb *lineBuf, redraw func()) {
 		lb.pos = start + len([]rune(repl))
 		redraw()
 		rp.tabCount = 0
-		// Trailing space for command/word completion like bash? Only
-		// when single file/dir match without further ambiguity — the
+		// Trailing space for single matches (bash behavior); the
 		// candidate already includes "/" for dirs.
 		if len(cands) == 1 && !strings.HasSuffix(repl, "/") {
 			lb.insert(' ')
@@ -485,52 +561,62 @@ func (rp *repl) doTab(lb *lineBuf, redraw func()) {
 	if rp.tabCount == 0 || rp.lastTab != word {
 		rp.tabCount = 1
 		rp.lastTab = word
-		return // first Tab: show nothing (bash rings bell)
+		bell(rp.out)
+		return
 	}
-	// Second Tab: list.
+	// Second Tab: commit the current row, list in columns, redraw.
+	rn.clear()
 	fmt.Fprintln(rp.out)
-	for _, c := range cands {
-		fmt.Fprintln(rp.out, c)
-	}
+	printCompletions(rp.out, cands, rp.width)
 	rp.tabCount = 0
 	rp.tabShown = true
+	rn.invalidate()
 	redraw()
 }
 
-// renderPrompt redraws prompt + buffer, positioning the cursor.
-// Multiline: wraps by terminal width; cursor via absolute moves.
+// renderPrompt is kept for plainLoop-less callers (tests); the TTY
+// loop now draws through lineRenderer.
 func renderPrompt(out io.Writer, promptDisp, promptRaw string, lb *lineBuf, width int) {
-	// CR + clear to end, then full redraw (simplest correct).
-	fmt.Fprint(out, "\r\x1b[K")
-	fmt.Fprint(out, promptDisp)
-	fmt.Fprint(out, lb.String())
-	// Move cursor back from end to pos.
-	back := len(lb.text) - lb.pos
-	if back > 0 {
-		// Move left by CELL width, not runes.
-		cells := 0
-		for _, r := range lb.text[lb.pos:] {
-			cells += runeWidth(r)
-		}
-		if cells > 0 {
-			fmt.Fprintf(out, "\x1b[%dD", cells)
-		}
-	}
+	rn := newLineRenderer(out, promptDisp, width)
+	rn.draw(lb.text, lb.pos)
 	_ = promptRaw
-	_ = width
+}
+
+// searchLine builds the Ctrl-R overlay text for the current state.
+func (rp *repl) searchLine() string {
+	m := rp.searchMatchIdx()
+	if m >= 0 {
+		return fmt.Sprintf("(reverse-i-search)`%s': %s", rp.searchBuf, rp.hist.items[m])
+	}
+	return fmt.Sprintf("(failed reverse-i-search)`%s': ", rp.searchBuf)
+}
+
+// searchRender draws the search overlay through the renderer: the
+// prompt row is replaced by the search text, keeping the block shape
+// managed by rn (no stray scrollback).
+func (rp *repl) searchRender(rn *lineRenderer) {
+	savedPrompt := rn.prompt
+	rn.prompt = rp.searchLine()
+	rn.invalidate()
+	rn.draw(nil, 0)
+	rn.prompt = savedPrompt
+	rp.searchRows = rn.rows
 }
 
 // search (Ctrl-R) methods.
-func (rp *repl) searchStart(lb *lineBuf, redraw func()) {
+func (rp *repl) searchStart(rn *lineRenderer, lb *lineBuf) {
 	rp.searchMode = true
 	rp.searchBuf = ""
+	rp.searchSaved = lb.String()
+	rp.searchSavedPos = lb.pos
 	rp.searchIdx = len(rp.hist.items)
-	rp.searchDraw(lb, redraw)
+	rn.clear()
+	rp.searchRender(rn)
 }
 
 func (rp *repl) searchDraw(lb *lineBuf, redraw func()) {
-	// Draw search line in place of prompt redraw: simplest is to print
-	// "(reverse-i-search)`text': matched" then restore on exit.
+	// Legacy redraw-callback form (kept for tests); live loop uses
+	// searchRender through the renderer.
 	fmt.Fprint(rp.out, "\r\x1b[K")
 	match := rp.searchMatch()
 	if match >= 0 {
@@ -543,7 +629,16 @@ func (rp *repl) searchDraw(lb *lineBuf, redraw func()) {
 }
 
 func (rp *repl) searchMatch() int {
+	return rp.searchMatchIdx()
+}
+
+// searchMatchIdx is the newest history entry containing the search
+// buffer (or the newest entry when the buffer is empty).
+func (rp *repl) searchMatchIdx() int {
 	if rp.searchBuf == "" {
+		if len(rp.hist.items) == 0 {
+			return -1
+		}
 		return len(rp.hist.items) - 1
 	}
 	for i := len(rp.hist.items) - 1; i >= 0; i-- {
@@ -554,24 +649,23 @@ func (rp *repl) searchMatch() int {
 	return -1
 }
 
-func (rp *repl) searchType(r rune, lb *lineBuf, redraw func()) {
+func (rp *repl) searchType(r rune, rn *lineRenderer, lb *lineBuf) {
 	rp.searchBuf += string(r)
-	m := rp.searchMatch()
-	if m >= 0 {
+	if m := rp.searchMatchIdx(); m >= 0 {
 		rp.searchIdx = m
 	}
-	rp.searchDraw(lb, redraw)
+	rp.searchRender(rn)
 }
 
-func (rp *repl) searchBackspace(redraw func()) {
+func (rp *repl) searchBackspace(rn *lineRenderer, lb *lineBuf) {
 	if len(rp.searchBuf) > 0 {
 		rr := []rune(rp.searchBuf)
 		rp.searchBuf = string(rr[:len(rr)-1])
 	}
-	rp.searchDraw(nil, redraw)
+	rp.searchRender(rn)
 }
 
-func (rp *repl) searchPrev(redraw func()) {
+func (rp *repl) searchPrev(rn *lineRenderer, lb *lineBuf) {
 	// Older match.
 	for i := rp.searchIdx - 1; i >= 0; i-- {
 		if rp.searchBuf == "" || strings.Contains(rp.hist.items[i], rp.searchBuf) {
@@ -579,22 +673,58 @@ func (rp *repl) searchPrev(redraw func()) {
 			break
 		}
 	}
-	rp.searchDraw(nil, redraw)
+	rp.searchRender(rn)
 }
 
-func (rp *repl) searchNext(redraw func()) {
+func (rp *repl) searchNext(rn *lineRenderer, lb *lineBuf) {
 	for i := rp.searchIdx + 1; i < len(rp.hist.items); i++ {
 		if rp.searchBuf == "" || strings.Contains(rp.hist.items[i], rp.searchBuf) {
 			rp.searchIdx = i
 			break
 		}
 	}
-	rp.searchDraw(nil, redraw)
+	rp.searchRender(rn)
+}
+
+// searchAccept puts the current match on the editing line (Enter in
+// search mode, like bash) and redraws through the renderer.
+func (rp *repl) searchAccept(rn *lineRenderer, lb *lineBuf) {
+	if m := rp.searchMatchIdx(); m >= 0 && rp.searchBuf != "" {
+		lb.clear()
+		lb.insertStr(rp.hist.items[m])
+		rp.histIdx = m
+	}
+	rp.searchMode = false
+	rp.searchBuf = ""
+	rn.clear()
+	rn.invalidate()
+	rn.draw(lb.text, lb.pos)
+}
+
+// searchCancel aborts the search (Ctrl-C/Esc): restores the stashed
+// line exactly as it was, with no history pollution.
+func (rp *repl) searchCancel(rn *lineRenderer, lb *lineBuf, _ func()) {
+	rp.searchMode = false
+	rp.searchBuf = ""
+	lb.clear()
+	lb.insertStr(rp.searchSaved)
+	lb.pos = rp.searchSavedPos
+	if lb.pos < 0 {
+		lb.pos = 0
+	}
+	if lb.pos > len(lb.text) {
+		lb.pos = len(lb.text)
+	}
+	rp.histIdx = len(rp.hist.items)
+	rn.clear()
+	rn.invalidate()
+	rn.draw(lb.text, lb.pos)
 }
 
 // acceptSearch puts the current search match (or typed text) on the line.
+// Kept for tests; the live loop uses searchAccept.
 func (rp *repl) acceptSearch(lb *lineBuf) {
-	if m := rp.searchMatch(); m >= 0 && rp.searchBuf != "" {
+	if m := rp.searchMatchIdx(); m >= 0 && rp.searchBuf != "" {
 		lb.clear()
 		lb.insertStr(rp.hist.items[m])
 		rp.histIdx = m

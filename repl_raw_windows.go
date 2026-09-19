@@ -32,8 +32,37 @@ func termRawOn() (func(), bool) {
 	inH := windows.Handle(os.Stdin.Fd())
 	var inMode uint32
 	if err := windows.GetConsoleMode(inH, &inMode); err != nil {
-		return nil, false
+		// Piped stdin but a real console exists (e.g. child with
+		// redirected pipes): open CONIN$ directly so the REPL still
+		// gets keystrokes instead of falling back to plainLoop.
+		conH, err := openConIn()
+		if err != nil {
+			return nil, false
+		}
+		if err := windows.GetConsoleMode(conH, &inMode); err != nil {
+			_ = windows.CloseHandle(conH)
+			return nil, false
+		}
+		return rawOnHandle(conH, inMode, true)
 	}
+	return rawOnHandle(inH, inMode, false)
+}
+
+func openConIn() (windows.Handle, error) {
+	name, err := windows.UTF16PtrFromString("CONIN$")
+	if err != nil {
+		return 0, err
+	}
+	return windows.CreateFile(name,
+		windows.GENERIC_READ|windows.GENERIC_WRITE,
+		windows.FILE_SHARE_READ|windows.FILE_SHARE_WRITE,
+		nil, windows.OPEN_EXISTING, 0, 0)
+}
+
+// rawOnHandle puts an input console handle in raw VT mode. When own is
+// true the handle came from openConIn: reads use it too (rp.inFile is
+// swapped by the caller) and it is closed on restore.
+func rawOnHandle(inH windows.Handle, inMode uint32, own bool) (func(), bool) {
 	var outH = windows.Handle(os.Stdout.Fd())
 	var outMode uint32
 	haveOut := windows.GetConsoleMode(outH, &outMode) == nil
@@ -52,6 +81,9 @@ func termRawOn() (func(), bool) {
 	newIn &^= ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT
 	newIn |= ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT
 	if err := windows.SetConsoleMode(inH, newIn); err != nil {
+		if own {
+			_ = windows.CloseHandle(inH)
+		}
 		return nil, false
 	}
 	var prevOut uint32
@@ -74,9 +106,26 @@ func termRawOn() (func(), bool) {
 		if haveOut {
 			_ = windows.SetConsoleMode(outH, prevOut)
 		}
+		if own {
+			_ = windows.CloseHandle(inH)
+		}
+	}
+	if own {
+		conFile := os.NewFile(uintptr(inH), "CONIN$")
+		if conFile == nil {
+			restore()
+			return nil, false
+		}
+		// Caller swaps rp.inFile to conFile and closes it via restore.
+		// Stash it in the package var consumed below.
+		conInFile = conFile
 	}
 	return restore, true
 }
+
+// conInFile is set by rawOnHandle when stdin was piped but CONIN$
+// exists; runInteractive swaps rp.inFile to it.
+var conInFile *os.File
 
 func termWidth() int {
 	w, _, err := term.GetSize(int(os.Stdout.Fd()))

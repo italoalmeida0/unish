@@ -24,6 +24,10 @@ func termRawOn() (func(), bool) {
 	return func() { _ = term.Restore(fd, old) }, true
 }
 
+// conInFile is a Windows-only stash (CONIN$ when stdin is piped);
+// nil everywhere else so repl_tty.go compiles on unix.
+var conInFile *os.File
+
 func termWidth() int {
 	w, _, err := term.GetSize(int(os.Stdout.Fd()))
 	if err != nil || w <= 0 {

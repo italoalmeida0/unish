@@ -25,32 +25,35 @@ import (
 
 // repl holds interactive state shared across loop iterations.
 type repl struct {
-	r             *interp.Runner
-	hist          *histStore
-	histNew       []string // items added this session (for save)
-	histIdx       int      // browsing index (len = live line)
-	liveSaved     string   // stashed live line while browsing
-	lastLine      string   // last accepted line (for live restore)
-	searchMode    bool
-	searchBuf     string
-	kbd           *keyReader
-	out           io.Writer
-	errOut        io.Writer
-	inFile        *os.File
-	rawOn         bool
-	width         int
-	exitCode      int
-	shouldExit    bool
-	lineNo        int
-	searchIdx     int
-	pendingVerify bool
-	plainNoPC     bool // plainLoop piped mode: skip PROMPT_COMMAND
-	histVerify    bool
-	histExpand    bool
-	tabCount      int
-	lastTab       string
-	tabShown      bool
-	mu            sync.Mutex
+	r              *interp.Runner
+	hist           *histStore
+	histNew        []string // items added this session (for save)
+	histIdx        int      // browsing index (len = live line)
+	liveSaved      string   // stashed live line while browsing
+	lastLine       string   // last accepted line (for live restore)
+	searchMode     bool
+	searchBuf      string
+	searchRows     int    // rows occupied by the current search overlay
+	searchSaved    string // line stashed when Ctrl-R started
+	searchSavedPos int
+	kbd            *keyReader
+	out            io.Writer
+	errOut         io.Writer
+	inFile         *os.File
+	rawOn          bool
+	width          int
+	exitCode       int
+	shouldExit     bool
+	lineNo         int
+	searchIdx      int
+	pendingVerify  bool
+	plainNoPC      bool // plainLoop piped mode: skip PROMPT_COMMAND
+	histVerify     bool
+	histExpand     bool
+	tabCount       int
+	lastTab        string
+	tabShown       bool
+	mu             sync.Mutex
 }
 
 // envSnapshot copies the runner's live variables (writeEnv overlay is

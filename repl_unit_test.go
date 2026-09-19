@@ -424,3 +424,173 @@ func TestCompletion(t *testing.T) {
 		t.Fatalf("no-match: %q %v", rep, cands)
 	}
 }
+
+func TestLayoutCells(t *testing.T) {
+	rows, cr, cc := layoutCells("$ ", []rune("hi"), 2, 80)
+	if rows != 1 || cr != 0 || cc != 4 {
+		t.Fatalf("simple: rows=%d cr=%d cc=%d", rows, cr, cc)
+	}
+	// CJK counts 2 cells.
+	rows, _, cc = layoutCells("", []rune("a中b"), 3, 80)
+	if rows != 1 || cc != 4 {
+		t.Fatalf("cjk: rows=%d cc=%d", rows, cc)
+	}
+	// ANSI escapes take no cells.
+	rows, _, cc = layoutCells("\x1b[32mok$ ", []rune("x"), 1, 80)
+	if rows != 1 || cc != 5 {
+		t.Fatalf("ansi: rows=%d cc=%d", rows, cc)
+	}
+	// Wrap at width: 8 cells at width 5 -> rows of 5+3.
+	rows, cr, cc = layoutCells("", []rune("abcdefgh"), 8, 5)
+	if rows != 2 || cr != 1 || cc != 3 {
+		t.Fatalf("wrap: rows=%d cr=%d cc=%d", rows, cr, cc)
+	}
+	_ = rows
+	// Cursor mid-line.
+	rows, cr, cc = layoutCells("> ", []rune("hello"), 2, 80)
+	if rows != 1 || cr != 0 || cc != 4 {
+		t.Fatalf("mid: rows=%d cr=%d cc=%d", rows, cr, cc)
+	}
+	// Combining char is zero width.
+	rows, _, cc = layoutCells("", []rune("áb"), 3, 80)
+	if rows != 1 || cc != 2 {
+		t.Fatalf("combining: rows=%d cc=%d", rows, cc)
+	}
+}
+
+func TestRendererIncremental(t *testing.T) {
+	var sb strings.Builder
+	rn := newLineRenderer(&sb, "$ ", 80)
+	rn.draw([]rune("h"), 1)
+	first := sb.String()
+	if first != "$ h" {
+		t.Fatalf("first draw: %q", first)
+	}
+	// Append: only new bytes, no clear.
+	sb.Reset()
+	rn.draw([]rune("hi"), 2)
+	if got := sb.String(); got != "i" {
+		t.Fatalf("append: %q", got)
+	}
+	// Same text, cursor move: only horizontal motion, no reprint.
+	sb.Reset()
+	rn.draw([]rune("hi"), 1)
+	if got := sb.String(); got != "\x1b[1D" {
+		t.Fatalf("cursor move: %q", got)
+	}
+	// Backspace at end: erase cells, no reprint.
+	sb.Reset()
+	rn.draw([]rune("h"), 1)
+	if got := sb.String(); got != "\b \b" {
+		t.Fatalf("backspace: %q", got)
+	}
+	// Middle edit: full redraw with exact clear.
+	sb.Reset()
+	rn.draw([]rune("Xh"), 1)
+	if got := sb.String(); !strings.Contains(got, "$ Xh") || !strings.Contains(got, "\x1b[K") {
+		t.Fatalf("middle edit: %q", got)
+	}
+	// Wrapped line shrinking across rows: full redraw must erase every
+	// old row (2 K's for the 90-col line at width 20 -> 5 rows) and
+	// place the cursor back at the new end.
+	sb.Reset()
+	long := []rune(strings.Repeat("a", 90))
+	rn2 := newLineRenderer(&sb, "", 20)
+	rn2.draw(long, 90)
+	sb.Reset()
+	rn2.draw(long[:45], 45)
+	got := sb.String()
+	if strings.Count(got, "\x1b[K") != 5 {
+		t.Fatalf("wrapped clear K count: %q", got)
+	}
+	if !strings.HasSuffix(got, strings.Repeat("a", 45)) {
+		t.Fatalf("wrapped clear reprint: %q", got)
+	}
+}
+
+func TestRendererNoChange(t *testing.T) {
+	var sb strings.Builder
+	rn := newLineRenderer(&sb, "$ ", 80)
+	rn.draw([]rune("hi"), 2)
+	sb.Reset()
+	rn.draw([]rune("hi"), 2)
+	if sb.String() != "" {
+		t.Fatalf("no-change must write nothing: %q", sb.String())
+	}
+}
+
+func TestPrintCompletionsColumns(t *testing.T) {
+	var sb strings.Builder
+	printCompletions(&sb, []string{"apple", "apricot", "banana"}, 20)
+	got := sb.String()
+	// 20 cols: apple/apricot/banana in 2 columns (9+2=11 -> 1 col? check).
+	// maxw=7, colW=9, cols=2, rows=2: apple banana / apricot.
+	if !strings.Contains(got, "apple") || !strings.Contains(got, "banana") {
+		t.Fatalf("columns: %q", got)
+	}
+	if strings.Count(got, "\r\n") != 2 {
+		t.Fatalf("rows: %q", got)
+	}
+	var sb2 strings.Builder
+	printCompletions(&sb2, []string{"a", "b"}, 80)
+	if sb2.String() != "a  b\r\n" {
+		t.Fatalf("single row: %q", sb2.String())
+	}
+	// Narrow but usable width: still columnar (cols=1 only below 10).
+	var sb3 strings.Builder
+	printCompletions(&sb3, []string{"aa", "bb"}, 12)
+	if sb3.String() != "aa  bb\r\n" {
+		t.Fatalf("narrow cols: %q", sb3.String())
+	}
+}
+
+func TestSearchOverlay(t *testing.T) {
+	rp := &repl{hist: newHistStore(), kbd: &keyReader{}, out: io.Discard, errOut: io.Discard}
+	rp.hist.add("echo hello", "")
+	rp.hist.add("ls /tmp", "")
+	var sb strings.Builder
+	rn := newLineRenderer(&sb, "$ ", 80)
+	rn.draw([]rune("ec"), 2)
+	sb.Reset()
+	// Start search: clears current block, draws overlay.
+	var lb lineBuf
+	lb.insertStr("ec")
+	lb.pos = 2
+	rp.searchStart(rn, &lb)
+	got := sb.String()
+	if !strings.Contains(got, "(reverse-i-search)") {
+		t.Fatalf("search start: %q", got)
+	}
+	// Type narrows to match.
+	sb.Reset()
+	rp.searchType('e', rn, &lb)
+	got = sb.String()
+	if !strings.Contains(got, "echo hello") {
+		t.Fatalf("search type: %q", got)
+	}
+	// Accept puts match on line (renderer cleared + redrawn, no overlay left).
+	sb.Reset()
+	rp.searchAccept(rn, &lb)
+	if lb.String() != "echo hello" {
+		t.Fatalf("accept: %q", lb.String())
+	}
+	if strings.Contains(sb.String(), "reverse-i-search") {
+		t.Fatalf("accept left overlay: %q", sb.String())
+	}
+	// Start again, type, then cancel restores stashed line.
+	lb.clear()
+	lb.insertStr("ec")
+	lb.pos = 2
+	sb.Reset()
+	rp.searchStart(rn, &lb)
+	rp.searchType('l', rn, &lb)
+	sb.Reset()
+	rp.searchCancel(rn, &lb, func() {})
+	if lb.String() != "ec" || lb.pos != 2 {
+		t.Fatalf("cancel: %q %d", lb.String(), lb.pos)
+	}
+	// Cancel must be net-newline-free-ish: just clear+redraw, check redraw happened.
+	if !strings.Contains(sb.String(), "$ ec") {
+		t.Fatalf("cancel redraw: %q", sb.String())
+	}
+}

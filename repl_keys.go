@@ -35,6 +35,7 @@ const (
 	keyCtrlLeft
 	keyCtrlRight
 	keyCtrlR
+	keyCtrlS
 	keyCtrlA
 	keyCtrlE
 	keyCtrlB
@@ -111,6 +112,9 @@ func (k *keyReader) next() (vtKey, bool) {
 	case 0x12:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlR}, true
+	case 0x13:
+		k.buf = k.buf[1:]
+		return vtKey{code: keyCtrlS}, true
 	case 0x14:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlT}, true
