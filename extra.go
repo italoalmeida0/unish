@@ -262,6 +262,15 @@ func callOverride(ctx context.Context, args []string) ([]string, error) {
 			return []string{"false"}, nil
 		}
 		return []string{"true"}, nil
+	case "history":
+		// mvdan/sh declares history but never implements it
+		// (falls into "unsupported builtin"); serve the live
+		// interactive history instead.
+		hc := interp.HandlerCtx(ctx)
+		if err := cmdHistory(ctx, hc, args); err != nil {
+			return []string{"false"}, nil
+		}
+		return []string{"true"}, nil
 	case "wait":
 		// Tracked externals wait here; everything else flows through
 		// to mvdan/sh's builtin (in-process jobs, real pids, errors).

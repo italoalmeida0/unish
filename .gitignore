@@ -16,3 +16,6 @@ coverage.txt
 *~
 .DS_Store
 Thumbs.db
+
+# Local reference material (not part of build)
+shell.js

@@ -10,8 +10,7 @@ cmd.Dir = workdir
 out, err := cmd.Output()
 ```
 
-There is only the `-c` flag, but it also accepts a file and stdin
-like bash:
+Non-interactive use is `-c`, a file, or stdin, like bash:
 
 ```
 unish -c "command"        run the string (ideal for agents/AI)
@@ -20,8 +19,17 @@ unish < script.sh         run stdin (like bash -s)
 unish --version           print version and exit
 ```
 
-No interactive mode, no readline. Timeout and cancellation are the
-caller's job (`exec` context / Ctrl-C).
+With no args and a terminal on stdin, unish starts an interactive
+shell (or force it with `unish -i`):
+
+```
+unish                    interactive shell (TTY stdin)
+unish -i                 force interactive shell (pipe-safe loop)
+unish -i < script.sh     run with history + `!` expansion
+```
+
+Timeout and cancellation are the caller's job (`exec` context /
+Ctrl-C).
 
 ## Why
 
@@ -56,8 +64,22 @@ caller's job (`exec` context / Ctrl-C).
 | files | `ls` (-a with `.`/`..`, -l, -R, -S, -t, -m, -C, -x, -i, -F, -Q, -d, …), `find` (-name/-iname, -path, -type, -maxdepth/-mindepth, -size, -mtime/-mmin, -newer, -empty, -perm, -not, -prune, -exec, -delete, -print0), `mktemp`, `cp` (-r, -v, -n, -p), `mv` (-v `renamed …`, -n), `rm` (never removes `.`/`..`, --preserve-root), `mkdir`, `touch` (-d, -r/--reference, -c), `chmod` (symbolic), `xargs` (-0, -n, -I, -r), `base64` (-d, -w, -i), `tar` (-cf/-xf/-tf/-czf, --exclude, slip defense), `gzip`/`gunzip`/`gzcat`, `dirname`, `basename`, `realpath`, `readlink`, `ln` (-s, -f), `du` (-s, -h, -b) |
 | system | `sleep`, `timeout` (-s, -k, --preserve-status), `kill` (-s/-n, `%jobspec`), `pwd`, `true`, `false`, `yes`, `which`, `printenv`, `whoami`, `nproc`, `clear`, `echo`, `date` (+strftime), `uname` (-s/-n/-r/-v/-m/-a, real kernel on Linux), `hostname`, `md5sum`, `sha1sum`, `sha256sum`, `shasum` (+`md5sum -c` check) |
 | sysinfo | `df` (-h, -k, -P), `ps` (aux/-ef), `free`, `uptime`, `env` (-i), `stat` (full + -c), `ss` (-t/-u/-l), `id`, `arch`, `tty`, `logname`, `sync`, `nohup`, `nice` |
-| shell | `umask`, `ulimit` (-n/-a, -Sn/-Hn), `hash` (real table), `type`, `jobs` (real PIDs), `wait` |
+| shell | `umask`, `ulimit` (-n/-a, -Sn/-Hn), `hash` (real table), `type`, `jobs` (real PIDs), `wait`, `history` (interactive) |
 | network | `nc`/`netcat`, `pgrep`, `pkill` |
+
+## Interactive shell
+
+No args on a terminal (or `unish -i`) starts a readline shell:
+
+- **Emacs editing**: arrows/Home/End/Delete, `^A/^E/^B/^F/^K/^U/^W`,
+  `Alt-B/F/D`, `^T`, `^L`, UTF-8 + CJK wide chars, `\e` colors in PS1
+- **History**: `~/.unish_history` (HISTFILE/HISTSIZE/HISTFILESIZE),
+  HISTCONTROL, `history` builtin (`-c/-d/-s/-p/-a/-n/-r/-w`),
+  `!`/`!!`/`!n`/`!-n`/`!str`/`!?str?` expansion, `Ctrl-R` search
+- **Completion**: `Tab` completes commands (builtins + PATH + `hash`),
+  `$vars`, files (dirs get `/`); second `Tab` lists
+- **Prompt**: PS1/PS2 with `\u \h \w \W \$ \# \!` + `$vars` +
+  `$(cmds)` + `\[...\]` colors, PROMPT_COMMAND, `~/.unishrc`
 
 Anything else (`git`, `curl`, `ssh`, `awk`, `python`, …) falls through
 to the system binary.

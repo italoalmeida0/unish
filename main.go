@@ -16,6 +16,8 @@ import (
 
 var command = flag.String("c", "", "entire bash command to run")
 
+var interactiveFlag = flag.Bool("i", false, "force interactive shell")
+
 var version = "dev"
 
 func versionString() string {
@@ -43,6 +45,9 @@ func main() {
 
 	var src, name string
 	var params []string
+	if *interactiveFlag {
+		os.Exit(runInteractive())
+	}
 	switch {
 	case flag.NFlag() > 0:
 		src = *command
@@ -56,6 +61,11 @@ func main() {
 			os.Exit(0)
 		}
 	default:
+		// No args and stdin is a TTY: start the interactive shell
+		// (like bash with no args). Piped stdin keeps old behavior.
+		if isInteractive(os.Stdin) {
+			os.Exit(runInteractive())
+		}
 		rest := flag.Args()
 		if len(rest) > 0 {
 			data, err := os.ReadFile(rest[0])
