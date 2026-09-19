@@ -305,6 +305,15 @@ func cmdRm(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	code := 0
 	for _, p := range rest {
+		// GNU: never remove '.' or '..', under ANY spelling ('.', './',
+		// 'sub/..', '/abs/path/.', ...), even with --no-preserve-root.
+		// Only the operand spelling matters: 'rm -rf /abs/cwd' is
+		// allowed while 'rm -rf .' is refused for the same directory.
+		if isDotOperand(p) {
+			fmt.Fprintf(hc.Stderr, "rm: refusing to remove '.' or '..' directory: skipping %q\n", p)
+			code = 1
+			continue
+		}
 		full := resolve(hc.Dir, p)
 		fi, err := os.Lstat(full)
 		if err != nil {
@@ -785,6 +794,27 @@ func sameFile(a, b string) bool {
 		return aa == bb && err1 == nil
 	}
 	return os.SameFile(fa, fb)
+}
+
+// isDotOperand reports whether the rm operand p spells '.' or '..'
+// (GNU refuses those under ANY spelling: '.', './', 'sub/..',
+// '/abs/path/.', 'C:\dir\..' on Windows, ...). Only the operand
+// spelling is considered: '/abs/cwd' is allowed while '.' for the
+// same directory is refused.
+func isDotOperand(p string) bool {
+	q := filepath.ToSlash(p)
+	// Strip trailing slashes (but keep '/' itself out: that's root).
+	for len(q) > 1 && strings.HasSuffix(q, "/") {
+		q = strings.TrimSuffix(q, "/")
+	}
+	if q == "." || q == ".." {
+		return true
+	}
+	// Last component is '.' or '..' ('./', 'sub/..', '/abs/.').
+	if strings.HasSuffix(q, "/.") || strings.HasSuffix(q, "/..") {
+		return true
+	}
+	return false
 }
 
 // isRootPath reports whether p resolves to the filesystem root (or the

@@ -1007,3 +1007,37 @@ func TestParityNewFlags(t *testing.T) {
 		t.Errorf("mv -v = %q", out)
 	}
 }
+
+func TestParityRmDotGuard(t *testing.T) {
+	// GNU: '.'/'..' are NEVER removed, under any spelling, even with
+	// --no-preserve-root. Only the operand spelling matters: an absolute
+	// path to the cwd IS allowed while '.' for the same dir is refused.
+	// (Once deleted the project's own sources via `rm -rf .` — the guard
+	// below is the regression test for that incident.)
+	dir := t.TempDir()
+	mustWrite(t, filepath.Join(dir, "keep.txt"), "hi\n")
+	if err := os.MkdirAll(filepath.Join(dir, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, src := range []string{
+		"rm -rf .", "rm -rf ./", "rm -rf sub/..",
+		"rm --no-preserve-root -rf .", "rm -rf ..",
+	} {
+		_, serr, err := runParityScript(t, dir, src)
+		if exitCode(err) != 1 || !strings.Contains(serr, "refusing to remove") {
+			t.Errorf("%s = err %q code %d; want refusal, rc 1", src, serr, exitCode(err))
+		}
+	}
+	// Refusal must not delete anything...
+	if _, err := os.Stat(filepath.Join(dir, "keep.txt")); err != nil {
+		t.Errorf("keep.txt was deleted by refused rm: %v", err)
+	}
+	// ...but other operands in the same command still run.
+	_, _, err := runParityScript(t, dir, "rm -rf . keep.txt")
+	if exitCode(err) != 1 {
+		t.Errorf("rm -rf . keep.txt code = %d; want 1", exitCode(err))
+	}
+	if _, err := os.Stat(filepath.Join(dir, "keep.txt")); !os.IsNotExist(err) {
+		t.Errorf("keep.txt should have been removed, stat err = %v", err)
+	}
+}
