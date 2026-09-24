@@ -2441,6 +2441,8 @@ func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error 
 	sufLen := fs.Uint64("a", 2, "")
 	fs.Uint64Var(sufLen, "suffix-length", 2, "")
 	numeric := fs.Bool("d", false, "")
+	verbose := fs.Bool("v", false, "")
+	_ = verbose // -v/--verbose: GNU prints chunk names; accepted (names still created).
 	number := fs.String("n", "", "")
 	fs.StringVar(number, "number", "", "")
 	byteStr := fs.String("b", "", "")
@@ -2933,12 +2935,14 @@ func cmdCmp(_ context.Context, hc interp.HandlerContext, args []string) error {
 func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("hexdump", hc.Stderr)
 	canonical := fs.Bool("C", false, "")
+	verbose := fs.Bool("v", false, "")
 	limit := fs.Uint64("n", 0, "")
 	skip := fs.Uint64("s", 0, "")
 	format := fs.String("e", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	_ = verbose // -v: no line suppression in our output anyway; accept for parity.
 	_ = format // -e custom formats: accepted; raw format string echoed? no — GNU applies it; we apply simple %02x passthrough below
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {

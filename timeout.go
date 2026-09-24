@@ -4,9 +4,11 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"mvdan.cc/sh/v3/interp"
@@ -55,16 +57,26 @@ func cmdTimeout(ctx context.Context, hc interp.HandlerContext, args []string) er
 	defer cancel()
 
 	if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
+		// Bound the builtin: after the deadline its stdout/stderr
+		// fail with EPIPE, so write-loops (yes, cat, ...) exit via
+		// their error path instead of leaking forever. Truly-stuck
+		// builtins blocked in Read (sort on infinite stdin) still
+		// can't be killed (Go can't kill goroutines), but the gated
+		// writer guarantees the common write-loop case is reaped.
+		ghc, gate := gateHCOnDone(hc)
 		res := make(chan error, 1)
 		go func() {
-			res <- cmd.main(tctx, hc, splitAttached(cmdArgs[0], cmdArgs))
+			res <- cmd.main(tctx, ghc, splitAttached(cmdArgs[0], cmdArgs))
 		}()
 		select {
 		case err := <-res:
+			gate.close()
 			return timeoutResult(err, false, *preserve, sig)
 		case <-tctx.Done():
+			gate.trip()
 			select {
 			case err := <-res:
+				gate.close()
 				return timeoutResult(err, true, *preserve, sig)
 			case <-time.After(gracePeriod(*killAfter)):
 				return exitError{124}
@@ -167,6 +179,54 @@ type timeoutProc struct {
 	cmd *exec.Cmd
 }
 
+// epipeErr is returned by gateWriter after the timeout trips, so
+// builtins blocked in a write loop exit via their error path.
+type epipeErr struct{}
+
+func (epipeErr) Error() string { return "write |1: broken pipe" }
+
+// gateWriter passes writes through until tripped; afterwards every
+// Write fails, unblocking write-loop builtins after a timeout.
+type gateWriter struct {
+	mu      sync.Mutex
+	dst       io.Writer
+	tripped   bool
+	closed    bool
+}
+
+func (w *gateWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.tripped || w.closed {
+		return 0, epipeErr{}
+	}
+	return w.dst.Write(p)
+}
+
+func (w *gateWriter) trip() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.tripped = true
+}
+
+func (w *gateWriter) close() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+}
+
+// gateHCOnDone copies hc with stdout/stderr wrapped so a timeout can
+// fail further writes. Returns the wrapped context and the output gate
+// (trip it on deadline; close it on clean return).
+func gateHCOnDone(hc interp.HandlerContext) (interp.HandlerContext, *gateWriter) {
+	og := &gateWriter{dst: hc.Stdout}
+	eg := &gateWriter{dst: hc.Stderr}
+	ghc := hc
+	ghc.Stdout = og
+	ghc.Stderr = eg
+	return ghc, og
+}
+
 func startTimeoutProc(hc interp.HandlerContext, cmdArgs []string) (*timeoutProc, error) {
 	path := cmdArgs[0]
 	if !isAbsOrRel(path) {
@@ -182,6 +242,7 @@ func startTimeoutProc(hc interp.HandlerContext, cmdArgs []string) (*timeoutProc,
 	c.Stdout = hc.Stdout
 	c.Stderr = hc.Stderr
 	c.Dir = hc.Dir
+	c.Env = shellExecEnv(hc)
 	if err := c.Start(); err != nil {
 		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", cmdArgs[0], err)
 		return nil, exitError{127}

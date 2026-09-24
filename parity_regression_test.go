@@ -39,6 +39,7 @@ func runParityScript(t *testing.T, dir, src string) (string, string, error) {
 		interp.Dir(dir),
 		interp.StdIO(nil, &stdout, &stderr),
 		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
@@ -1005,6 +1006,32 @@ func TestParityNewFlags(t *testing.T) {
 	out, _, _ = runParityScript(t, dir, "echo new > mv1.txt; mv -v mv1.txt mv2.txt")
 	if out != "renamed 'mv1.txt' -> 'mv2.txt'\n" {
 		t.Errorf("mv -v = %q", out)
+	}
+}
+
+func TestParityChildUTF8Env(t *testing.T) {
+	// Windows charmap papercut: children must inherit a UTF-8 default
+	// (PYTHONIOENCODING/PYTHONUTF8) unless the user overrode them, and
+	// the full OS env (PATH etc.) must survive, not just shell exports.
+	dir := t.TempDir()
+	norm := func(s string) string {
+		s = strings.ReplaceAll(s, "\r\n", "\n")
+		return s
+	}
+	out, _, rerr := runParityScript(t, dir, `python -c "import os; print(os.environ.get('PYTHONIOENCODING')); print(os.environ.get('PYTHONUTF8'))"`)
+	if exitCode(rerr) != 0 {
+		t.Skipf("python not available: err=%v out=%q", rerr, out)
+	}
+	if out = norm(out); out != "utf-8\n1\n" {
+		t.Errorf("child utf8 defaults = %q, want %q", out, "utf-8\n1\n")
+	}
+	out, _, _ = runParityScript(t, dir, `export PYTHONIOENCODING=cp1252; python -c "import os; print(os.environ.get('PYTHONIOENCODING'))"`)
+	if out = norm(out); out != "cp1252\n" {
+		t.Errorf("shell export must win over default, got %q", out)
+	}
+	out, _, _ = runParityScript(t, dir, "printenv PATH")
+	if out == "" {
+		t.Errorf("child PATH must be inherited from OS env")
 	}
 }
 

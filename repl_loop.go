@@ -297,6 +297,7 @@ func (rp *repl) expandPromptVars(s string) string {
 		interp.Env(expand.ListEnviron()),
 		interp.StdIO(nil, &out, io.Discard),
 		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
@@ -362,7 +363,7 @@ func promptEscape(s string) string {
 func (rp *repl) execLine(line string) int {
 	prog, err := syntax.NewParser().Parse(strings.NewReader(line), "")
 	if err != nil {
-		fmt.Fprintln(rp.errOut, "unish:", err)
+		fmt.Fprintln(rp.errOut, "bash:", err)
 		return 2
 	}
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
@@ -378,7 +379,7 @@ func (rp *repl) execLine(line string) int {
 		} else if errors.Is(err, context.DeadlineExceeded) {
 			code = 124
 		} else {
-			fmt.Fprintln(rp.errOut, "unish:", err)
+			fmt.Fprintln(rp.errOut, "bash:", err)
 			code = 1
 		}
 		if rp.r.Exited() {
@@ -437,7 +438,7 @@ func (rp *repl) rcFile() {
 	}
 	prog, err := syntax.NewParser().Parse(strings.NewReader(string(data)), p)
 	if err != nil {
-		fmt.Fprintln(rp.errOut, "unish: ~/.unishrc:", err)
+		fmt.Fprintln(rp.errOut, "bash: ~/.unishrc:", err)
 		return
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

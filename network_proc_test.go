@@ -22,6 +22,7 @@ func runUnishScript(t *testing.T, src string) (string, string, error) {
 	var stdout, stderr bytes.Buffer
 	r, err := interp.New(
 		interp.StdIO(nil, &stdout, &stderr),
+		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(extraHandler),
 	)
 	if err != nil {

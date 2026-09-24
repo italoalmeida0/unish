@@ -97,6 +97,10 @@ func cmdNc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 }
 
 func pipeConn(ctx context.Context, hc interp.HandlerContext, conn net.Conn) {
+	// Close the conn when EITHER direction ends: the surviving copier's
+	// Read then fails and its goroutine is reaped. Without this, a
+	// half-open stream leaves one copier blocked in Read forever.
+	defer conn.Close()
 	done := make(chan struct{}, 2)
 	go func() {
 		_, _ = io.Copy(conn, hc.Stdin)

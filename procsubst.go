@@ -81,7 +81,12 @@ func waitProcSubstProducer(path string) {
 		return
 	}
 	if st := winProcSubstLookup(path); st != nil {
-		<-st.producerDone
+		// Bounded: a dead producer must not hang the consumer
+		// forever (30s backstop; producers are local commands).
+		select {
+		case <-st.producerDone:
+		case <-time.After(30 * time.Second):
+		}
 	}
 }
 
@@ -183,7 +188,6 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 	}
 	winProcSubstRegister(st)
 	openSubshell := func(ctx context.Context) (io.ReadWriteCloser, error) {
-		_ = ctx
 		switch op {
 		case syntax.CmdIn:
 			// Producer writes; signal completion on close.
@@ -194,7 +198,14 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 			return &countedFile{File: w, onClose: st.finishProducer}, nil
 		default:
 			// Producer reads; wait for the consumer to finish first.
-			<-st.consumerDone
+			// Bounded: if the consumer never opens (early error on
+			// the other side), give up on ctx cancel instead of
+			// blocking forever and leaking the producer + temp.
+			select {
+			case <-st.consumerDone:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			r, err := os.Open(name)
 			if err != nil {
 				return nil, err
@@ -203,7 +214,6 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 		}
 	}
 	openConsumer := func(ctx context.Context, flag int) (io.ReadWriteCloser, error) {
-		_ = ctx
 		_ = flag
 		switch op {
 		case syntax.CmdIn:
@@ -211,7 +221,12 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 			// The file is deleted when the consumer closes it (the
 			// runner's Cleanup may run before the consumer is done,
 			// so Cleanup must NOT delete for this direction).
-			<-st.producerDone
+			// Bounded: a dead producer no longer hangs us forever.
+			select {
+			case <-st.producerDone:
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
 			r, err := os.Open(name)
 			if err != nil {
 				return nil, err
@@ -261,7 +276,10 @@ func openShellFile(path string) (io.ReadWriteCloser, error) {
 	// is only reached on unix (real /dev/stdin) or odd spellings —
 	// keep the direct open so the true OS error surfaces.
 	if st := winProcSubstLookup(path); st != nil {
-		<-st.producerDone
+		select {
+		case <-st.producerDone:
+		case <-time.After(30 * time.Second):
+		}
 		f, err := openRetry(path)
 		if err != nil {
 			return nil, err

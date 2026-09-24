@@ -19,8 +19,11 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	rawArgs := args[1:]
 	if len(rawArgs) > 0 && !strings.HasPrefix(rawArgs[0], "-") && !strings.Contains(rawArgs[0], "=") {
 		rawArgs = append([]string{"-" + rawArgs[0]}, rawArgs[1:]...)
-		rawArgs = splitAttached("tar", append([]string{"tar"}, rawArgs...))[1:]
 	}
+	// Always split combined shorts (-cf, -xzf) and normalize --long=val;
+	// without this `tar -cf t.tar --exclude=X dir` misparses -cf and
+	// treats --exclude as a positional path (real-agent failure).
+	rawArgs = splitAttached("tar", append([]string{"tar"}, rawArgs...))[1:]
 	fs := newFlagSet("tar", hc.Stderr)
 	create := fs.Bool("c", false, "")
 	extract := fs.Bool("x", false, "")

@@ -64,7 +64,13 @@ type jobTable struct {
 
 var globalJobs = &jobTable{}
 
-// track registers a just-started external process.
+// maxTrackedJobs bounds the registry: finished jobs are reaped, and if
+// more than this many are still RUNNING, the oldest finished slots are
+// reused. Prevents unbounded growth in long agent sessions.
+const maxTrackedJobs = 256
+
+// track registers a just-started external process. Finished jobs are
+// reaped (removed) once observed, so the table never grows forever.
 func (t *jobTable) track(cmd *exec.Cmd, argv []string) *trackedJob {
 	if cmd == nil || cmd.Process == nil {
 		return nil
@@ -81,6 +87,7 @@ func (t *jobTable) track(cmd *exec.Cmd, argv []string) *trackedJob {
 	t.mu.Lock()
 	t.jobs = append(t.jobs, j)
 	t.mu.Unlock()
+	t.sweep(0)
 	go func() {
 		err := cmd.Wait()
 		j.err = err
@@ -96,6 +103,49 @@ func (t *jobTable) track(cmd *exec.Cmd, argv []string) *trackedJob {
 		close(j.done)
 	}()
 	return j
+}
+
+// sweep drops finished jobs, keeping at most keepRecent completions.
+// Waiters hold the *trackedJob pointer, so codes stay readable after
+// the entry leaves the table; with keepRecent=0 every observe/track
+// point reaps the dead, bounding the table by the live set. `wait $!`
+// still works: the job is present while running, and the code is
+// returned before the next sweep drops it.
+func (t *jobTable) sweep(keepRecent int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	// Count finished from oldest; drop all but the newest keepRecent.
+	fin := 0
+	for _, j := range t.jobs {
+		select {
+		case <-j.done:
+			fin++
+		default:
+		}
+	}
+	drop := fin - keepRecent
+	if drop <= 0 {
+		// Still enforce the hard cap on TOTAL entries.
+		if len(t.jobs) > maxTrackedJobs {
+			kept := t.jobs[len(t.jobs)-maxTrackedJobs:]
+			copy(kept, t.jobs[len(t.jobs)-maxTrackedJobs:])
+			t.jobs = append([]*trackedJob(nil), kept...)
+		}
+		return
+	}
+	kept := t.jobs[:0]
+	for _, j := range t.jobs {
+		select {
+		case <-j.done:
+			if drop > 0 {
+				drop--
+				continue
+			}
+		default:
+		}
+		kept = append(kept, j)
+	}
+	t.jobs = kept
 }
 
 // byFakeID resolves "g1".."gN" (what $! expands to) to a job.
@@ -290,6 +340,7 @@ func trackCmd(hc interp.HandlerContext, name string, argv []string) (*trackedJob
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
 	cmd.Stderr = hc.Stderr
+	cmd.Env = shellExecEnv(hc)
 	if err := cmd.Start(); err != nil {
 		return nil, err
 	}
@@ -299,6 +350,7 @@ func trackCmd(hc interp.HandlerContext, name string, argv []string) (*trackedJob
 // cmdJobs implements `jobs [-l]`: list tracked background processes.
 func cmdJobs(hc interp.HandlerContext, args []string) error {
 	globalJobs.waitForLaunch()
+	globalJobs.sweep(0)
 	long := false
 	for _, a := range args[1:] {
 		if a == "-l" {
@@ -344,6 +396,7 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 				return 1, true
 			}
 		}
+		globalJobs.sweep(0)
 		return 0, true
 	}
 	code := 0
@@ -368,5 +421,6 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 			return 1, true
 		}
 	}
+	globalJobs.sweep(0)
 	return code, true
 }

@@ -294,6 +294,6 @@ func inSingleQuotes(line string, at int) bool {
 
 type histExpandError struct{ ref string }
 
-func (e *histExpandError) Error() string { return "unish: " + e.ref + ": event not found" }
+func (e *histExpandError) Error() string { return "bash: " + e.ref + ": event not found" }
 
 func errNoHist(ref string) error { return &histExpandError{ref} }

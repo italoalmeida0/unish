@@ -55,7 +55,7 @@ func main() {
 			name = flag.Args()[0]
 			params = flag.Args()[1:]
 		} else {
-			name = "unish"
+			name = "bash"
 		}
 		if strings.TrimSpace(src) == "" {
 			os.Exit(0)
@@ -70,7 +70,7 @@ func main() {
 		if len(rest) > 0 {
 			data, err := os.ReadFile(rest[0])
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "unish: %s: No such file or directory\n", rest[0])
+				fmt.Fprintf(os.Stderr, "bash: %s: No such file or directory\n", rest[0])
 				os.Exit(127)
 			}
 			src = string(data)
@@ -84,7 +84,7 @@ func main() {
 			}
 			data, err := io.ReadAll(os.Stdin)
 			if err != nil {
-				fmt.Fprintln(os.Stderr, "unish:", err)
+				fmt.Fprintln(os.Stderr, "bash:", err)
 				os.Exit(1)
 			}
 			src = string(data)
@@ -98,7 +98,9 @@ func main() {
 
 	prog, err := syntax.NewParser().Parse(strings.NewReader(src), name)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "unish:", err)
+		// Parse errors already carry "name:line:col:" (e.g. bash:1:10: ...),
+		// like bash's "bash: -c: line 1: ..."; print raw, no double prefix.
+		fmt.Fprintln(os.Stderr, err)
 		os.Exit(2)
 	}
 
@@ -108,6 +110,7 @@ func main() {
 	runnerOpts := []interp.RunnerOption{
 		interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
 		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(
 			trackExec,
 			extraHandler,
@@ -119,7 +122,7 @@ func main() {
 	}
 	r, err := interp.New(runnerOpts...)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "unish:", err)
+		fmt.Fprintln(os.Stderr, "bash:", err)
 		os.Exit(1)
 	}
 
@@ -134,7 +137,7 @@ func main() {
 		if errors.Is(err, context.DeadlineExceeded) {
 			os.Exit(124)
 		}
-		fmt.Fprintln(os.Stderr, "unish:", err)
+		fmt.Fprintln(os.Stderr, "bash:", err)
 		os.Exit(1)
 	}
 }

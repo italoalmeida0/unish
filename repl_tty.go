@@ -41,11 +41,12 @@ func runInteractive() int {
 	r, err := interp.New(
 		interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
 		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, "unish:", err)
+		fmt.Fprintln(os.Stderr, "bash:", err)
 		return 1
 	}
 	rp.r = r

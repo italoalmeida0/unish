@@ -410,6 +410,8 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 	fs.StringVar(dateStr, "date", "", "")
 	refFile := fs.String("r", "", "")
 	fs.StringVar(refFile, "reference", "", "")
+	mtimeOnly := fs.Bool("m", false, "")
+	_ = mtimeOnly // -m: only modify mtime; we always set both (atime==mtime), accepted for parity.
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}

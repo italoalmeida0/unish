@@ -118,7 +118,7 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 				return nil
 			}
 		}
-		hc := interp.HandlerCtx(ctx)
+			hc := interp.HandlerCtx(ctx)
 		err := cmd.main(ctx, hc, splitAttached(args[0], args))
 		if isPipeClosed(err) || isPipeClosed(ctx.Err()) {
 			// SIGPIPE semantics: downstream closed the pipe early
@@ -137,6 +137,15 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 				return interp.NewExitStatus(uint8(ee.code))
 			}
 			if err == flag.ErrHelp {
+				return interp.NewExitStatus(2)
+			}
+			// Go flag parse failures already printed "flag provided..." +
+			// "Try 'X --help'..." to stderr: exit 2 like GNU, without an
+			// extra "bash: ..." duplicate line (agents key off bash text).
+			if msg := err.Error(); strings.HasPrefix(msg, "flag provided") ||
+				strings.HasPrefix(msg, "flag needs an argument") ||
+				strings.HasPrefix(msg, "invalid boolean") ||
+				strings.HasPrefix(msg, "invalid value") {
 				return interp.NewExitStatus(2)
 			}
 			return err
@@ -186,14 +195,49 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 
 // shellExecEnv builds the environment for external processes from the
 // shell's exported variables (mirrors interp's unexported execEnv).
+// It starts from the OS environment so children (python, node, git...)
+// never lose PATH/SystemRoot/etc when the shell has few exports, then
+// overlays shell exports. On Windows it also forces UTF-8 stdio for
+// children (PYTHONIOENCODING/PYTHONUTF8) unless the user already set
+// them, so `print(emoji)` doesn't die with charmap/UnicodeEncodeError
+// under cp1252/cp850 consoles — the classic Windows agent papercut.
+// Shell exports always win over the injected defaults.
 func shellExecEnv(hc interp.HandlerContext) []string {
-	list := make([]string, 0, 64)
+	base := os.Environ()
+	merged := make(map[string]string, len(base)+16)
+	order := make([]string, 0, len(base)+16)
+	for _, kv := range base {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			k := kv[:i]
+			if _, ok := merged[k]; !ok {
+				order = append(order, k)
+			}
+			merged[k] = kv[i+1:]
+		}
+	}
 	hc.Env.Each(func(name string, vr expand.Variable) bool {
 		if vr.Exported && vr.IsSet() && vr.Kind == expand.String {
-			list = append(list, name+"="+vr.Str)
+			if _, ok := merged[name]; !ok {
+				order = append(order, name)
+			}
+			merged[name] = vr.Str
 		}
 		return true
 	})
+	if runtime.GOOS == "windows" {
+		if _, ok := merged["PYTHONIOENCODING"]; !ok {
+			order = append(order, "PYTHONIOENCODING")
+			merged["PYTHONIOENCODING"] = "utf-8"
+		}
+		if _, ok := merged["PYTHONUTF8"]; !ok {
+			order = append(order, "PYTHONUTF8")
+			merged["PYTHONUTF8"] = "1"
+		}
+	}
+	list := make([]string, 0, len(order))
+	for _, k := range order {
+		list = append(list, k+"="+merged[k])
+	}
 	return list
 }
 
@@ -202,7 +246,8 @@ func filterLsArgs(args []string) []string {
 	for _, a := range args[1:] {
 		if a == "--color" || strings.HasPrefix(a, "--color=") ||
 			a == "--hyperlink" || strings.HasPrefix(a, "--hyperlink=") ||
-			a == "--group-directories-first" || a == "--indicator-style=classify" {
+			a == "--group-directories-first" || a == "--indicator-style=classify" ||
+			a == "--exclude" || strings.HasPrefix(a, "--exclude=") {
 			continue
 		}
 		out = append(out, a)
@@ -291,40 +336,244 @@ func callOverride(ctx context.Context, args []string) ([]string, error) {
 }
 
 func resolve(dir, p string) string {
-	if p == "" || p == "-" || p == "/dev/stdin" || filepath.IsAbs(p) || dir == "" {
+	if p == "" || p == "-" || p == "/dev/stdin" || dir == "" {
 		return p
 	}
-	if runtime.GOOS == "windows" && len(p) > 0 && (p[0] == '/' || p[0] == '\\') {
-		if w, ok := msysPath(p); ok {
-			return w
+	if runtime.GOOS == "windows" {
+		// MSYS-style paths (/c/x, /cygdrive/c/x, /tmp...) LOOK absolute
+		// to filepath.IsAbs, but Windows can't open them: translate
+		// before anything else.
+		if len(p) > 0 && (p[0] == '/' || p[0] == '\\') {
+			if w, ok := msysPath(p); ok {
+				return w
+			}
 		}
+		if filepath.IsAbs(p) {
+			return p
+		}
+		return filepath.Join(dir, p)
+	}
+	if filepath.IsAbs(p) {
+		return p
 	}
 	return filepath.Join(dir, p)
 }
 
-var msysCygpathOnce sync.Once
-var msysCygpath string
+var msysMountsOnce sync.Once
+var msysMounts map[string]string // lowercase unix prefix -> windows root
 
+// msysPath converts MSYS/Cygwin-style paths to Windows paths in a
+// self-contained way, with no external dependency:
+//
+//   - /c/Users/x    -> C:\Users\x   (single-letter drive)
+//   - /cygdrive/c/x -> C:\x          (cygdrive prefix)
+//   - /tmp, /home.. -> resolved against /etc/fstab mounts
+//     (longest-prefix match), falling back to the MSYS root
+//   - /dev/null, /dev/stdin... -> NUL / handled by resolve() callers
+//
+// Unknown paths report "don't know" (false) and the caller falls back
+// to a plain filepath.Join. Virtual paths (/proc, /sys, /dev/*) are
+// intentionally not translated: they have no Windows equivalent.
 func msysPath(p string) (string, bool) {
-	msysCygpathOnce.Do(func() {
-		if v, err := exec.LookPath("cygpath.exe"); err == nil {
-			msysCygpath = v
-		} else if v, err := exec.LookPath("cygpath"); err == nil {
-			msysCygpath = v
+	return msysPathInline(p)
+}
+
+// msysPathInline converts purely in Go, without spawning a process.
+func msysPathInline(p string) (string, bool) {
+	if p == "" {
+		return "", false
+	}
+	// Normalize \ to / for analysis.
+	s := strings.ReplaceAll(p, "\\", "/")
+	if !strings.HasPrefix(s, "/") {
+		return "", false
+	}
+	// /cygdrive/c/rest -> C:\rest
+	if strings.HasPrefix(strings.ToLower(s), "/cygdrive/") {
+		rest := s[len("/cygdrive/"):]
+		if len(rest) >= 1 && isASCIILetter(rest[0]) {
+			drive := strings.ToUpper(string(rest[0]))
+			tail := rest[1:]
+			tail = strings.TrimPrefix(tail, "/")
+			if tail == "" {
+				return drive + `:\`, true
+			}
+			return drive + `:\` + strings.ReplaceAll(tail, "/", `\`), true
 		}
+		return "", false
+	}
+	// /c/rest or /C -> C:\rest (single-letter drive).
+	if len(s) >= 2 && s[0] == '/' && isASCIILetter(s[1]) && (len(s) == 2 || s[2] == '/') {
+		drive := strings.ToUpper(string(s[1]))
+		tail := ""
+		if len(s) > 2 {
+			tail = s[3:]
+		}
+		if tail == "" {
+			return drive + `:\`, true
+		}
+		return drive + `:\` + strings.ReplaceAll(tail, "/", `\`), true
+	}
+	// Other absolute paths (/tmp, /home, custom mounts...): resolve
+	// against /etc/fstab with longest-prefix match, falling back to
+	// the MSYS root. Virtual paths (/proc, /sys, /dev/...) have no
+	// Windows equivalent and are left untranslated.
+	if w, ok := msysMountLookup(s); ok {
+		return w, true
+	}
+	return "", false
+}
+
+// msysMountLookup resolves an absolute unix-style path against the
+// MSYS mount table (parsed from /etc/fstab) with longest-prefix match.
+// Returns false for virtual paths (/proc, /sys, /dev/...) and when no
+// mount covers the path, so the caller never gets an invented path.
+func msysMountLookup(s string) (string, bool) {
+	msysMountsOnce.Do(func() {
+		msysMounts = loadMsysMounts()
 	})
-	if msysCygpath == "" {
+	if isMsysVirtual(s) {
 		return "", false
 	}
-	out, err := exec.Command(msysCygpath, "-w", p).Output()
-	if err != nil {
+	best := ""
+	for mp := range msysMounts {
+		if mp == "/" {
+			continue
+		}
+		if s == mp || strings.HasPrefix(s, mp+"/") {
+			if len(mp) > len(best) {
+				best = mp
+			}
+		}
+	}
+	if best != "" {
+		root := msysMounts[best]
+		tail := strings.TrimPrefix(s[len(best):], "/")
+		if tail == "" {
+			return root, true
+		}
+		return root + `\` + strings.ReplaceAll(tail, "/", `\`), true
+	}
+	root, ok := msysMounts["/"]
+	if !ok || root == "" {
 		return "", false
 	}
-	w := strings.TrimSpace(string(out))
-	if w == "" {
-		return "", false
+	tail := strings.TrimPrefix(s, "/")
+	if tail == "" {
+		return root, true
 	}
-	return w, true
+	return root + `\` + strings.ReplaceAll(tail, "/", `\`), true
+}
+
+// isMsysVirtual reports MSYS virtual paths with no Windows equivalent.
+func isMsysVirtual(s string) bool {
+	if s == "/proc" || strings.HasPrefix(s, "/proc/") ||
+		s == "/sys" || strings.HasPrefix(s, "/sys/") ||
+		s == "/dev" || strings.HasPrefix(s, "/dev/") {
+		return true
+	}
+	return false
+}
+
+// loadMsysMounts parses the MSYS /etc/fstab mount table into
+// unix-prefix -> windows-root entries. Every real mount is kept so
+// custom mounts resolve by longest-prefix match; the "none / cygdrive"
+// control line is skipped. With no MSYS at all, the AX scratch paths
+// (/tmp, /var/tmp, /temp, /scratch, /var/log) still resolve to the OS
+// temp dir (agent experience: scratch must work on a bare machine)
+// while every other MSYS-only path reports "don't know".
+// No external process is spawned.
+func loadMsysMounts() map[string]string {
+	m := map[string]string{}
+	// No PATH lookup, no subprocess: probe the well-known install
+	// locations directly. Extra roots can be added via UNISH_MSYS_ROOT.
+	knownRoots := []string{`C:\tools\msys64`, `C:\msys64`}
+	cands := []string{}
+	if extra := os.Getenv("UNISH_MSYS_ROOT"); extra != "" {
+		cands = append(cands, filepath.Join(extra, "etc", "fstab"))
+	}
+	for _, r := range knownRoots {
+		cands = append(cands, filepath.Join(r, "etc", "fstab"))
+	}
+	for _, f := range cands {
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		for _, ln := range strings.Split(string(data), "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" || strings.HasPrefix(ln, "#") {
+				continue
+			}
+			f := strings.Fields(ln)
+			if len(f) < 2 {
+				continue
+			}
+			win, mp := f[0], strings.ToLower(f[1])
+			if win == "none" || win == "cygdrive" || !strings.HasPrefix(mp, "/") {
+				continue // control lines (cygdrive prefix), not mounts
+			}
+			root := strings.ReplaceAll(win, "/", `\`)
+			if _, dup := m[mp]; !dup {
+				m[mp] = root
+			}
+		}
+	}
+	if len(m) > 0 {
+		// Custom fstab without scratch entries: still pin the AX
+		// scratch paths (see pinAX) so they always work.
+		pinAX(m)
+		return m
+	}
+	// No fstab (or no usable entries): the MSYS install dir itself is
+	// the "/" root. UNISH_MSYS_ROOT wins over the known locations.
+	// Either way, the AX scratch paths are pinned so agents always
+	// have working scratch dirs, even on machines without MSYS.
+	if extra := os.Getenv("UNISH_MSYS_ROOT"); extra != "" {
+		if fi, err := os.Stat(extra); err == nil && fi.IsDir() {
+			m["/"] = extra
+			pinAX(m)
+			return m
+		}
+	}
+	for _, r := range knownRoots {
+		if fi, err := os.Stat(r); err == nil && fi.IsDir() {
+			m["/"] = r
+			pinAX(m)
+			return m
+		}
+	}
+	// Bare machine, no MSYS anywhere: only the AX scratch paths
+	// resolve; everything else stays untranslated.
+	pinAX(m)
+	return m
+}
+
+// pinAX pins the agent-experience scratch paths to the OS temp dir so
+// they always work, even on machines without MSYS:
+//
+//   - /tmp, /var/tmp, /temp, /scratch -> %TEMP% (flat scratch)
+//   - /var/log -> %TEMP%\unish-log (writable log sink; the real
+//     C:\Windows\Logs needs elevation, useless for agents)
+//
+// Everything else stays strict: unknown paths report "don't know"
+// instead of landing somewhere unexpected.
+func pinAX(m map[string]string) {
+	if tmp := os.TempDir(); tmp != "" {
+		for _, mp := range []string{"/tmp", "/var/tmp", "/temp", "/scratch"} {
+			if _, dup := m[mp]; !dup {
+				m[mp] = tmp
+			}
+		}
+		if _, dup := m["/var/log"]; !dup {
+			ld := filepath.Join(tmp, "unish-log")
+		// Create once so `cmd >> /var/log/x` never fails on a
+			// fresh machine; ignore errors (fallback: open fails
+			// loudly like bash would).
+			_ = os.MkdirAll(ld, 0o755)
+			m["/var/log"] = ld
+		}
+	}
 }
 
 func shellGetenv(hc interp.HandlerContext, key string) string {
@@ -332,6 +581,23 @@ func shellGetenv(hc interp.HandlerContext, key string) string {
 		return v.Str
 	}
 	return os.Getenv(key)
+}
+
+// shellOpenHandler is mvdan/sh's DefaultOpenHandler with self-contained
+// MSYS translation: redirections (>, >>, <) and internals that open files
+// go through here, so `/tmp/x`, `/c/...` work in redirections.
+// Keeps the /dev/null -> NUL workaround from the default handler.
+func shellOpenHandler() interp.OpenHandlerFunc {
+	return func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+		mc := interp.HandlerCtx(ctx)
+		if runtime.GOOS == "windows" && path == "/dev/null" {
+			path = "NUL"
+		flag &^= os.O_TRUNC
+		} else if path != "" {
+			path = resolve(mc.Dir, path)
+		}
+		return os.OpenFile(path, flag, perm)
+	}
 }
 
 type flagSpec struct {
@@ -364,23 +630,26 @@ var flagSpecs = map[string]flagSpec{
 		"lines": "n", "bytes": "c", "quiet": "q", "silent": "q",
 		"verbose": "v", "follow": "f",
 	}},
-	"sort": {bools: "rufncz", values: "tk", long: map[string]string{
+	"sort": {bools: "rufnczsV", values: "tko", long: map[string]string{
 		"reverse": "r", "unique": "u", "ignore-case": "f", "numeric-sort": "n",
 		"check": "c", "key": "k", "zero-terminated": "z",
+		"stable": "s", "version-sort": "V", "output": "o",
 	}},
-	"uniq": {bools: "cdui", values: "fsw", long: map[string]string{
+	"uniq": {bools: "cduig", values: "fsw", long: map[string]string{
 		"count": "c", "repeated": "d", "unique": "u", "ignore-case": "i",
 		"skip-fields": "f", "skip-chars": "s", "check-chars": "w",
+		"group": "g",
 	}},
 	"wc": {bools: "lwcmL", values: "", long: map[string]string{
 		"lines": "l", "words": "w", "bytes": "c", "chars": "m",
 		"max-line-length": "L",
 	}},
 	"tee": {bools: "a", values: "", long: map[string]string{"append": "a"}},
-	"tr": {bools: "dsc", values: "", long: map[string]string{
+	"tr": {bools: "dsct", values: "", long: map[string]string{
 		"delete": "d", "squeeze-repeats": "s", "complement": "c",
+		"truncate-set1": "t",
 	}},
-	"cut": {bools: "s", values: "dfcb", long: map[string]string{
+	"cut": {bools: "sn", values: "dfcb", long: map[string]string{
 		"delimiter": "d", "fields": "f", "characters": "c", "bytes": "b",
 		"only-delimited": "s", "complement": "complement",
 		"output-delimiter": "output-delimiter",
@@ -392,14 +661,15 @@ var flagSpecs = map[string]flagSpec{
 		"number": "n", "number-nonblank": "b", "squeeze-blank": "s",
 		"show-ends": "E", "show-tabs": "T", "show-all": "A",
 	}},
-	"ls": {bools: "alhdRFQSrt1", values: "", long: map[string]string{
+	"ls": {bools: "alhdRFQSrt1mxCi", values: "", long: map[string]string{
 		"all": "a", "long": "l", "human-readable": "h", "directory": "d",
 		"recursive": "R", "classify": "F", "quoted": "Q",
 		"size": "S", "reverse": "r", "time": "t",
 	}},
 	"comm": {bools: "123", values: ""},
-	"split": {bools: "d", values: "lab", long: map[string]string{
-		"lines": "l", "suffix-length": "a", "bytes": "b",
+	"split": {bools: "dv", values: "labn", long: map[string]string{
+		"lines": "l", "suffix-length": "a", "bytes": "b", "number": "n",
+		"verbose": "v",
 	}},
 	"diff": {bools: "qu", values: "L", long: map[string]string{
 		"brief": "q", "report-identical-files": "s", "unified": "u",
@@ -452,8 +722,8 @@ var flagSpecs = map[string]flagSpec{
 	"mkdir": {bools: "pv", values: "m", long: map[string]string{
 		"parents": "p", "verbose": "v",
 	}},
-	"touch": {bools: "c", values: "d", long: map[string]string{
-		"no-create": "c", "date": "d",
+	"touch": {bools: "cm", values: "dr", long: map[string]string{
+		"no-create": "c", "date": "d", "reference": "r",
 	}},
 	"chmod": {bools: "Rv", values: "", long: map[string]string{
 		"recursive": "R", "verbose": "v",
@@ -471,11 +741,12 @@ var flagSpecs = map[string]flagSpec{
 	"shasum": {bools: "bt", values: "a", long: map[string]string{
 		"algorithm": "a", "binary": "b", "text": "t",
 	}},
-	"base64": {bools: "d", values: "w", long: map[string]string{
-		"decode": "d", "wrap": "w",
+	"base64": {bools: "di", values: "w", long: map[string]string{
+		"decode": "d", "wrap": "w", "ignore-garbage": "i",
 	}},
 	"tar": {bools: "cxtzvkP", values: "fC", long: map[string]string{
-		"keep-old-files": "k", "absolute-names": "P",
+		"keep-old-files": "k", "absolute-names": "P", "exclude": "exclude",
+		"directory": "C", "file": "f", "gzip": "z", "verbose": "v",
 	}},
 	"gzip": {bools: "kcf", values: "", long: map[string]string{
 		"keep": "k", "stdout": "c", "force": "f",
@@ -490,17 +761,20 @@ var flagSpecs = map[string]flagSpec{
 		"symbolic": "s", "force": "f",
 	}},
 	"date": {bools: "u", values: "d", long: map[string]string{"universal": "u", "utc": "u", "date": "d"}},
-	"uname": {bools: "amnrsv", values: "", long: map[string]string{
+	"uname": {bools: "amnrsvpi", values: "", long: map[string]string{
 		"all": "a", "machine": "m", "nodename": "n",
 		"release": "r", "sysname": "s",
+		"version": "v", "processor": "p", "hardware-platform": "i",
 	}},
-	"hexdump": {bools: "C", values: "n"},
+	"hexdump": {bools: "Cv", values: "nse", long: map[string]string{
+		"canonical": "C",
+	}},
 	"strings": {bools: "ao", values: "nt", long: map[string]string{
-		"radix": "t",
+		"radix": "t", "bytes": "n",
 	}},
-	"md5sum":    {bools: "bt", values: ""},
-	"sha1sum":   {bools: "bt", values: ""},
-	"sha256sum": {bools: "bt", values: ""},
+	"md5sum":    {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}},
+	"sha1sum":   {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}},
+	"sha256sum": {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}},
 	"readlink":  {bools: "fm", values: ""},
 	"realpath":  {bools: "em", values: ""},
 	"basename":  {bools: "a", values: "s"},
@@ -525,7 +799,7 @@ var flagSpecs = map[string]flagSpec{
 	"unexpand": {bools: "a", values: "t", long: map[string]string{
 		"tabs": "t", "all": "a", "first-only": "first-only",
 	}},
-	"join": {bools: "i", values: "12jateo", long: map[string]string{
+	"join": {bools: "i", values: "12jateov", long: map[string]string{
 		"ignore-case": "i",
 	}},
 }
@@ -623,13 +897,32 @@ func isFlagChar(cmd string, c byte) bool {
 	if isASCIILetter(c) {
 		return true
 	}
-	return c >= '0' && c <= '9' && cmd == "comm"
+	// Combined shorts may include digits (ls -1a, comm -12, head -2).
+	if c >= '0' && c <= '9' {
+		return true
+	}
+	return false
 }
 
 func cascadeBools(spec flagSpec, s string) ([]string, bool) {
 	var out []string
 	for i := 0; i < len(s); i++ {
 		c := s[i]
+		// Digit-combined shorts (ls -1a, head -2): the digit is a
+		// standalone bool occurrence; keep it as "-1" etc.
+		if c >= '0' && c <= '9' {
+			if strings.ContainsRune(spec.bools, rune(c)) {
+				out = append(out, "-"+string(c))
+				continue
+			}
+			// Unknown digit inside a cluster: split off the rest as
+			// positional (bash parity: `ls -1a` works even when the
+			// cluster mixes digit and letter flags).
+			if i > 0 {
+				return append(out, "-"+s[i:]), true
+			}
+			return nil, false
+		}
 		if strings.ContainsRune(spec.bools, rune(c)) {
 			out = append(out, "-"+string(c))
 			continue
@@ -721,6 +1014,10 @@ func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader
 func newFlagSet(name string, stderr io.Writer) *flag.FlagSet {
 	fs := flag.NewFlagSet(name, flag.ContinueOnError)
 	fs.SetOutput(stderr)
+	// bash parity: never dump "Usage of X:" (GNU prints a short hint).
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "Try '%s --help' for more information.\n", name)
+	}
 	return fs
 }
 
@@ -1068,6 +1365,10 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 	release := fs.Bool("r", false, "")
 	sysname := fs.Bool("s", false, "")
 	version := fs.Bool("v", false, "")
+	proc := fs.Bool("p", false, "")
+	fs.BoolVar(proc, "processor", false, "")
+	hw := fs.Bool("i", false, "")
+	fs.BoolVar(hw, "hardware-platform", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -1089,7 +1390,7 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 		return nil
 	}
 	var parts []string
-	if *sysname || (!*machine && !*node && !*release && !*version) {
+	if *sysname || (!*machine && !*node && !*release && !*version && !*proc && !*hw) {
 		parts = append(parts, name)
 	}
 	if *node {
@@ -1104,6 +1405,14 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	if *machine {
 		parts = append(parts, machineName)
+	}
+	// GNU: -p (processor) and -i (hardware platform) print "unknown"
+	// when the info is unavailable; never fail with "not defined".
+	if *proc {
+		parts = append(parts, "unknown")
+	}
+	if *hw {
+		parts = append(parts, "unknown")
 	}
 	fmt.Fprintln(hc.Stdout, strings.Join(parts, " "))
 	return nil

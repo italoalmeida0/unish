@@ -16,6 +16,7 @@ func mustRunner(t *testing.T) *interp.Runner {
 	r, err := interp.New(
 		interp.StdIO(nil, io.Discard, io.Discard),
 		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
