@@ -1638,7 +1638,10 @@ func cmdPrintenv(_ context.Context, hc interp.HandlerContext, args []string) err
 	for _, k := range args[1:] {
 		if v := hc.Env.Get(k); v.IsSet() {
 			fmt.Fprintln(hc.Stdout, v.Str)
-		} else if ev, ok := os.LookupEnv(k); ok {
+		} else if ev, ok := os.LookupEnv(k); ok && envFallbackAllowed(hc, k) {
+			// Fall back to the process environment only when the shell's
+			// own environment still contains that name. Otherwise `env -i`
+			// would leak the parent's variables back in (it must not).
 			fmt.Fprintln(hc.Stdout, ev)
 		} else {
 			code = 1
@@ -1648,6 +1651,24 @@ func cmdPrintenv(_ context.Context, hc interp.HandlerContext, args []string) err
 		return exitError{code}
 	}
 	return nil
+}
+
+// envFallbackAllowed reports whether a name absent from hc.Env may still
+// be answered from the process environment. It is allowed only if the
+// shell environment is not deliberately emptied: with `env -i` the child
+// must see nothing, so the fallback is suppressed.
+func envFallbackAllowed(hc interp.HandlerContext, name string) bool {
+	// If the shell has no exported variables at all, it is an emptied
+	// environment (env -i): do not resurrect anything from os.Environ.
+	saw := false
+	hc.Env.Each(func(_ string, v expand.Variable) bool {
+		if v.IsSet() && v.Exported {
+			saw = true
+			return false
+		}
+		return true
+	})
+	return saw
 }
 
 func cmdWhoami(_ context.Context, hc interp.HandlerContext, _ []string) error {

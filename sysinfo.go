@@ -464,36 +464,45 @@ func cmdEnv(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		cmd = rest[i:]
 		break
 	}
-	_ = ignore
-	if len(cmd) == 0 {
-		seen := map[string]bool{}
-		hc.Env.Each(func(name string, v expand.Variable) bool {
-			if v.IsSet() && v.Exported {
-				fmt.Fprintf(hc.Stdout, "%s=%s\n", name, v.Str)
-				seen[name] = true
-			}
-			return true
-		})
-		for _, e := range os.Environ() {
-			k := e[:strings.IndexByte(e, '=')]
-			if !seen[k] {
-				fmt.Fprintln(hc.Stdout, e)
-			}
-		}
-		return nil
-	}
-	if *ignore {
-		os.Clearenv()
+	// Build the child environment explicitly. -i clears it; assignments
+	// are added on top. Never mutate the shell's own environment with
+	// os.Clearenv/os.Setenv: `env` must affect only the command it runs.
+	var childEnv []string
+	if !*ignore {
+		childEnv = shellExecEnv(hc)
 	}
 	for _, kv := range envPairs {
 		k := kv[:strings.IndexByte(kv, '=')]
 		v := kv[strings.IndexByte(kv, '=')+1:]
-		os.Setenv(k, v)
+		childEnv = setEnvVar(childEnv, k, v)
 	}
+	if len(cmd) == 0 {
+		// No command: print the environment this env would pass on.
+		for _, e := range childEnv {
+			fmt.Fprintln(hc.Stdout, e)
+		}
+		return nil
+	}
+	// Run the command with that environment. Builtins of ours get the
+	// same HandlerContext but with a substituted Env, so they see it too.
+	hc.Env = expand.ListEnviron(childEnv...)
 	if extra := lookupExtra(cmd[0]); extra != nil {
 		return extra.main(ctx, hc, splitAttached(cmd[0], cmd))
 	}
 	return interp.DefaultExecHandler(2)(ctx, cmd)
+}
+
+// setEnvVar sets name=value in an environment list, replacing any
+// existing entry for name.
+func setEnvVar(env []string, name, value string) []string {
+	prefix := name + "="
+	for i, e := range env {
+		if strings.HasPrefix(e, prefix) {
+			env[i] = prefix + value
+			return env
+		}
+	}
+	return append(env, prefix+value)
 }
 
 func isEnvName(s string) bool {

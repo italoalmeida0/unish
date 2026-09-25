@@ -41,8 +41,8 @@ CASES = [
     ("nice -n adjustment", "nice -n 5 echo niced", "niced\n", 0),
     ("env sets a variable", "env FOO=bar printenv FOO", "bar\n", 0),
     ("env runs a command", "env echo hi", "hi\n", 0),
-    # FINDING: env -i does not clear the environment (see REPORT.md).
-    ("FINDING env -i clears the environment", "env -i printenv PATH; echo rc=$?", "rc=1\n", 0),
+    # env -i clears the environment (fixed).
+    ("env -i clears the environment", "env -i printenv PATH; echo rc=$?", "rc=1\n", 0),
 
     # --- hexdump / strings / expand ---
     ("hexdump -C canonical", "printf 'abc\\n' | hexdump -C | head -1", "00000000  61 62 63 0a                                       |abc.|\n", 0),
