@@ -45,6 +45,28 @@ Ctrl-C).
   `sort -rn`, `head -2`), `ls --color=auto` accepted, `/`-style paths
   from `grep -r` even on Windows.
 
+## Performance
+
+Because the utilities are embedded (no fork/exec, no external
+dependencies), unish is fast exactly where shells usually hurt. Measured
+with `bench/` (same workloads, medians over repeated runs; GNU tools in
+the bash column are the external C binaries):
+
+**Windows** (vs Git Bash and MSYS2): faster in **every** workload.
+`$(cmd)` in a loop is ~2300x faster (20s → 0.009s), the text tools are
+7–12x, pipelines ~5x, `sort` ~2.6x, shell startup ~5x.
+
+**Linux** (vs bash 5.2 + coreutils 9.4): command substitution **20x**,
+`cat` **4x**, arithmetic loops ~2x, `seq` ~2x, plain `sort` and
+`sort -u` ahead, `sed`/`wc`/`head` at parity. The remaining narrow
+losses are documented in `bench/README.md` (tar over thousands of tiny
+files, `echo` with thousands of arguments, `grep` which is mostly
+process startup and file I/O).
+
+Numbers vary between machines (WSL2 in particular quantizes timers
+below ~10ms); `bench/README.md` explains how to reproduce and how to
+read the results.
+
 ## Embedded commands (work on any OS)
 
 **Shell builtins** (~40, via mvdan/sh): `cd`, `echo`, `printf`
@@ -126,6 +148,21 @@ CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -ldflags="-s -w" -o uni
 
 Pure Go, `CGO_ENABLED=0`: the Linux binaries are fully static
 (no glibc/musl needed), the Windows ones only link system DLLs.
+
+## Development
+
+```
+go vet ./...
+go test ./...        # unit + GNU parity regression oracles
+```
+
+The differential suite in `parity/` runs ~370 scripts under both unish
+and a real GNU bash and requires identical stdout, exit codes and file
+effects; it runs in CI on every push (and weekly) and is the safety net
+for all the GNU edge cases (`sort` keys, `sed` cycles, `printf`
+conversions, trailing-newline semantics, …). See `parity/README.md`.
+
+Benchmarks live in `bench/`; see `bench/README.md`.
 
 ## License
 

@@ -3460,7 +3460,7 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	}
 	if lists > 1 {
-		fmt.Fprintln(hc.Stderr, "cut: only one list may be specified")
+		fmt.Fprintln(hc.Stderr, "cut: only one type of list may be specified")
 		fmt.Fprintln(hc.Stderr, "Try 'cut --help' for more information.")
 		return exitError{1}
 	}
