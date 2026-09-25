@@ -95,7 +95,8 @@ func (rp *repl) getenv(key string) string {
 // then strips \[ \] markers for width math (bash keeps them zero-width).
 func (rp *repl) prompt(primary bool) (display, raw string) {
 	varKey := "PS1"
-	def := `\u@\h:\w\$ `
+	// Distro-bashrc style default: green user@host, blue working dir.
+	def := `\[\e[1;32m\]\u@\h\[\e[0m\]:\[\e[1;34m\]\w\[\e[0m\]\$ `
 	if !primary {
 		varKey = "PS2"
 		def = "> "
@@ -445,18 +446,43 @@ alias grep='grep --color=auto'
 # alias g='git'
 # export EDITOR=vim
 # export PAGER=less
-# PS1 supports colors too: export PS1='\[\e[1;32m\]\u@\h\[\e[0m\] \w$ '
+# The default prompt is already colored (green user@host, blue path);
+# override it here if you want, e.g.:
+# export PS1='\[\e[1;36m\]\u@\h\[\e[0m\] \w\$ '
+`
+
+// oldDefaultRC is the first version of the starter file; when the
+// current ~/.unishrc is still exactly that, it is upgraded in place.
+const oldDefaultRC = `# ~/.unishrc — sourced by unish at interactive startup (like ~/.bashrc).
+# Created automatically on the first run; edit it freely.
+# It has no effect on scripts or "unish -c".
+
+# Handy aliases
+alias ll='ls -l'
+alias la='ls -la'
+alias l='ls'
+
+# Suggestions (uncomment to taste)
+# alias grep='grep --color=auto'
+# alias ..='cd ..'
+# export EDITOR=vim
+# export PAGER=less
 `
 
 // ensureRCFile writes the starter ~/.unishrc on the first interactive
-// run; it never overwrites an existing file and is best-effort.
+// run; it never overwrites user content, but does upgrade a pristine
+// copy of an older shipped template. Best-effort either way.
 func (rp *repl) ensureRCFile() {
 	h, err := os.UserHomeDir()
 	if err != nil {
 		return
 	}
 	p := filepath.Join(h, ".unishrc")
-	if _, err := os.Stat(p); err == nil {
+	data, err := os.ReadFile(p)
+	if err == nil {
+		if string(data) == oldDefaultRC {
+			_ = os.WriteFile(p, []byte(defaultRC), 0o644)
+		}
 		return
 	}
 	_ = os.WriteFile(p, []byte(defaultRC), 0o644)
