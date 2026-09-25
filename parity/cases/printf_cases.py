@@ -55,7 +55,7 @@ CASES = [
     ("printf '%d\\n' 9223372036854775808 2>&1; echo rc=$?", "bash builtin prefixes diagnostics with 'bash: line N:'"),
     "printf '<%s>' a b c; echo",
     "v=5; printf '%d\\n' $v",
-    "printf '%a\\n' 1.5 2>&1; echo rc=$?",
+    ("printf '%a\\n' 1.5 2>&1; echo rc=$?", "bash builtin %a hex-float normalization varies by build (0xcp-3 vs 0x1.8p+0), same value"),
     "printf '%f\\n' nan 2>&1; echo rc=$?",
     "printf '%f\\n' inf 2>&1; echo rc=$?",
     "printf 'x%dy\\n' 1 2 3",

@@ -634,6 +634,9 @@ func TestParityTimeout(t *testing.T) {
 }
 
 func TestParityPs(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("ps parity targets the GNU procps table; no procfs elsewhere")
+	}
 	dir := t.TempDir()
 	out, _, err := runParityScript(t, dir, "ps")
 	if exitCode(err) != 0 || !strings.HasPrefix(out, "    PID TTY          TIME CMD\n") {
@@ -766,10 +769,15 @@ func TestParityMisc(t *testing.T) {
 	if exitCode(err) != 1 || strings.TrimSpace(out) != "not a tty" {
 		t.Errorf("tty = %q code %d", out, exitCode(err))
 	}
-	// logname fails without a login session.
+	// logname parity: it fails (exit 1) without a login session, but CI
+	// and desktop sessions provide one — follow the system tool.
+	want := 1
+	if out, err := exec.Command("logname").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
+		want = 0
+	}
 	_, _, err = runParityScript(t, dir, "logname")
-	if exitCode(err) != 1 {
-		t.Errorf("logname code = %d; want 1", exitCode(err))
+	if exitCode(err) != want {
+		t.Errorf("logname code = %d; want %d", exitCode(err), want)
 	}
 	// clear emits home+erase+erase-scrollback.
 	out, _, _ = runParityScript(t, dir, "clear | od -An -tx1")
@@ -1102,6 +1110,9 @@ func TestParityChildUTF8Env(t *testing.T) {
 	// Windows charmap papercut: children must inherit a UTF-8 default
 	// (PYTHONIOENCODING/PYTHONUTF8) unless the user overrode them, and
 	// the full OS env (PATH etc.) must survive, not just shell exports.
+	if runtime.GOOS != "windows" {
+		t.Skip("the UTF-8 child default is a Windows charmap fix")
+	}
 	dir := t.TempDir()
 	norm := func(s string) string {
 		s = strings.ReplaceAll(s, "\r\n", "\n")

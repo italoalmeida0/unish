@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -78,6 +79,9 @@ func TestNetcatScanning(t *testing.T) {
 }
 
 func TestPgrep(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("pgrep parity targets procps; no procfs on macOS")
+	}
 	stdout, _, err := runUnishScript(t, "pgrep -l .")
 	if err != nil {
 		t.Fatalf("pgrep -l . failed: %v", err)
