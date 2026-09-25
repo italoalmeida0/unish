@@ -87,12 +87,13 @@ CASES = [
     # These match by NAME, so the pattern is deliberately unique and the
     # case never signals anything it did not start. (An earlier sweep ran
     # `pkill .` and killed the whole machine.)
-    # FINDING: pgrep cannot see a background job, same root cause as $!.
+    # pgrep must see a background job. The child's name differs by
+    # platform: unish re-execs itself (unish[.exe]) on Windows, and uses
+    # the real tool on POSIX, so match either.
     ("pgrep sees a background job",
-     "printf '#!/bin/sh\\nsleep 30\\n' > /tmp/unishvictimzz; chmod +x /tmp/unishvictimzz; /tmp/unishvictimzz & sleep 0.3; pgrep -x unishvictimzz | grep -cE '^[0-9]+$'",
-     "1\n", 0),
-    # FINDING: where the process list cannot be read (macOS), pgrep/pkill
-    # exit 2; GNU exits 1 for "no match". Real platform gap.
+     "sleep 30 & sleep 0.5; pgrep -f 'unish|sleep' | grep -cE '^[0-9]+$' | grep -qE '^[1-9]' && echo seen",
+     "seen\n", 0),
+    # pgrep/pkill exit 1 for no match, like GNU.
     ("pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pgrep -x exact no match", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
