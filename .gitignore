@@ -19,3 +19,8 @@ Thumbs.db
 
 # Local reference material (not part of build)
 shell.js
+
+# Private usage data (AI agent session exports)
+comandos.json
+*.usage.json
+
