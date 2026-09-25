@@ -35,6 +35,7 @@ from cases import misc_cases, printf_cases, sed_cases, shell_cases, sort_cases
 from functional import CASES as FUNCTIONAL_CASES
 from cases.flag_cases import FLAG_CASES
 from cases.gap_cases import ORACLE_CASES, FIXED_CASES
+from cases.cmd_cases import CASES as CMD_CASES
 from e2e import CASES as E2E_CASES
 from edge_cases import CASES as EDGE_CASES
 from flag_audit import oracle_path
@@ -116,6 +117,8 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--skip-platform", action="store_true",
                     help="skip cases that need GNU/busybox tooling absent here")
+    ap.add_argument("--only-cmd", action="store_true",
+                    help="run only the per-command fixture cases")
     ap.add_argument("--only-edge", action="store_true",
                     help="run only the boundary/robustness cases")
     ap.add_argument("--only-e2e", action="store_true",
@@ -130,6 +133,9 @@ def main():
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return run_go_tests(repo, args.verbose)
 
+    if args.only_cmd:
+        unish_abs = os.path.abspath(args.unish)
+        return 1 if run_cmd_cases(unish_abs, args.timeout, args.verbose) else 0
     if args.only_edge:
         unish_abs = os.path.abspath(args.unish)
         return 1 if run_edge(unish_abs, args.timeout, args.verbose) else 0
@@ -207,7 +213,8 @@ def main():
     gp_failed = run_gap_cases(unish, args.oracle, args.timeout, args.verbose)
     e2_failed = run_e2e(unish, args.timeout, args.verbose)
     ed_failed = run_edge(unish, args.timeout, args.verbose)
-    return 1 if (failed or fn_failed or fl_failed or gp_failed or e2_failed or ed_failed) else 0
+    cm_failed = run_cmd_cases(unish, args.timeout, args.verbose)
+    return 1 if (failed or fn_failed or fl_failed or gp_failed or e2_failed or ed_failed or cm_failed) else 0
 
 
 def run_go_tests(unish_dir, verbose):
@@ -502,6 +509,35 @@ def run_edge(unish, timeout, verbose):
         finally:
             shutil.rmtree(d, ignore_errors=True)
     print("=== edge: %d cases, %d failures, %d known gaps" % (total, failed, gaps))
+    return failed
+
+
+def run_cmd_cases(unish, timeout, verbose):
+    """Per-command cases for commands whose flags need real fixtures."""
+    total = failed = gaps = 0
+    for name, script, want_out, want_rc in CMD_CASES:
+        total += 1
+        d = tempfile.mkdtemp(prefix="cmd_")
+        try:
+            got, rc, _ = run_one([unish], script, d, timeout)
+            got_s = norm(got).decode("utf-8", "replace")
+            if got_s == want_out and rc == want_rc:
+                if verbose:
+                    print("ok    [cmd] %s" % name)
+            elif name.startswith("FINDING"):
+                gaps += 1
+                print("KNOWN GAP [cmd] %s" % name)
+                if verbose:
+                    print("      want %r/%d got %r/%d" % (want_out, want_rc, got_s, rc))
+            else:
+                failed += 1
+                print("FAIL  [cmd] %s" % name)
+                print("      script: %r" % script)
+                print("      want %r exit %d" % (want_out, want_rc))
+                print("      got  %r exit %d" % (got_s, rc))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    print("=== cmd: %d cases, %d failures, %d known gaps" % (total, failed, gaps))
     return failed
 
 
