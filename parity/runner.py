@@ -35,6 +35,7 @@ from cases import misc_cases, printf_cases, sed_cases, shell_cases, sort_cases
 from functional import CASES as FUNCTIONAL_CASES
 from cases.flag_cases import FLAG_CASES
 from cases.gap_cases import ORACLE_CASES, FIXED_CASES
+from e2e import CASES as E2E_CASES
 
 CASE_GROUPS = [
     ("sort", sort_cases.CASES),
@@ -113,6 +114,8 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--skip-platform", action="store_true",
                     help="skip cases that need GNU/busybox tooling absent here")
+    ap.add_argument("--only-e2e", action="store_true",
+                    help="run only the end-to-end process cases")
     ap.add_argument("--only-flags", action="store_true",
                     help="run only the generated flag cases")
     ap.add_argument("--go-tests", action="store_true",
@@ -123,6 +126,9 @@ def main():
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return run_go_tests(repo, args.verbose)
 
+    if args.only_e2e:
+        unish_abs = os.path.abspath(args.unish)
+        return 1 if run_e2e(unish_abs, args.timeout, args.verbose) else 0
     if args.only_flags:
         unish_abs = os.path.abspath(args.unish)
         return 1 if run_flag_cases(unish_abs, args.timeout, args.verbose) else 0
@@ -192,7 +198,8 @@ def main():
     fn_failed = run_functional(unish, args.timeout, args.verbose)
     fl_failed = run_flag_cases(unish, args.timeout, args.verbose)
     gp_failed = run_gap_cases(unish, args.oracle, args.timeout, args.verbose)
-    return 1 if (failed or fn_failed or fl_failed or gp_failed) else 0
+    e2_failed = run_e2e(unish, args.timeout, args.verbose)
+    return 1 if (failed or fn_failed or fl_failed or gp_failed or e2_failed) else 0
 
 
 def run_go_tests(unish_dir, verbose):
@@ -334,6 +341,80 @@ def run_gap_cases(unish, oracle_spec, timeout, verbose):
             shutil.rmtree(du, ignore_errors=True)
             shutil.rmtree(do, ignore_errors=True)
     print("=== gaps: %d cases, %d failures" % (total, failed))
+    return failed
+
+
+def run_e2e(unish, timeout, verbose):
+    """Fase 4: the binary as a real process — scripts, pipes, exit codes.
+
+    Each case runs `unish` as a child process (never in-process), so it
+    exercises the parts a user actually touches: argv handling, stdin,
+    real pipes between two unish processes, redirections and exit codes.
+    """
+    total = failed = 0
+    for name, kind, payload, (want_out, want_rc) in E2E_CASES:
+        total += 1
+        d = tempfile.mkdtemp(prefix="e2e_")
+        try:
+            if kind == "script":
+                sc = os.path.join(d, "s.sh")
+                with open(sc, "w") as fh:
+                    fh.write(payload)
+                argv = [unish, sc] + (["x", "y"] if "$1" in payload else [])
+                p = subprocess.run(argv, cwd=d, input=b"line\n",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                got, rc = norm(p.stdout).decode("utf-8", "replace"), p.returncode
+            elif kind == "stdin":
+                p = subprocess.run([unish], cwd=d, input=payload.encode(),
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                got, rc = norm(p.stdout).decode("utf-8", "replace"), p.returncode
+            elif kind == "pipeline":
+                p = subprocess.run([unish, "-c", payload], cwd=d, input=b"",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+                got, rc = norm(p.stdout).decode("utf-8", "replace"), p.returncode
+            elif kind == "process":
+                # Real OS pipe chain: N unish processes, each stdout into
+                # the next stdin. This is what a Makefile or another tool
+                # sees, and it is where stdin/buffering bugs surface.
+                procs = []
+                prev_out = None
+                for i, stage in enumerate(payload):
+                    last = i == len(payload) - 1
+                    pr = subprocess.Popen(
+                        [unish, "-c", " ".join(stage)], cwd=d,
+                        stdin=prev_out,
+                        stdout=subprocess.PIPE if not last else subprocess.PIPE,
+                        stderr=subprocess.PIPE)
+                    if prev_out is not None:
+                        prev_out.close()
+                    prev_out = pr.stdout
+                    procs.append(pr)
+                out, _ = procs[-1].communicate(timeout=timeout)
+                for pr in procs[:-1]:
+                    try:
+                        pr.wait(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        pr.kill()
+                got, rc = norm(out).decode("utf-8", "replace"), procs[-1].returncode
+            else:
+                failed += 1
+                print("FAIL  [e2e] %s (unknown kind %r)" % (name, kind))
+                continue
+
+            if got == want_out and rc == want_rc:
+                if verbose:
+                    print("ok    [e2e] %s" % name)
+            else:
+                failed += 1
+                print("FAIL  [e2e] %s" % name)
+                print("      want %r exit %d" % (want_out, want_rc))
+                print("      got  %r exit %d" % (got, rc))
+        except subprocess.TimeoutExpired:
+            failed += 1
+            print("FAIL  [e2e] %s (timeout)" % name)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    print("=== e2e: %d cases, %d failures" % (total, failed))
     return failed
 
 
