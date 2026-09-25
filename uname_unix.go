@@ -4,6 +4,7 @@ package main
 
 import (
 	"os"
+	"runtime"
 	"strings"
 )
 
@@ -27,4 +28,31 @@ func kernelVersion() string {
 		}
 	}
 	return "1.0"
+}
+
+// machineProcessor reports the processor type (uname -p). GNU uname on
+// Linux reports the machine architecture here (e.g. x86_64), not
+// "unknown"; the earlier hardcoded value was simply wrong.
+func machineProcessor() string {
+	return unameMachine()
+}
+
+// machineHardware reports the hardware platform (uname -i). Linux has no
+// separate notion, so GNU reports the same machine string as -m/-p.
+func machineHardware() string {
+	return unameMachine()
+}
+
+// unameMachine maps the Go architecture to the kernel machine name, the
+// same mapping `uname -m` uses (arm64 -> aarch64, amd64 -> x86_64).
+func unameMachine() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	case "386":
+		return "i686"
+	}
+	return runtime.GOARCH
 }

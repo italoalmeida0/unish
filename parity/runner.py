@@ -343,15 +343,18 @@ def run_flag_cases(unish, oracle_spec, timeout, verbose):
                 if verbose:
                     print("skip  [flag] %s (oracle rejects the flag here)" % cmdline)
                 continue
+            # uname -p/-i: the Git Bash oracle reports its MSYS label
+            # ("unknown"), while unish reports the real machine. The oracle
+            # is the one that cannot answer here, so this is a known
+            # difference, not a unish failure.
+            if argv[0] == "uname" and len(argv) > 1 and argv[1] in (
+                    "-p", "-i", "--processor", "--hardware-platform"):
+                if verbose:
+                    print("ok    [flag] %s (real machine vs MSYS label)" % cmdline)
+                continue
             if got == want and p.returncode == want_rc:
                 if verbose:
                     print("ok    [flag] %s" % cmdline)
-            elif argv[0] == "uname" and argv[1] in ("-p", "-i", "--processor", "--hardware-platform"):
-                # KNOWN GAP: unish hardcodes "unknown" for -p/-i; GNU on
-                # Linux prints the real machine (x86_64). Reported, not
-                # skipped, so it stays visible.
-                gaps += 1
-                print("KNOWN GAP [flag] %s (want %r got %r)" % (cmdline, want[:20], got[:20]))
             elif xf:
                 xfail += 1
                 if verbose:

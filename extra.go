@@ -1808,13 +1808,14 @@ func cmdUname(_ context.Context, hc interp.HandlerContext, args []string) error 
 	if *machine {
 		parts = append(parts, machineName)
 	}
-	// GNU: -p (processor) and -i (hardware platform) print "unknown"
-	// when the info is unavailable; never fail with "not defined".
+	// GNU: -p (processor) and -i (hardware platform) report the machine
+	// architecture on Linux/Windows; only report "unknown" when the
+	// platform genuinely has no answer.
 	if *proc {
-		parts = append(parts, "unknown")
+		parts = append(parts, machineProcessor())
 	}
 	if *hw {
-		parts = append(parts, "unknown")
+		parts = append(parts, machineHardware())
 	}
 	fmt.Fprintln(hc.Stdout, strings.Join(parts, " "))
 	return nil

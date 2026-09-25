@@ -45,3 +45,27 @@ func kernelRelease() string {
 func kernelVersion() string {
 	return fmt.Sprintf("%s windows", runtime.Version())
 }
+
+// machineProcessor reports the processor type (uname -p). On Windows GNU
+// uname (MSYS) reports the MSYS architecture label; the closest honest
+// answer is the real machine (x86_64 / aarch64), not "unknown".
+func machineProcessor() string {
+	return unameMachine()
+}
+
+// machineHardware reports the hardware platform (uname -i).
+func machineHardware() string {
+	return unameMachine()
+}
+
+func unameMachine() string {
+	switch runtime.GOARCH {
+	case "amd64":
+		return "x86_64"
+	case "arm64":
+		return "aarch64"
+	case "386":
+		return "i686"
+	}
+	return runtime.GOARCH
+}
