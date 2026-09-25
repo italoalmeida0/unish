@@ -9,29 +9,26 @@ rediscover any of it.
 | Group | Cases | Result |
 |---|---|---|
 | Output parity (GNU oracle) | 372 | 0 failures, 9 documented wording deltas |
-| Flag cases (oracle at run time) | 192 | 0 failures, 49 known differences |
-| Per-command fixture cases | 51 | 0 failures, 2 known gaps |
+| Flag cases (oracle at run time) | 404 | 0 failures, 60 known differences |
+| Per-command fixture cases | 77 | 0 failures, 3 known gaps |
+| Sandbox (docker: pgrep/pkill/ss/nc) | 29 | 0 failures, 3 known gaps |
 | Functional (does it DO it) | 21 | 0 failures, 5 known gaps |
 | Gaps: the 15 uncovered commands | 37 | 0 failures, 1 known gap |
 | End-to-end (real processes) | 38 | 0 failures |
 | Edge cases / robustness | 62 | 0 failures, 1 known gap |
 | Go unit suite | 86 tests | 0 failures, 5 platform skips |
 
-CI runs all of it on Linux, macOS and Windows (9 jobs, all green).
+CI runs all of it on Linux, macOS and Windows, plus a docker sandbox
+job (10 jobs, all green).
 
-## Flag coverage: 223 of 503 (44%), every command covered
+## Flag coverage: 431 of 503 (86%), every command covered
 
-All 90 embedded commands now have at least one flag case. The 223 with a
-case are the ones a generic sweep or a hand-written fixture can set up
-honestly.
+All 90 embedded commands have at least one flag case; 431 of 503 flags
+are exercised (a long alias counts when its short form is).
 
-The remaining ~280 are not a coverage failure waiting to be fixed by
-more generation: each needs state a test cannot invent safely — a live
-socket (`nc`/`ss` beyond usage), another user's process, a filesystem
-with specific attributes (`chattr`-style flags), or a signal target that
-is not this machine's processes. Writing cases for them would mean
-asserting behaviour the test itself cannot establish, which is the
-theatre this campaign set out to avoid.
+The remaining 72 need live state a test cannot invent safely: process
+matching and sockets (covered instead in the docker sandbox), plus a
+handful of platform-specific flags.
 
 ## Real findings in unish
 
@@ -72,6 +69,19 @@ GNU leaves leading tabs untouched with `-i`; unish rejects the flag.
 `env -i printenv PATH` still prints the full PATH. The flag is parsed and
 discarded (`_ = ignore`), and the implementation calls `os.Clearenv` /
 `os.Setenv`, mutating the whole shell process instead of the child.
+
+### `pgrep -x` never matches
+
+`-x` compares `^name$` against the base of the full command line
+(`sleep 30`), so it never matches a process started with arguments.
+
+### `pkill -s` (session) is not implemented
+
+### `nc` sends nothing
+
+`pipeConn` returns as soon as EITHER direction ends, so the stdout copier
+(which finishes first when the peer does not reply) closes the connection
+before the stdin copier has sent the data.
 
 ### `pgrep`/`pkill` on macOS exit 2
 
