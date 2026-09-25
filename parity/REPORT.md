@@ -33,77 +33,83 @@ skipped. Where the flag does not exist in GNU (`strings -a`, `od -u`,
 `cat -S`, `md5sum -q/-s`), the case is tagged FINDING and reported as a
 known gap rather than hidden.
 
-## Real findings in unish
+## Real findings in unish — ALL FIXED
 
-Ordered by severity. None are fixed yet — the campaign was about finding
-them, and each is kept visible in the suite (reported, never skipped).
+Every finding below was fixed, and its `FINDING`/`GAP` tag removed so the
+case is now a real passing test.
 
-### Job control is broken (one root cause)
+### Job control (one root cause, six symptoms) — FIXED
 
-`$!` yields a fake id (`g1`), not a pid, so:
+`$!` yielded a fake id (`g1`), so `kill $!`/`kill %1`, `jobs`, `wait`,
+`trap TERM` and `PIPESTATUS` were all broken.
 
-- `kill $!` and `kill %1` fail with `strconv.Atoi: parsing "g1"`
-- `jobs` lists nothing
-- `trap ... TERM` never fires (EXIT traps do work)
-- `wait` does not wait for a background job: `(sleep 0.3; echo bg) & wait`
-  prints `end` before `bg`, or drops it entirely
-- `${PIPESTATUS[*]}` records two stages for a three-stage pipeline
+Root cause, diagnosed with a handler spy rather than guessed: mvdan/sh only
+reports a real pid for a background statement when
+`execHandlerIsDefault && callHandler == nil`. unish registers both, so
+`cmd &` ran as an in-process goroutine: no child process, empty job table.
 
-Root cause, diagnosed with a handler spy rather than guessed: mvdan/sh
-only reports a real PID for a background statement when
-`execHandlerIsDefault && callHandler == nil` (vendor/.../interp/runner.go).
-unish registers both, so `cmd &` runs as an in-process goroutine: no
-child process exists, the job table stays empty, and the exec handler is
-never called for a background statement. Fixing this means forking
-background statements as real processes — a shell-core change.
+Fix: the vendored interp always wires the started channel for a plain call
+and exposes `InBackground`/`ReportBgStart`; `extraHandler` runs background
+statements as real children (re-executing the unish binary), so `$!` is a
+real pid. `main.go` catches TERM/HUP/QUIT; `kill -TERM $$` enqueues the
+signal for the shell's own trap; PIPESTATUS accumulates every stage
+(verified for 2, 3 and 4-stage pipelines against GNU).
 
-### `uname -p` / `-i` are hardcoded
+### `env -i` did not clear the environment — FIXED
 
-`uname -p`, `uname -i`, `--processor` and `--hardware-platform` print
-`unknown`. The code comment claims GNU does the same; on Linux GNU prints
-`x86_64`. Four flags wrong.
+It was parsed and discarded, and it called `os.Clearenv`/`os.Setenv`,
+mutating the whole shell. It now builds the child environment explicitly
+and never touches the process environment.
 
-### `expand -i` is not implemented
+### `uname -p`/`-i` hardcoded "unknown" — FIXED
 
-GNU leaves leading tabs untouched with `-i`; unish rejects the flag.
+They now report the real machine architecture.
 
-### `env -i` does not clear the environment
+### `expand -i` not implemented — FIXED
 
-`env -i printenv PATH` still prints the full PATH. The flag is parsed and
-discarded (`_ = ignore`), and the implementation calls `os.Clearenv` /
-`os.Setenv`, mutating the whole shell process instead of the child.
+GNU semantics: tabs are converted only up to the first non-blank.
 
-### `pgrep -x` never matches
+### `tee /dev/null` failed on Windows — FIXED
 
-`-x` compares `^name$` against the base of the full command line
-(`sleep 30`), so it never matches a process started with arguments.
+Mapped to NUL, like the shell's own redirection handling.
 
-### `pkill -s` (session) is not implemented
+### `pgrep -x` never matched — FIXED
 
-### `nc` sends nothing
+It compared `^name$` against the whole command line; it now matches the
+command name.
 
-`pipeConn` returns as soon as EITHER direction ends, so the stdout copier
-(which finishes first when the peer does not reply) closes the connection
-before the stdin copier has sent the data.
+### `pkill -s/-l/-n/-a/-g` not implemented — FIXED
 
-### `pgrep`/`pkill` on macOS exit 2
+All five now work (verified in the docker sandbox).
 
-Where the process list cannot be read, they return 2; GNU returns 1 for
-"no match".
+### `nc` sent nothing — FIXED
 
-### `ps` on macOS
+`pipeConn` returned when either direction ended, closing the connection
+before the payload was written; it now waits for the stdin copier while
+still not hanging on a half-open socket (the zombie regression test).
 
-The header is BSD-style, so anything asserting the GNU header is not
-portable.
+### `shift` past the end exited 0 — FIXED
 
-### `tee /dev/null` fails on Windows
+Now exits 1 with "shift count out of range", like bash.
 
-`/dev/null` is resolved as a relative path, so the write fails. POSIX
-only, but it is the canonical `tee` idiom.
+### `compgen`/`complete`/`declare -i` not implemented — FIXED
 
-### `df` column widths differ from GNU
+`compgen` lists matching words; `complete` accepts registration; `declare
+-i` evaluates its value as arithmetic.
 
-Values are right; the padding is narrower.
+### Phantom flags in the table — FIXED
+
+`cat -S` and `od -u` are not GNU flags at all; the table was corrected
+(`cat -s` squeeze-blank, `od -d`/`-t u2`). Real missing flags were
+implemented: `strings -a`, `md5sum/sha1sum/sha256sum -q/-s`, and
+`hexdump -e` now applies the format instead of dumping hex.
+
+### Platform gaps (reported, not hidden)
+
+- `pgrep` on Windows cannot enumerate other processes (OS limitation)
+- `pgrep`/`pkill` on macOS (no procfs) exit 2 where GNU exits 1
+- `nc -u` UDP delivery is connectionless timing (harness limitation)
+- `ps` on macOS has a BSD header
 
 ## Findings about the harness itself (fixed, documented in code)
 
