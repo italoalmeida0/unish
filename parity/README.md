@@ -41,6 +41,33 @@ prefixes `printf` diagnostics with `bash: line N:`). They are reported
 as `XFAIL` and don't fail the run; if one starts passing it is reported
 as `XPASS` so the tag can be removed.
 
+## Functional tests (does it actually work?)
+
+Output parity answers "does unish print what GNU prints". That is not
+the same as "does the shell do the thing", and a shell can pass
+thousands of parity cases while `kill $!` is broken.
+
+`functional.py` runs ~20 scripts for real — spawning processes, killing
+them, waiting, watching traps fire — and checks the observable effect.
+They run in CI on Linux, macOS and Windows.
+
+### Known gaps (documented, not hidden)
+
+These five fail today and are tagged in the data as known gaps, so they
+stay visible in CI output instead of passing silently:
+
+| Behavior | Why |
+|---|---|
+| `$!` is not a real PID (`g1`) | mvdan/sh only reports a real PID for background jobs when it uses its *default* exec handler and no call handler; unish registers both, so background statements run as in-process goroutines |
+| `kill $!` / `kill %1` | follow from the above: the job table is empty because no external process is started for `cmd &` |
+| `jobs` lists nothing | same |
+| `trap ... TERM` does not fire | the in-process background/subshell path never delivers signals to the trap callback |
+| `${PIPESTATUS[*]}` misses a stage | only two entries are recorded for a three-stage pipeline |
+
+Fixing these means forking background statements as real child
+processes. That is a shell-core change, not a patch, and it is tracked
+here rather than papered over.
+
 ## Oracle versions
 
 The authoritative oracle is **GNU coreutils 9.4 / bash 5.2** (what the

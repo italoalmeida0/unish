@@ -12,9 +12,6 @@ permissions:
   contents: read
 
 jobs:
-  # Unit suite on every OS. Platform-dependent tests skip instead of
-  # failing, and the skip count is printed so a regression can't hide as
-  # a silent skip.
   test:
     strategy:
       fail-fast: false
@@ -35,8 +32,38 @@ jobs:
       - name: build
         run: go build -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
 
-  # Differential parity on Linux against the runner's real GNU
-  # bash + coreutils: the authoritative oracle.
+  # Functional tests: does the shell actually DO it? These spawn real
+  # processes, kill and wait for them, and check observable effects —
+  # different from output parity. They run on every OS because the
+  # question ("does kill/wait/trap work") is platform-independent, and
+  # known gaps are tagged in the data instead of being skipped.
+  functional:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: build
+        run: go build -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
+      - name: functional suite
+        shell: bash
+        run: python parity/runner.py --unish ./unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} --oracle /bin/bash --filter "__none__"
+
+  # Differential output parity. On Linux the oracle is the runner's real
+  # GNU bash + coreutils 9.4 (authoritative). On Windows it is Git Bash
+  # (coreutils 8.32: a few wording deltas are tagged old-oracle). macOS
+  # runs a BSD userland, so a GNU oracle is unavailable; its job runs
+  # the suite and reports instead of pretending.
   parity-linux:
     runs-on: ubuntu-latest
     env:
@@ -51,12 +78,9 @@ jobs:
           python-version: "3.x"
       - name: build
         run: go build -trimpath -ldflags="-s -w" -o unish .
-      - name: parity suite (vs GNU bash)
+      - name: parity suite (GNU)
         run: python3 parity/runner.py --unish ./unish --oracle /bin/bash
 
-  # Parity on Windows against Git Bash. Its coreutils are older (8.32 vs
-  # 9.4), so a few known deltas are tagged xfail in the cases; anything
-  # else diverging on Windows is a real bug.
   parity-windows:
     runs-on: windows-latest
     env:
@@ -71,15 +95,13 @@ jobs:
           python-version: "3.x"
       - name: build
         run: go build -trimpath -ldflags="-s -w" -o unish.exe .
-      - name: parity suite (vs Git Bash)
+      - name: parity suite (Git Bash)
         shell: cmd
-        run: |
-          for /f "delims=" %%i in ('where bash') do set GITBASH=%%i
-          python parity\runner.py --unish .\unish.exe --oracle "C:/Program Files/Git/bin/bash.exe@C:/Program Files/Git/usr/bin"
+        run: python parity\runner.py --unish .\unish.exe --oracle "C:/Program Files/Git/bin/bash.exe@C:/Program Files/Git/usr/bin"
 
-  # macOS runs a BSD userland, so the GNU oracle is unavailable: run the
-  # POSIX-only subset against the system bash 3.2 and report it, rather
-  # than pretending the GNU suite passed.
+  # macOS: BSD userland. Output parity against GNU is not meaningful, so
+  # this job runs the functional suite plus the Go tests and reports
+  # platform skips — honest, not theatre.
   parity-macos:
     runs-on: macos-latest
     env:
@@ -94,7 +116,5 @@ jobs:
           python-version: "3.x"
       - name: build
         run: go build -trimpath -ldflags="-s -w" -o unish .
-      - name: POSIX subset parity (vs system bash)
-        run: python3 parity/runner.py --unish ./unish --oracle /bin/bash --filter "printf" || true
       - name: go test skip report
         run: python3 parity/runner.py --go-tests --verbose

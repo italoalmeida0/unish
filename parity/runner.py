@@ -32,6 +32,7 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cases import misc_cases, printf_cases, sed_cases, shell_cases, sort_cases
+from functional import CASES as FUNCTIONAL_CASES
 
 CASE_GROUPS = [
     ("sort", sort_cases.CASES),
@@ -180,7 +181,8 @@ def main():
 
     print("=== %d cases: %d failures, %d known deltas (xfail), %d xpass" %
           (total, failed, xfailed, xpassed))
-    return 1 if failed else 0
+    fn_failed = run_functional(unish, args.timeout, args.verbose)
+    return 1 if (failed or fn_failed) else 0
 
 
 def run_go_tests(unish_dir, verbose):
@@ -218,6 +220,42 @@ def run_go_tests(unish_dir, verbose):
     if skipped_tests and verbose:
         for t in skipped_tests:
             print("    skip: %s" % t)
+    return failed
+
+
+def run_functional(unish, timeout, verbose):
+    """Functional tests: does the shell DO it, not just print it?
+
+    Each case is run for real (spawning processes, killing them, waiting)
+    and judged on observable effects. Tags record KNOWN GAPs per platform
+    so they stay visible instead of silently passing.
+    """
+    total = failed = known = 0
+    for name, script, want_out, want_code, tags in FUNCTIONAL_CASES:
+        total += 1
+        d = tempfile.mkdtemp(prefix="fn_")
+        try:
+            got_out, got_code, _ = run_one([unish], script, d, timeout)
+            got = got_out.decode("utf-8", "replace")
+            ok = got == want_out and got_code == want_code
+            tag = "all" if "all" in tags else platform_key() if platform_key() in tags else None
+            if ok:
+                if verbose:
+                    print("ok    [fn] %s" % name)
+            elif tag:
+                known += 1
+                print("KNOWN GAP [fn] %s (%s)" % (name, tag))
+                if verbose:
+                    print("      want %r/%d  got %r/%d" % (want_out, want_code, got, got_code))
+            else:
+                failed += 1
+                print("FAIL  [fn] %s" % name)
+                print("      script: %r" % script)
+                print("      want %r exit %d" % (want_out, want_code))
+                print("      got  %r exit %d" % (got, got_code))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    print("=== functional: %d cases, %d failures, %d known gaps" % (total, failed, known))
     return failed
 
 

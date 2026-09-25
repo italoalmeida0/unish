@@ -1821,3 +1821,8 @@ func isPipeClosed(err error) bool {
 	}
 	return false
 }
+
+// probeLog is a temporary debugging aid for job-tracking diagnosis.
+var probeLog = func(format string, a ...any) {
+	os.Stderr.WriteString("PROBE: " + fmt.Sprintf(format, a...) + "\n")
+}
