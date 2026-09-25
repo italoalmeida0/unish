@@ -36,3 +36,21 @@ The output is a TSV: label, workload, shell, median seconds, exit code.
   substitution) and the embedded utilities (sort/grep/sed/wc/tar...),
   where bash uses external GNU tools and unish uses its built-ins: that
   is the architectural trade the benchmark is meant to expose.
+
+## Reading the numbers
+
+A single run is not a measurement in WSL: the same workload can differ by
+2x between runs because the scheduler quantizes and the VM is shared.
+`--runs` takes a median over repeats, which helps, but the reliable
+signal for anything under ~50ms is the **minimum of many runs** (the
+fastest run is the one least disturbed). The harness prints medians; for
+small workloads, wrap it or take the min yourself.
+
+Example of the noise: a run reported `loop_arith10k` at 0.072s and
+`seq_100k` at 0.011s, suggesting regressions; min-of-15 showed both at
+parity with bash (0.03s and 0.00s). No code change was involved.
+
+After the job-control work (background statements now fork real child
+processes) the numbers were re-checked: no workload regressed. The only
+structural gaps remain the documented ones (tar over thousands of tiny
+files, where Go's per-file syscall overhead is higher than C's).
