@@ -37,3 +37,5 @@ xa[a-z]
 sum
 out.txt
 f3
+
+tmp/

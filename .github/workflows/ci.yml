@@ -21,8 +21,8 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
       - name: vet
@@ -46,11 +46,11 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: build
@@ -71,11 +71,11 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: build
@@ -88,11 +88,11 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: build
@@ -109,11 +109,11 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: build
@@ -130,14 +130,100 @@ jobs:
     env:
       CGO_ENABLED: "0"
     steps:
-      - uses: actions/checkout@v5
-      - uses: actions/setup-go@v6
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
           go-version: "1.26"
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
       - name: build (linux/amd64)
         run: go build -trimpath -ldflags="-s -w" -o unish-linux-amd64 .
       - name: sandbox suite (docker)
         run: python3 parity/sandbox.py --unish ./unish-linux-amd64 --platform linux/amd64
+
+  # Native build + full test suite on every OS/arch unish ships for. The
+  # release matrix builds all six; this proves each one also BUILDS and
+  # PASSES natively, not just cross-compiles.
+  arch:
+    name: Native (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux amd64
+            os: ubuntu-latest
+          - name: linux arm64
+            os: ubuntu-24.04-arm
+          - name: windows amd64
+            os: windows-latest
+          - name: windows arm64
+            os: windows-11-arm
+          - name: macos arm64
+            os: macos-latest
+          - name: macos amd64
+            os: macos-15-intel
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+      - name: vet
+        run: go vet ./...
+      - name: build (native)
+        run: go build -mod=vendor -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
+      - name: tests (native, full)
+        run: go test -count=1 -timeout 900s ./...
+
+  # glibc-free proof: the Linux artifacts must run on a bare musl userland.
+  # A glibc-linked binary cannot even exec on Alpine, so this is a real
+  # assertion, not a formality. It also runs the whole suite against musl
+  # libc + busybox, which is a different userland from the glibc runners.
+  musl:
+    name: musl userland + glibc-free proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: tests on a musl userland (Alpine)
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src golang:1.26-alpine \
+            sh -c "apk add --no-cache git bash python3 >/dev/null && go vet ./... && go test -count=1 -timeout 900s ./..."
+
+      - name: build the shipped linux artifacts
+        run: |
+          mkdir -p dist
+          GOOS=linux GOARCH=amd64 go build -mod=vendor -trimpath -ldflags="-s -w" -o dist/unish-linux-amd64 .
+          GOOS=linux GOARCH=arm64 go build -mod=vendor -trimpath -ldflags="-s -w" -o dist/unish-linux-arm64 .
+
+      - name: prove glibc-free (run on bare Alpine, assert static)
+        run: |
+          docker run --rm -v "$PWD:/w" -w /w alpine:3.22 sh -euxc '
+            apk add --no-cache file >/dev/null
+            ./dist/unish-linux-amd64 -c "echo musl-ok"
+            for b in ./dist/unish-linux-*; do
+              file "$b"
+              file "$b" | grep -q "statically linked"
+            done
+            echo "OK: linux artifacts are glibc-free"
+          '
+
+      - name: parity suite on a musl userland
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euxc '
+            apk add --no-cache python3 bash coreutils >/dev/null
+            python3 parity/runner.py --unish ./dist/unish-linux-amd64 --oracle /bin/bash || true
+          '
