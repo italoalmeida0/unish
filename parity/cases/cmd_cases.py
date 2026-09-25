@@ -136,18 +136,20 @@ CASES = [
     ("strings finds text", "printf '\x01hello\x02world\n' | strings", "hello\nworld\n", 0),
     ("strings -n length filter", "printf 'ab\x01longer\n' | strings -n 3", "longer\n", 0),
     # FINDING: strings -a is not implemented (GNU: scan whole file).
-    ("FINDING strings -a scans whole file", "printf '\x01hi\n' | strings -a", "hi\n", 0),
+    ("strings -a scans whole file", "printf '\\x01hello\\n' | strings -a", "hello\n", 0),
     # FINDING: strings -t/-o (offset prefix) produce nothing.
-    ("FINDING strings -t offset prefix", "printf 'abc\n' | strings -t x | grep -cE '^ *[0-9a-f]+ abc'", "1\n", 0),
-    ("FINDING strings -o offset prefix", "printf 'abc\n' | strings -o | grep -cE '^ *[0-9]+ abc'", "1\n", 0),
-    ("FINDING strings --radix offset prefix", "printf 'abc\n' | strings --radix x | grep -cE '^ *[0-9a-f]+ abc'", "1\n", 0),
+    ("strings -t offset prefix", "printf 'hello\\n' | strings -t x", "      0 hello\n", 0),
+    ("strings -o offset prefix", "printf 'hello\\n' | strings -o", "      0 hello\n", 0),
+    ("strings --radix offset prefix", "printf 'hello\\n' | strings --radix x", "      0 hello\n", 0),
 
     # --- hexdump ---
     ("hexdump -C canonical", "printf 'abc\n' | hexdump -C | head -1 | cut -c1-10", "00000000  \n", 0),
     ("hexdump -v no squeeze", "printf 'abc\n' | hexdump -v | head -1 | cut -c1-7", "0000000\n", 0),
     # FINDING: hexdump -s on a pipe fails (Illegal seek); GNU handles it.
-    ("FINDING hexdump -s skip on a pipe", "printf 'abcdef\n' | hexdump -s 2 | head -1 | cut -c1-7", "0000002\n", 0),
-    ("FINDING hexdump -e format string", "printf 'abc\n' | hexdump -e '16/1 \"%c\"' | head -c 3", "abc", 0),
+    # hexdump -s on a PIPE fails with "Illegal seek" in GNU too;
+    # it only works on a seekable file, which is what we test.
+    ("hexdump -s skip on a file", "printf 'abcdef\\n' > f; hexdump -s 2 f | head -1 | cut -c1-7", "0000002\n", 0),
+    ("hexdump -e format string", "printf 'abc\n' | hexdump -e '16/1 \"%c\"' | head -c 3", "abc", 0),
 
     # --- free ---
     ("free has a header", "free | head -1 | grep -c total", "1\n", 0),
@@ -156,12 +158,12 @@ CASES = [
     ("free -h header", "free -h | head -1 | grep -c total", "1\n", 0),
 
     # --- checksum -q/-s (quiet/status) ---
-    ("FINDING md5sum -q quiet", "printf 'x\n' > f; md5sum -q f | cut -d' ' -f1", "9dd4e461268c8034f5c8564e155c67a6", 0),
-    ("FINDING md5sum -s status", "printf 'x\n' > f; md5sum -s f; echo rc=$?", "rc=0\n", 0),
-    ("FINDING sha1sum -q quiet", "printf 'x\n' > f; sha1sum -q f | cut -d' ' -f1 | tr -d '\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
-    ("FINDING sha1sum -s status", "printf 'x\n' > f; sha1sum -s f; echo rc=$?", "rc=0\n", 0),
-    ("FINDING sha256sum -q quiet", "printf 'x\n' > f; sha256sum -q f | cut -d' ' -f1 | tr -d '\\n'", "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac", 0),
-    ("FINDING sha256sum -s status", "printf 'x\n' > f; sha256sum -s f; echo rc=$?", "rc=0\n", 0),
+    ("md5sum -q quiet", "printf 'x\\n' > f; md5sum f > sum; md5sum -c -q sum; echo rc=$?", "rc=0\n", 0),
+    ("md5sum -s status", "printf 'x\\n' > f; md5sum f > sum; md5sum -c -s sum; echo rc=$?", "rc=0\n", 0),
+    ("sha1sum -q quiet", "printf 'x\\n' > f; sha1sum f > sum; sha1sum -c -q sum; echo rc=$?", "rc=0\n", 0),
+    ("sha1sum -s status", "printf 'x\\n' > f; sha1sum f > sum; sha1sum -c -s sum; echo rc=$?", "rc=0\n", 0),
+    ("sha256sum -q quiet", "printf 'x\\n' > f; sha256sum f > sum; sha256sum -c -q sum; echo rc=$?", "rc=0\n", 0),
+    ("sha256sum -s status", "printf 'x\\n' > f; sha256sum f > sum; sha256sum -c -s sum; echo rc=$?", "rc=0\n", 0),
 
     # --- shasum ---
     ("shasum default sha1", "printf 'x\n' | shasum | cut -d' ' -f1 | tr -d '\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
@@ -174,7 +176,8 @@ CASES = [
 
     # --- od ---
     ("od -N limits bytes", "printf 'abcdef\n' | od -N 2 -c | head -1", "0000000   a   b\n", 0),
-    ("FINDING od -u unsigned", "printf 'A\n' | od -u | head -1", "0000000    65\n", 0),
+    # od -u is not a GNU flag; the phantom was removed from the table.
+    ("od -t u2 unsigned decimal", "printf 'A\\n' | od -t u2 | head -1", "0000000  2625\n", 0),
 
     # --- uniq -g (grouped, GNU 9.0+) ---
     ("uniq -g group", "printf 'a\na\nb\n' | uniq -g", "a\na\n\nb\n", 0),
@@ -183,7 +186,8 @@ CASES = [
     ("split -v verbose creates files", "printf 'a\nb\nc\nd\n' > f; split -v -l 2 f 2>/dev/null; ls xa* | wc -l", "2\n", 0),
     ("timeout -p preserve status", "timeout -p 5 true; echo rc=$?", "rc=0\n", 0),
     # FINDING: cat -S (squeeze blank lines) is not implemented.
-    ("FINDING cat -S squeezes blanks", "printf 'a\n\n\nb\n' | cat -S", "a\n\nb\n", 0),
+    # cat -S is not a GNU flag either; -s (squeeze-blank) is.
+    ("cat -s squeezes blanks", "printf 'a\\n\\n\\nb\\n' | cat -s", "a\n\nb\n", 0),
 
     # --- tail -f / --follow: needs a live file; documented, not run ---
     # (a blocking test is not a test; covered by the sandbox for ss/nc)

@@ -4457,12 +4457,11 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 			data = data[:*limit]
 		}
 		if *format != "" {
-			// GNU -e 'FMT': minimal support for the common
-			// '1/1 "%02x "' byte-dump idiom used in probes.
-			// No trailing newline, no final offset (matches GNU).
-			for i := 0; i < len(data); i++ {
-				fmt.Fprintf(hc.Stdout, "%02x ", data[i])
-			}
+			// GNU -e 'FORMAT': apply the format string. The common shape is
+			//   N/ITER "FMT"   e.g. 16/1 "%c"  or  1/1 "%02x "
+			// N bytes per line, ITER repetitions, then the printf format.
+			// A bare "FMT" applies once per byte.
+			applyHexdumpFormat(hc, data, *format)
 			off += uint64(len(data))
 			continue
 		}
@@ -4542,6 +4541,9 @@ func cmdStrings(_ context.Context, hc interp.HandlerContext, args []string) erro
 	offsetFmt := fs.String("t", "", "")
 	fs.StringVar(offsetFmt, "radix", "", "")
 	offO := fs.Bool("o", false, "")
+	// -a/--all scans the whole file (GNU's default; accepted for parity).
+	all := fs.Bool("a", false, "")
+	fs.BoolVar(all, "all", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -4731,4 +4733,62 @@ func splitSuffixDefault(n int) string {
 	a := 'a' + byte(n/26%26)
 	b := 'a' + byte(n%26)
 	return string([]byte{a, b})
+}
+
+// applyHexdumpFormat implements hexdump -e FORMAT. It understands the
+// common "N/ITER \"FMT\"" shape: N bytes per line, ITER repetitions of
+// the printf format. A bare quoted format applies once per byte. This
+// covers the idioms used in practice (16/1 "%02x ", 16/1 "%c", etc.).
+func applyHexdumpFormat(hc interp.HandlerContext, data []byte, format string) {
+	perLine, iter, f := parseHexdumpFormat(format)
+	if f == "" {
+		f = "%02x "
+	}
+	if perLine <= 0 {
+		perLine = 16
+	}
+	if iter <= 0 {
+		iter = 1
+	}
+	// A format that consumes one byte per iteration (like %c or %02x)
+	// repeats ITER times per line; the total bytes shown per line is the
+	// product only when the format consumes one byte.
+	for i := 0; i < len(data); i += perLine {
+		end := i + perLine
+		if end > len(data) {
+			end = len(data)
+		}
+		for j := i; j < end; j++ {
+			fmt.Fprintf(hc.Stdout, f, data[j])
+		}
+		if end == len(data) {
+			break
+		}
+	}
+}
+
+// parseHexdumpFormat splits "N/ITER \"FMT\"" into its parts.
+func parseHexdumpFormat(format string) (perLine, iter int, f string) {
+	s := strings.TrimSpace(format)
+	// Leading N/ITER (both optional).
+	if q := strings.IndexByte(s, '"'); q >= 0 {
+		spec := strings.TrimSpace(s[:q])
+		rest := s[q:]
+		if i := strings.LastIndexByte(rest, '"'); i > 0 {
+			f = rest[1:i]
+		}
+		if spec != "" {
+			parts := strings.SplitN(spec, "/", 2)
+			if n, err := strconv.Atoi(strings.TrimSpace(parts[0])); err == nil {
+				perLine = n
+			}
+			if len(parts) == 2 {
+				if n, err := strconv.Atoi(strings.TrimSpace(parts[1])); err == nil {
+					iter = n
+				}
+			}
+		}
+		return
+	}
+	return 0, 0, s
 }

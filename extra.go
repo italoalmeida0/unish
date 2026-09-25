@@ -689,7 +689,7 @@ var flagSpecs = map[string]flagSpec{
 	"paste": {bools: "s", values: "d", long: map[string]string{
 		"delimiters": "d", "serial": "s",
 	}},
-	"cat": {bools: "nbEsSTA", values: "", long: map[string]string{
+	"cat": {bools: "nbEsTvA", values: "", long: map[string]string{
 		"number": "n", "number-nonblank": "b", "squeeze-blank": "s",
 		"show-ends": "E", "show-tabs": "T", "show-all": "A",
 	}},
@@ -811,7 +811,7 @@ var flagSpecs = map[string]flagSpec{
 	"readlink":  {bools: "fm", values: ""},
 	"realpath":  {bools: "em", values: ""},
 	"basename":  {bools: "a", values: "s"},
-	"od": {bools: "Anvxcdu", values: "tNfwjA", long: map[string]string{
+	"od": {bools: "Anvxcd", values: "tNfwjA", long: map[string]string{
 		"format": "t", "address-radix": "A", "output-duplicates": "",
 		"read-bytes": "N", "skip-bytes": "j", "width": "w",
 		"strings": "S",

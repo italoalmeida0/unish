@@ -71,11 +71,19 @@ func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs.Uint64Var(&skip, "j", 0, "")
 	addrHex := fs.Bool("x", false, "")
 	addrDec := fs.Bool("d", false, "")
+	// GNU od type shorthand: -c is -t c. (-u and -d are not GNU od type
+	// shorthands here: -d is already the address-radix flag, and -u was a
+	// phantom in our flag table.)
+	typeC := fs.Bool("c", false, "")
 	addrModeFlag := fs.String("A", "", "")
 	fs.StringVar(addrModeFlag, "address-radix", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
+	if *typeC {
+		types = append(types, "c")
+	}
+
 	if *verbose {
 	}
 	addrMode := "o"
