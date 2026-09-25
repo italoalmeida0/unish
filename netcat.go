@@ -97,30 +97,32 @@ func cmdNc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 }
 
 func pipeConn(ctx context.Context, hc interp.HandlerContext, conn net.Conn) {
-	// Wait for BOTH directions, not just the first. Returning when either
-	// finished closed the connection before the stdin copier had sent the
-	// data (the peer often stops reading first, so `printf x | nc host port`
-	// delivered nothing).
+	// Wait for the STDIN copier to finish (so the payload is actually
+	// sent), not for either direction: the stdout copier may block forever
+	// on a half-open socket, and returning as soon as it finished closed
+	// the connection before the write completed.
 	defer conn.Close()
-	done := make(chan struct{}, 2)
+	sent := make(chan struct{})
 	go func() {
 		_, _ = io.Copy(conn, hc.Stdin)
 		// Half-close so the peer sees EOF and can finish.
 		if tc, ok := conn.(*net.TCPConn); ok {
 			_ = tc.CloseWrite()
 		}
-		done <- struct{}{}
+		close(sent)
 	}()
 	go func() {
 		_, _ = io.Copy(hc.Stdout, conn)
-		done <- struct{}{}
 	}()
-	for i := 0; i < 2; i++ {
+	select {
+	case <-ctx.Done():
+		_ = conn.Close()
+	case <-sent:
+		// The write side is done. Give the peer a brief window to reply,
+		// then close: a half-open socket must not hang the command.
 		select {
 		case <-ctx.Done():
-			_ = conn.Close()
-			return
-		case <-done:
+		case <-time.After(50 * time.Millisecond):
 		}
 	}
 }
