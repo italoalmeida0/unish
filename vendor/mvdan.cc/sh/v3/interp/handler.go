@@ -314,6 +314,41 @@ func LookPath(env expand.Environ, file string) (string, error) {
 // such as PWD and PATH.
 //
 // If no error is returned, the returned path must be valid.
+// LookPathDirAll lists the command names reachable through PATH, for
+// compgen -c. It returns base names without extensions, deduplicated.
+func LookPathDirAll(cwd string, env expand.Environ) ([]string, error) {
+	pathList := filepath.SplitList(env.Get("PATH").String())
+	seen := make(map[string]bool)
+	var out []string
+	for _, dir := range pathList {
+		if dir == "" {
+			continue
+		}
+		entries, err := os.ReadDir(dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if runtime.GOOS == "windows" {
+				ext := strings.ToLower(filepath.Ext(name))
+				if ext != ".exe" && ext != ".bat" && ext != ".cmd" && ext != ".com" {
+					continue
+				}
+				name = strings.TrimSuffix(name, filepath.Ext(name))
+			}
+			if !seen[name] {
+				seen[name] = true
+				out = append(out, name)
+			}
+		}
+	}
+	return out, nil
+}
+
 func LookPathDir(cwd string, env expand.Environ, file string) (string, error) {
 	return lookPathDir(cwd, env, file, findExecutable)
 }

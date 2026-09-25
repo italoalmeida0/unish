@@ -34,6 +34,18 @@ import (
 
 // IsBuiltin returns true if the given word is a POSIX Shell
 // or Bash builtin.
+// builtinNames lists the shell builtins by name, for compgen -A builtin.
+var builtinNames = []string{
+	"alias", "bg", "cd", "command", "false", "fc", "fg", "getopts", "hash",
+	"jobs", "kill", "newgrp", "pwd", "read", "true", "umask", "unalias", "wait",
+	"break", ":", "continue", ".", "eval", "exec", "exit", "export", "readonly",
+	"return", "set", "shift", "times", "trap", "unset",
+	"source", "bind", "builtin", "caller", "compgen", "complete", "compopt",
+	"declare", "typeset", "dirs", "disown", "enable", "history", "help",
+	"let", "local", "logout", "mapfile", "popd", "pushd", "readarray", "shopt",
+	"type", "echo", "printf", "test", "[", "getopts", "ulimit",
+}
+
 func IsBuiltin(name string) bool {
 	switch name {
 	case
@@ -1087,6 +1099,83 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 			return failf(2, "%s: unable to read, %v\n", name, err)
 		}
 		r.setVar(arrayName, vr)
+
+	case "complete", "compopt":
+		// bash completion registration. The shell has no programmable
+		// completion engine, but accepting the call (and reporting the
+		// registration with -p) is what scripts and .bashrc files expect;
+		// erroring would break them for no benefit.
+		if len(args) > 0 && args[0] == "-p" {
+			// Nothing registered yet: print nothing, exit 1 like bash
+			// when no completion is defined.
+			exit.code = 1
+			break
+		}
+		break
+
+	case "compgen":
+		// bash completion helper: list words that match. -A ACTION selects
+		// the source (builtin, command, function, alias); -c is shorthand
+		// for -A command. A trailing operand is a prefix filter.
+		action := ""
+		prefix := ""
+		fp := flagParser{remaining: args}
+		for fp.more() {
+			switch flag := fp.flag(); flag {
+			case "-A":
+				action = fp.value()
+			case "-c":
+				action = "command"
+			case "-b":
+				action = "builtin"
+			case "-a":
+				action = "alias"
+			default:
+				return failf(2, "compgen: invalid option %q\n", flag)
+			}
+		}
+		if rest := fp.args(); len(rest) > 0 {
+			prefix = rest[0]
+		}
+		var words []string
+		switch action {
+		case "alias":
+			for name := range r.alias {
+				words = append(words, name)
+			}
+		case "function":
+			for name := range r.Funcs {
+				words = append(words, name)
+			}
+		case "builtin":
+			for _, name := range builtinNames {
+				words = append(words, name)
+			}
+		case "command", "":
+			// Builtins, functions and anything on PATH.
+			for _, name := range builtinNames {
+				words = append(words, name)
+			}
+			for name := range r.Funcs {
+				words = append(words, name)
+			}
+			if paths, err := LookPathDirAll(r.Dir, r.writeEnv); err == nil {
+				words = append(words, paths...)
+			}
+		default:
+			return failf(2, "compgen: %s: invalid action\n", action)
+		}
+		slices.Sort(words)
+		any := false
+		for _, w := range slices.Compact(words) {
+			if prefix == "" || strings.HasPrefix(w, prefix) {
+				r.outf("%s\n", w)
+				any = true
+			}
+		}
+		if !any {
+			exit.code = 1
+		}
 
 	default:
 		return failf(2, "%s: unsupported builtin\n", name)

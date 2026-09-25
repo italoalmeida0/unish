@@ -20,7 +20,7 @@ CASES = [
     ("export reaches a child", "export X=hi; env | grep -c '^X=hi$'", "1\n", 0),
     ("declare sets a variable", "declare x=5; echo $x", "5\n", 0),
     ("typeset sets a variable", "typeset y=6; echo $y", "6\n", 0),
-    ("FINDING declare -i integer", "declare -i n=2+3; echo $n", "5\n", 0),
+    ("declare -i integer", "declare -i n=2+3; echo $n", "5\n", 0),
     ("local in a function", "f() { local v=in; echo $v; }; f", "in\n", 0),
     ("local does not leak", "f() { local v=in; }; f; echo \"${v:-none}\"", "none\n", 0),
 
@@ -72,6 +72,6 @@ CASES = [
 
     # --- compgen/complete (bash completion helpers) ---
     # FINDING: compgen is not implemented.
-    ("FINDING compgen lists commands", "compgen -c 2>/dev/null | head -1 | grep -c .", "1\n", 0),
-    ("FINDING complete registers", "complete -W 'a b' mycmd; echo rc=$?", "rc=0\n", 0),
+    ("compgen lists commands", "compgen -c 2>/dev/null | head -1 | grep -c .", "1\n", 0),
+    ("complete registers", "complete -W 'a b' mycmd; echo rc=$?", "rc=0\n", 0),
 ]

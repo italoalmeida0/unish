@@ -856,6 +856,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 		local, global := false, false
 		var modes []string
 		valType := ""
+		integerAttr := false
 		declQuery := "" // "-f" or "-p" for query mode
 		switch cm.Variant.Value {
 		case "declare":
@@ -885,6 +886,10 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 					modes = append(modes, flag)
 				case "-a", "-A", "-n":
 					valType = flag
+				case "-i":
+					// integer attribute: values are evaluated as
+					// arithmetic on assignment, like bash.
+					integerAttr = true
 				case "-g":
 					global = true
 				case "-f", "-p":
@@ -965,6 +970,20 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 				} else {
 					vr.Kind = expand.KeepValue
 				}
+			} else if integerAttr {
+				// declare -i: the value is an arithmetic expression.
+				// Expand the word, then evaluate it as arithmetic.
+				lit := r.literal(as.Value)
+				if n, aerr := arithmEval(r.ecfg, lit); aerr == nil {
+					vr.Set = true
+					vr.Kind = expand.String
+					vr.Str = strconv.FormatInt(n, 10)
+					r.setVar(name, vr)
+				} else {
+					r.errf("declare: %v\n", aerr)
+					r.exit.code = 1
+				}
+				continue
 			} else {
 				name, vr = r.assignVal(name, vr, as, valType)
 			}
@@ -1465,4 +1484,16 @@ func (r *Runner) lstat(ctx context.Context, name string) (fs.FileInfo, error) {
 func (r *Runner) access(ctx context.Context, name string, mode AccessMode) error {
 	path := absPath(r.Dir, name)
 	return r.accessHandler(r.handlerCtx(ctx, handlerKindAccess, todoPos), path, mode)
+}
+
+
+// arithmEval parses src as an arithmetic expression and evaluates it.
+// Used by declare -i, whose value is an expression rather than a literal.
+func arithmEval(ecfg *expand.Config, src string) (int64, error) {
+	expr, err := syntax.NewParser().Arithmetic(strings.NewReader(src))
+	if err != nil {
+		return 0, err
+	}
+	n, err := expand.Arithm(ecfg, expr)
+	return int64(n), err
 }
