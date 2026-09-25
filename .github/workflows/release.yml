@@ -114,7 +114,7 @@ jobs:
           brew install bash coreutils gnu-sed findutils grep gawk gnu-tar
           P="$(brew --prefix)"
           GNUPATH="$P/opt/coreutils/libexec/gnubin:$P/opt/gnu-sed/libexec/gnubin:$P/opt/findutils/libexec/gnubin:$P/opt/grep/libexec/gnubin:$P/opt/gawk/libexec/gnubin:$P/opt/gnu-tar/libexec/gnubin"
-          echo "GNU_PATH=$GNUPATH" >> "$GITHUB_ENV"
+          echo "ORACLE_PATH=$GNUPATH" >> "$GITHUB_ENV"
           echo "ORACLE_SHELL=$P/bin/bash" >> "$GITHUB_ENV"
           echo "$GNUPATH" | tr ':' '\n' >> "$GITHUB_PATH"
           for t in sort sed grep find tar xargs od uniq tr cut wc date; do
