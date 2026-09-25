@@ -808,6 +808,8 @@ func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error
 	fs := newFlagSet("expand", hc.Stderr)
 	tabs := fs.String("t", "8", "")
 	fs.StringVar(tabs, "tabs", "8", "")
+	initial := fs.Bool("i", false, "")
+	fs.BoolVar(initial, "initial", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -829,20 +831,27 @@ func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error
 			var sb strings.Builder
 			sb.Grow(len(line) + 8)
 			col := 0
+			// -i: convert tabs only up to the first non-blank; after that
+			// they are left as-is (GNU: "do not convert tabs after non
+			// blanks").
+			sawNonBlank := false
 			for _, c := range line {
-				if c == '\t' {
+				if c == '\t' && !(*initial && sawNonBlank) {
 					nt := nextTab(col, stops)
 					for ; col < nt; col++ {
 						sb.WriteByte(' ')
 					}
+					continue
+				}
+				sb.WriteRune(c)
+				if c == '\b' {
+					if col > 0 {
+						col--
+					}
 				} else {
-					sb.WriteRune(c)
-					if c == '\b' {
-						if col > 0 {
-							col--
-						}
-					} else {
-						col++
+					col++
+					if c != ' ' {
+						sawNonBlank = true
 					}
 				}
 			}

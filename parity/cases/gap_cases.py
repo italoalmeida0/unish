@@ -63,8 +63,8 @@ FIXED_CASES = [
     ("nohup passes argv", "nohup echo ok", "ok\n"),
     ("expand one tab to 8", "printf 'a\\tb\\n' | expand", "a       b\n"),
     ("expand -t4", "printf 'a\\tb\\n' | expand -t4", "a   b\n"),
-    # FINDING: expand -i is not implemented (GNU leaves leading tabs).
-    ("FINDING expand -i keeps leading tabs", "printf '\\ta\\tb\\n' | expand -i", "        a\tb\n"),
+    # expand -i converts tabs only up to the first non-blank (fixed).
+    ("expand -i keeps leading tabs", "printf '\\ta\\tb\\n' | expand -i", "        a\tb\n"),
     # unexpand converts only LEADING blanks, like GNU.
     ("unexpand leading blanks", "printf '        a\\n' | unexpand", "\ta\n"),
     ("nproc is a number", "nproc | grep -c '^[0-9][0-9]*$'", "1\n"),
