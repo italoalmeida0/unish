@@ -548,6 +548,11 @@ def run_cmd_cases(unish, timeout, verbose):
             elif sys.platform == "win32" and "pgrep" in script and "background job" in name:
                 gaps += 1
                 print("KNOWN GAP [cmd] %s (Windows cannot enumerate other processes)" % name)
+            elif sys.platform == "darwin" and "ps " in script + " " and "header" in name:
+                # BSD ps on macOS has a different header column set; the
+                # GNU header is not portable there.
+                gaps += 1
+                print("KNOWN GAP [cmd] %s (BSD ps header on macOS)" % name)
             elif sys.platform == "darwin" and "pgrep" in script or \
                  (sys.platform == "darwin" and "pkill" in script):
                 # macOS cannot read the process list, so pgrep/pkill exit 2
