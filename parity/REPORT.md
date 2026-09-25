@@ -9,17 +9,37 @@ rediscover any of it.
 | Group | Cases | Result |
 |---|---|---|
 | Output parity (GNU oracle) | 372 | 0 failures, 9 documented wording deltas |
-| Flag cases (oracle at run time) | 410 | 0 failures, 60 known differences |
-| Per-command fixture cases | 114 | 0 failures, 17 known gaps |
-| Sandbox (docker: pgrep/pkill/ss/nc) | 35 | 0 failures, 7 known gaps |
-| Functional (does it DO it) | 21 | 0 failures, 5 known gaps |
-| Gaps: the 15 uncovered commands | 37 | 0 failures, 1 known gap |
+| Flag cases (oracle at run time) | 410 | 0 failures, 50-62 known differences |
+| Per-command fixture cases | 114 | 0 failures |
+| Shell builtins | 40 | 0 failures |
+| Sandbox (docker: pgrep/pkill/ss/nc) | 35 | 0 failures |
+| Functional (does it DO it) | 21 | 0 failures |
+| Gaps: the 15 uncovered commands | 38 | 0 failures |
 | End-to-end (real processes) | 38 | 0 failures |
-| Edge cases / robustness | 62 | 0 failures, 1 known gap |
+| Edge cases / robustness | 62 | 0 failures |
 | Go unit suite | 86 tests | 0 failures, 5 platform skips |
 
-CI runs all of it on Linux, macOS and Windows, plus a docker sandbox
-job (10 jobs, all green).
+Counts are what `python3 parity/runner.py` reports at 1.0.0 (1120
+behavioural cases). The two "known" columns follow the oracle's
+toolchain: flag differences are 50 against Ubuntu's GNU 9.x and 62
+against Git Bash's coreutils 8.32, and the parity group's wording deltas
+are 9 against modern GNU but 16 against Git Bash (8.32 words a few
+diagnostics the old way -- those deltas are the oracle's, not unish's).
+
+CI runs all of it on every push: `go vet`, the Go tests and this
+behavioural suite on all six native targets (linux/windows/macos x
+amd64/arm64), plus a docker sandbox job and a musl/Alpine job -- 14
+jobs. The release workflow then rebuilds and re-runs the full
+differential suite against a GNU reference on Linux, Windows and macOS
+before anything is published. Nothing runs under `|| true`.
+
+Every differential oracle is GNU: bash + coreutils on Linux, Git Bash on
+Windows, Homebrew's GNU tools + bash on macOS (the system there is bash
+3.2 over a BSD userland, so comparing against it would measure the
+oracle, not unish). The Alpine job installs GNU
+coreutils/findutils/sed/grep/tar and asserts they really are GNU before
+comparing anything: busybox output differs from GNU by design, and unish
+is graded on "it works like GNU", not "it prints what busybox prints".
 
 ## Flag coverage: 502 of 503 (100%)
 
@@ -143,5 +163,7 @@ pgrep/pkill entirely (they need a sandbox that spawns its own victims).
   known-gap cases above
 - interactive REPL behaviour (history, completion, prompt width) has Go
   unit tests but no end-to-end terminal test
-- network tools (`nc`, `ss`) are audited for flags but not exercised
-  against a real socket
+- network tools are exercised against real sockets in the docker
+  sandbox (unish's `nc` transfers data to a peer, `ss` reads real
+  listeners), but only over local TCP/UDP -- no TLS, no multi-peer
+  concurrency, no UDP fragmentation cases

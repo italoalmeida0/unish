@@ -171,14 +171,22 @@ builtins, edge cases and end-to-end process behaviour, and it runs in CI
 on every push (and weekly). See `parity/README.md` and `parity/REPORT.md`
 (the latter records what the campaign found).
 
+The oracle is GNU on every platform — bash + coreutils on Linux, Git Bash
+on Windows, Homebrew's GNU tools + bash on macOS (the system bash there
+is 3.2 over BSD tools) and GNU tools asserted on Alpine — so a pass means
+"behaves like GNU", not "looks like whatever the host ships".
+
 CI runs the full suite on **six native targets** (linux, windows and
 macOS, each amd64 + arm64), plus:
 
 - a **musl** job that proves the Linux binaries are glibc-free: they are
   executed on a bare Alpine image and checked with `file(1)` for
-  `statically linked`, and the whole Go suite runs on a musl userland
+  `statically linked`, and the whole suite runs on a musl userland
 - a **docker sandbox** job for the process/network tools (`pgrep`,
   `pkill`, `ss`, `nc`), which cannot be tested safely against the runner
+
+The release workflow repeats the full differential suite on Linux,
+Windows and macOS before publishing. Release history: [CHANGELOG.md](CHANGELOG.md).
 
 Benchmarks live in `bench/`; see `bench/README.md`.
 
