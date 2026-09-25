@@ -29,6 +29,7 @@ def oracle(cmd):
 def main():
     unish = sys.argv[1] if len(sys.argv) > 1 else os.path.join(REPO, "unish.exe")
     flags = fa.read_flags()
+    takes_value = fa.read_value_flags()
     cases = []
     skipped = []
 
@@ -53,7 +54,14 @@ def main():
                 continue
             if any(fl == nf or fl.startswith(nf) for nf in fa.NEEDS_FIXTURE):
                 continue
-            argv = [cmd, fl] + ops
+            # A value is attached ONLY for flags the command table marks as
+            # value-taking. Attaching one to a boolean flag (cat --number)
+            # makes the operand a stray argument and the case meaningless.
+            val = fa.FLAG_VALUES.get(fl, "") if fl in takes_value.get(cmd, set()) else ""
+            if val:
+                argv = [cmd, fl, val] + ops
+            else:
+                argv = [cmd, fl] + ops
             if fa.unsafe(argv):
                 continue
             # Fresh fixtures per flag: mutating commands (cp/mv/rm/gzip)

@@ -154,6 +154,45 @@ def read_flags():
     return out
 
 
+# Flags that REQUIRE a value: the value the sweep uses. Without this the
+# flag is skipped and its behaviour stays untested.
+FLAG_VALUES = {
+    "-n": "2", "--lines": "2", "--bytes": "3", "-c": "3",
+    "-w": "4", "--width": "4", "--wrap": "4",
+    "-t": "4", "--tabs": "4", "--tab": "4",
+    "-d": ":", "--delimiter": ":", "-f": "1", "--fields": "1",
+    "-b": "1", "--bytes2": "1",
+    "-s": "1", "--skip-chars": "1", "--separator": " ",
+    "-k": "1", "--key": "1",
+    "-F": ":", "--field-separator": ":",
+    "-o": "1", "--output-delimiter": "-",
+    "-i": "1", "--ignore-case": "", "--increment": "1",
+    "-e": "1", "--expression": "s/a/A/",
+    "-l": "2", "--length": "2", "--line-length": "2",
+    "-a": "1", "--suffix-length": "1",
+    "-N": "2", "--number": "2",
+    "-j": "1", "--jump": "1",
+    "-A": "x", "--address-radix": "x",
+    "-P": "1", "--pages": "1",
+    "-T": "1", "--files0-from": "a.txt",
+    "-L": "1", "--label": "x", "--unified": "1",
+    "-D": "1", "--date": "2020-01-01",
+    "-r": "1", "--reference": "a.txt",
+    "-m": "1", "--mode": "644",
+    "-u": "1", "--user": "root", "--group": "root",
+    "-p": "1", "--port": "1", "--pid": "1",
+    "-M": "1", "--max-args": "1", "--max-chars": "1",
+    "-I": "1", "--replace": "1", "--include": "a.txt",
+    "-E": "1", "--exclude": "b.txt",
+    "--format": "%Y", "--time": "1", "--timeout": "1",
+    "-C": ".", "--directory": ".", "--context": "1",
+    "--strip": "1", "--transform": "s/a/A/",
+    "--record-size": "1", "--suffix": ".bak",
+    "--from": "1", "--to": "2", "--step": "1",
+    "--split": "1", "--width2": "1",
+}
+
+
 # Commands that can affect the machine (processes, devices, the filesystem
 # outside our temp dir). The audit must never invoke these.
 FORBIDDEN_COMMANDS = {
@@ -192,6 +231,19 @@ def unsafe(argv):
         if any(a.startswith(p) for p in FORBIDDEN_FLAG_PREFIXES):
             return True
     return False
+
+
+def read_value_flags():
+    """Per command, the flags that REQUIRE an argument (from `values:`)."""
+    src = ""
+    for f in os.listdir(REPO):
+        if f.endswith(".go") and not f.endswith("_test.go"):
+            src += open(os.path.join(REPO, f), encoding="utf-8", errors="replace").read()
+    out = {}
+    for m in re.finditer(r'"([a-zA-Z0-9_]+)":\s*\{bools:\s*"([^"]*)",\s*values:\s*"([^"]*)",\s*long:\s*map\[string\]string\{([^}]*)\}', src):
+        name, bools, values, longs = m.groups()
+        out[name] = set("-" + c for c in values)
+    return out
 
 
 def oracle_path(cmd):
