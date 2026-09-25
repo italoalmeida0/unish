@@ -90,7 +90,7 @@ CASES = [
     # FINDING: pgrep cannot see a background job, same root cause as $!.
     ("pgrep sees a background job",
      "printf '#!/bin/sh\\nsleep 30\\n' > /tmp/unishvictimzz; chmod +x /tmp/unishvictimzz; /tmp/unishvictimzz & sleep 0.3; pgrep -x unishvictimzz | grep -cE '^[0-9]+$'",
-     "1\\n", 0),
+     "1\n", 0),
     # FINDING: where the process list cannot be read (macOS), pgrep/pkill
     # exit 2; GNU exits 1 for "no match". Real platform gap.
     ("FINDING pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
