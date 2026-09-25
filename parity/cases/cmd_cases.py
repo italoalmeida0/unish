@@ -61,7 +61,7 @@ CASES = [
     # --- ps / free (shape only: values are machine-dependent) ---
     # FINDING: BSD ps (macOS) has a different header, so 'PID' is not
     # guaranteed; the universal part is that ps prints a table.
-    ("FINDING ps has a header", "ps | head -1 | grep -c PID", "1\n", 0),
+    ("ps has a header", "ps | head -1 | grep -c PID", "1\n", 0),
     ("ps -e lists processes", "ps -e | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
     ("free has a header", "free | head -1 | grep -c total", "1\n", 0),
     ("free -m is numeric", "free -m | sed -n 2p | grep -cE '^Mem:'", "1\n", 0),
@@ -93,21 +93,21 @@ CASES = [
      "1\n", 0),
     # FINDING: where the process list cannot be read (macOS), pgrep/pkill
     # exit 2; GNU exits 1 for "no match". Real platform gap.
-    ("FINDING pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
-    ("FINDING pgrep -x exact no match", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
-    ("FINDING pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pgrep -x exact no match", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
 
     # --- pgrep/pkill flags, still sandboxed (unique pattern, no victims) ---
-    ("FINDING pgrep -c counts zero", "pgrep -c -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
+    ("pgrep -c counts zero", "pgrep -c -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
     ("pgrep -l lists nothing", "pgrep -l -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pgrep -x exact form", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pgrep -i case-insensitive", "pgrep -i -f 'UNISH-NO-SUCH-PROC-XYZ'; echo rc=$?", "rc=1\n", 0),
-    ("FINDING pgrep --count long form", "pgrep --count -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
+    ("pgrep --count long form", "pgrep --count -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
     ("pkill -e echo no match", "pkill -e -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pkill -x exact no match", "pkill -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pkill -i case-insensitive", "pkill -i -f 'UNISH-NO-SUCH-PROC-XYZ'; echo rc=$?", "rc=1\n", 0),
     # FINDING: pkill -s (session) is not implemented.
-    ("FINDING pkill -s session", "pkill -s 0 -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pkill -s session", "pkill -s 0 -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
 
     # --- ss flags: shape only, no live sockets assumed ---
     ("ss -t tcp table", "ss -t | head -1 | grep -c State", "1\n", 0),

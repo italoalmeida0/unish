@@ -55,8 +55,7 @@ CASES = [
     ("function call with args", 'f() { echo "$1"; }; f hello', "hello\n", 0),
     ("function sees $#", "f() { echo $#; }; f a b c", "3\n", 0),
     ("nested function call", 'f() { g; }; g() { echo deep; }; f', "deep\n", 0),
-    # FINDING: unset -f does not remove a function.
-    ("FINDING unset -f removes a function", "f() { echo fn; }; unset -f f; f 2>/dev/null; echo rc=$?", "rc=127\n", 0),
+    ("unset -f removes a function", "f() { echo fn; }; unset -f f; f 2>/dev/null; echo rc=$?", "rc=127\n", 0),
 
     # --- misc builtins ---
     ("cd changes directory", "mkdir dd; cd dd; pwd | grep -c 'dd'", "1\n", 0),
