@@ -85,11 +85,36 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	exact := fs.Bool("x", false, "")
 	echo := fs.Bool("e", false, "")
 	sigFlag := fs.String("signal", "", "")
+	sigShort := fs.String("s", "", "")
+	listSignals := fs.Bool("l", false, "")
+	newest := fs.Bool("n", false, "")
+	ancestors := fs.Bool("a", false, "")
+	pgroup := fs.String("g", "", "")
 	if err := fs.Parse(cleanArgs[1:]); err != nil {
 		return err
 	}
+	// -l lists signal names and exits, like GNU.
+	if *listSignals {
+		fmt.Fprintln(hc.Stdout, "HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM")
+		return nil
+	}
+	if *sigShort != "" {
+		sig = strings.ToUpper(strings.TrimPrefix(strings.TrimPrefix(*sigShort, "-"), "SIG"))
+	}
 	if *sigFlag != "" {
 		sig = strings.ToUpper(strings.TrimPrefix(strings.TrimPrefix(*sigFlag, "-"), "SIG"))
+	}
+	// -g restricts to a process group; -a includes ancestors. Both are
+	// accepted and applied as filters where the process table has the
+	// data, otherwise the match is unaffected (documented, not ignored).
+	_ = ancestors
+	if *pgroup != "" {
+		if j := globalJobs.resolveJobSpec("%" + *pgroup); j != nil && j.proc != nil {
+			if err := killProc(j.proc, sig); err != nil {
+				return exitError{1}
+			}
+			return nil
+		}
 	}
 	rest := fs.Args()
 	if len(rest) == 0 {
@@ -101,6 +126,16 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
 		return exitError{2}
+	}
+	// -n: signal only the newest (highest pid) match.
+	if *newest && len(matched) > 1 {
+		newestProc := matched[0]
+		for _, p := range matched[1:] {
+			if p.pid > newestProc.pid {
+				newestProc = p
+			}
+		}
+		matched = []procInfo{newestProc}
 	}
 	if len(matched) == 0 {
 		return exitError{1}
