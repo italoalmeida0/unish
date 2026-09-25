@@ -3,14 +3,15 @@
 package main
 
 import (
-	"os/user"
 	"fmt"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -180,12 +181,24 @@ func loadAvg() (float64, float64, float64) {
 	return a, b, c
 }
 
+// identity caches the user/group lookups (/etc/passwd+group); callers
+// such as `ls -l` and `tar` use it per entry.
+var (
+	identityOnce sync.Once
+	idUID        int
+	idUser       string
+	idGID        int
+	idGroup      string
+)
+
 func identity() (uid int, user string, gid int, group string) {
-	uid = os.Getuid()
-	gid = os.Getgid()
-	user = lookupUserName(uid)
-	group = lookupGroupName(gid)
-	return uid, user, gid, group
+	identityOnce.Do(func() {
+		idUID = os.Getuid()
+		idGID = os.Getgid()
+		idUser = lookupUserName(idUID)
+		idGroup = lookupGroupName(idGID)
+	})
+	return idUID, idUser, idGID, idGroup
 }
 
 func ttyName() string { return "" }

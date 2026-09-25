@@ -19,28 +19,19 @@ import (
 func Arithm(cfg *Config, expr syntax.ArithmExpr) (int, error) {
 	switch expr := expr.(type) {
 	case *syntax.Word:
+		// Fast path: plain names and numeric literals dominate real
+		// arithmetic ($((sum+i))); skipping the word machinery for them
+		// is the difference between matching and beating bash in loops.
+		if len(expr.Parts) == 1 {
+			if lit, ok := expr.Parts[0].(*syntax.Lit); ok && arithLitSafe(lit.Value) {
+				return arithWordNum(cfg, lit.Value)
+			}
+		}
 		str, err := Literal(cfg, expr)
 		if err != nil {
 			return 0, err
 		}
-		// recursively fetch vars
-		i := 0
-		for syntax.ValidName(str) {
-			val := cfg.envGet(str)
-			if val == "" {
-				break
-			}
-			if i++; i >= maxNameRefDepth {
-				break
-			}
-			str = val
-		}
-		// default to 0
-		n, err := atoi(str)
-		if err != nil {
-			return 0, err
-		}
-		return int(n), nil
+		return arithWordNum(cfg, str)
 	case *syntax.ParenArithm:
 		return Arithm(cfg, expr.X)
 	case *syntax.UnaryArithm:
@@ -137,6 +128,43 @@ func oneIf(b bool) int {
 		return 1
 	}
 	return 0
+}
+
+// arithLitSafe reports whether an arithmetic word is a plain name or
+// number literal (no expansions or escapes to process).
+func arithLitSafe(s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+			(c >= 'A' && c <= 'Z') || c == '_' {
+			continue
+		}
+		return false
+	}
+	return s != ""
+}
+
+// arithWordNum resolves an arithmetic word: valid names dereference
+// variables (including namerefs), everything else is a number.
+func arithWordNum(cfg *Config, str string) (int, error) {
+	// recursively fetch vars
+	i := 0
+	for syntax.ValidName(str) {
+		val := cfg.envGet(str)
+		if val == "" {
+			break
+		}
+		if i++; i >= maxNameRefDepth {
+			break
+		}
+		str = val
+	}
+	// default to 0
+	n, err := atoi(str)
+	if err != nil {
+		return 0, err
+	}
+	return int(n), nil
 }
 
 // atoi is like [strconv.ParseInt](s, BASE, 64), but it handles integer

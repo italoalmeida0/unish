@@ -2,6 +2,7 @@ package main
 
 import (
 	"archive/tar"
+	"bufio"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -81,20 +82,45 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 }
 
-func tarOpenWriter(hc interp.HandlerContext, archive string, zip bool) (io.WriteCloser, *gzip.Writer, *tar.Writer, error) {
-	f, err := os.Create(archive)
-	if err != nil {
-		return nil, nil, nil, err
+func tarOpenWriter(hc interp.HandlerContext, archive string, zip bool) (io.Closer, *gzip.Writer, *tar.Writer, error) {
+	var f *os.File
+	raw := hc.Stdout
+	if archive != "-" {
+		var err error
+		f, err = os.Create(archive)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		raw = f
 	}
+	// tar writes 512-byte blocks; a large buffer keeps stdout and file
+	// targets fast.
+	bw := bufio.NewWriterSize(raw, 256*1024)
 	var gz *gzip.Writer
-	w := io.Writer(f)
-	_ = hc
+	w := io.Writer(bw)
 	if zip {
-		gz = gzip.NewWriter(f)
+		gz = gzip.NewWriter(bw)
 		w = gz
 	}
 	tw := tar.NewWriter(w)
-	return f, gz, tw, nil
+	return &tarWriteCloser{bw: bw, f: f}, gz, tw, nil
+}
+
+// tarWriteCloser flushes the buffered archive and closes the underlying
+// file, if any ("-" archives are stdout and must not be closed).
+type tarWriteCloser struct {
+	bw *bufio.Writer
+	f  *os.File
+}
+
+func (c *tarWriteCloser) Close() error {
+	err := c.bw.Flush()
+	if c.f != nil {
+		if e := c.f.Close(); err == nil {
+			err = e
+		}
+	}
+	return err
 }
 
 func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, zip, verb bool) error {
@@ -118,6 +144,9 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 		return exitError{1}
 	}
 	code := 0
+	// Identity lookups read /etc/passwd+group; do them once per run,
+	// not once per archived file.
+	_, uname, _, gname := identity()
 	closeAll := func() {
 		tw.Close()
 		if gz != nil {
@@ -131,9 +160,11 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 			if err != nil {
 				return err
 			}
-			rel, err := filepath.Rel(base, path)
-			if err != nil {
-				return err
+			rel := path
+			if base != "." {
+				if r, err := filepath.Rel(base, path); err == nil {
+					rel = r
+				}
 			}
 			rel = filepath.ToSlash(rel)
 			hdr, err := tar.FileInfoHeader(info, "")
@@ -146,14 +177,11 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 			}
 			// GNU tar stores user/group names; Go leaves them empty.
 			// Fill from the current identity for -tv parity.
-			if _, user, _, group := identity(); true {
-				_ = user
-				if hdr.Uname == "" {
-					hdr.Uname = user
-				}
-				if hdr.Gname == "" {
-					hdr.Gname = group
-				}
+			if hdr.Uname == "" {
+				hdr.Uname = uname
+			}
+			if hdr.Gname == "" {
+				hdr.Gname = gname
 			}
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
@@ -186,10 +214,26 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 	return nil
 }
 
-func tarOpenReader(archive string, zip bool) (io.ReadCloser, *gzip.Reader, *tar.Reader, error) {
-	f, err := openShellFile(archive)
-	if err != nil {
-		return nil, nil, nil, err
+// nopReadWriteCloser adapts a plain reader (like stdin) to the handle
+// shape tarOpenReader returns.
+type nopReadWriteCloser struct{ io.Reader }
+
+func (nopReadWriteCloser) Write(p []byte) (int, error) { return 0, io.ErrClosedPipe }
+func (nopReadWriteCloser) Close() error                { return nil }
+
+// tarOpenReader opens the archive for reading; "-" is stdin, like GNU
+// tar. Gzip input is sniffed transparently; the sniffed bytes are
+// re-prepended so no seeking/reopening is needed (works for pipes).
+func tarOpenReader(hc interp.HandlerContext, archive string, zip bool) (io.ReadWriteCloser, *gzip.Reader, *tar.Reader, error) {
+	var f io.ReadWriteCloser
+	if archive == "-" {
+		f = nopReadWriteCloser{hc.Stdin}
+	} else {
+		var err error
+		f, err = openShellFile(archive)
+		if err != nil {
+			return nil, nil, nil, err
+		}
 	}
 	var gz *gzip.Reader
 	var r io.Reader = f
@@ -198,20 +242,11 @@ func tarOpenReader(archive string, zip bool) (io.ReadCloser, *gzip.Reader, *tar.
 		if n, _ := io.ReadFull(f, magic[:]); n == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
 			zip = true
 		}
-		// No Seek (procsub-aware handle): re-prepend sniffed bytes.
 		r = io.MultiReader(bytes.NewReader(magic[:]), f)
 	}
 	if zip {
-		// Zip path needs the raw stream from the start; re-read via
-		// readShellFile when we consumed magic bytes... simplest: if we
-		// sniffed, reopen. Archives are rarely procsub; reopen is cheap.
-		f.Close()
-		f2, err := openShellFile(archive)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		f = f2
-		gz, err = gzip.NewReader(f)
+		var err error
+		gz, err = gzip.NewReader(r)
 		if err != nil {
 			f.Close()
 			return nil, nil, nil, err
@@ -222,7 +257,7 @@ func tarOpenReader(archive string, zip bool) (io.ReadCloser, *gzip.Reader, *tar.
 }
 
 func tarExtract(hc interp.HandlerContext, archive, base string, only []string, zip, verb bool) error {
-	f, gz, tr, err := tarOpenReader(archive, zip)
+	f, gz, tr, err := tarOpenReader(hc, archive, zip)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tar:", err)
 		return exitError{1}
@@ -284,7 +319,7 @@ func tarExtract(hc interp.HandlerContext, archive, base string, only []string, z
 }
 
 func tarList(hc interp.HandlerContext, archive string, zip, verb bool) error {
-	f, gz, tr, err := tarOpenReader(archive, zip)
+	f, gz, tr, err := tarOpenReader(hc, archive, zip)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tar:", err)
 		return exitError{1}

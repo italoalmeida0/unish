@@ -69,6 +69,9 @@ func TestParitySedEdges(t *testing.T) {
 		// addr2 forms +N and ~N
 		{`printf 'a\nb\nc\nd\n' | sed -n '1,+2p'`, "a\nb\nc\n"},
 		{`printf 'a\nb\nc\nd\ne\nf\n' | sed -n '/a/,~3p'`, "a\nb\nc\n"},
+		// literal s/// must still report "not substituted" (t loops)
+		{`printf 'aaa\n' | sed ':a;s/a//;ta'`, "\n"},
+		{`printf 'zzz\n' | sed 's/a/X/;s/b/Y/'`, "zzz\n"},
 	}
 	for _, c := range cases {
 		out, se, err := runParityScript(t, dir, c.script)

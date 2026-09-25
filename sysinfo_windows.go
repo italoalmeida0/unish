@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 	"unsafe"
@@ -123,15 +124,24 @@ func loadAvg() (float64, float64, float64) {
 	return 0, 0, 0
 }
 
+// identity caches the user lookup; callers use it per entry.
+var (
+	identityOnce sync.Once
+	idUser       string
+)
+
 func identity() (uid int, user string, gid int, group string) {
-	u := "user"
-	if name, err := userCurrent(); err == nil && name != "" {
-		u = name
-		if i := strings.LastIndexAny(u, `\/`); i >= 0 {
-			u = u[i+1:]
+	identityOnce.Do(func() {
+		u := "user"
+		if name, err := userCurrent(); err == nil && name != "" {
+			u = name
+			if i := strings.LastIndexAny(u, `\/`); i >= 0 {
+				u = u[i+1:]
+			}
 		}
-	}
-	return 0, u, 0, "group"
+		idUser = u
+	})
+	return 0, idUser, 0, "group"
 }
 
 func ttyName() string { return "" }
@@ -152,26 +162,26 @@ const (
 )
 
 type processEntry32 struct {
-	size              uint32
-	usage             uint32
-	processID         uint32
-	defaultHeapID     uintptr
-	moduleID          uint32
-	threads           uint32
-	parentProcessID   uint32
-	priClassBase      int32
-	flags             uint32
-	exeFile           [maxPath]uint16
+	size            uint32
+	usage           uint32
+	processID       uint32
+	defaultHeapID   uintptr
+	moduleID        uint32
+	threads         uint32
+	parentProcessID uint32
+	priClassBase    int32
+	flags           uint32
+	exeFile         [maxPath]uint16
 }
 
 var (
-	procCreateSnapshot     = modKernel32.NewProc("CreateToolhelp32Snapshot")
-	procProcess32First     = modKernel32.NewProc("Process32FirstW")
-	procProcess32Next      = modKernel32.NewProc("Process32NextW")
-	procCloseHandle        = modKernel32.NewProc("CloseHandle")
-	procOpenProcess        = modKernel32.NewProc("OpenProcess")
-	procGetProcessMemory   = modPsapi.NewProc("GetProcessMemoryInfo")
-	modPsapi               = syscall.NewLazyDLL("psapi.dll")
+	procCreateSnapshot   = modKernel32.NewProc("CreateToolhelp32Snapshot")
+	procProcess32First   = modKernel32.NewProc("Process32FirstW")
+	procProcess32Next    = modKernel32.NewProc("Process32NextW")
+	procCloseHandle      = modKernel32.NewProc("CloseHandle")
+	procOpenProcess      = modKernel32.NewProc("OpenProcess")
+	procGetProcessMemory = modPsapi.NewProc("GetProcessMemoryInfo")
+	modPsapi             = syscall.NewLazyDLL("psapi.dll")
 )
 
 func listProcs() ([]procInfo, error) {

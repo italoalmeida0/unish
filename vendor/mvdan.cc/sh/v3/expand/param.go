@@ -322,7 +322,7 @@ func removePattern(str, pat string, fromEnd, shortest bool) string {
 	if shortest {
 		mode |= pattern.Shortest
 	}
-	expr, err := pattern.Regexp(pat, mode)
+	expr, err := cachedPattern(pat, mode)
 	if err != nil {
 		return str
 	}
@@ -338,7 +338,7 @@ func removePattern(str, pat string, fromEnd, shortest bool) string {
 		expr = "^(" + expr + ")"
 	}
 	// no need to check error as Translate returns one
-	rx := regexp.MustCompile(expr)
+	rx := cachedRegexp(expr)
 	if loc := rx.FindStringSubmatchIndex(str); loc != nil {
 		// remove the original pattern (the submatch)
 		str = str[:loc[2]] + str[loc[3]:]
@@ -476,18 +476,22 @@ func (cfg *Config) caseConvElems(op syntax.ParExpOperator, arg string, elems []s
 	toggle := op == syntax.ToggleFirst
 	all := op == syntax.UpperAll || op == syntax.LowerAll
 
-	// empty string means '?'; nothing to do there
-	expr, err := pattern.Regexp(arg, 0)
-	if err != nil {
-		return elems
+	// empty string means '?'; every character matches — skip the regex.
+	allMatch := arg == ""
+	var rx *regexp.Regexp
+	if !allMatch {
+		expr, err := cachedPattern(arg, 0)
+		if err != nil {
+			return elems
+		}
+		rx = cachedRegexp(expr)
 	}
-	rx := regexp.MustCompile(expr)
 
 	out := make([]string, len(elems))
 	for i, elem := range elems {
 		rs := []rune(elem)
 		for ri, r := range rs {
-			if rx.MatchString(string(r)) {
+			if allMatch || rx.MatchString(string(r)) {
 				if toggle {
 					if unicode.IsUpper(r) {
 						rs[ri] = unicode.ToLower(r)

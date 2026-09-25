@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/md5"
 	"crypto/sha1"
@@ -713,9 +714,74 @@ func splitMktempPattern(pattern string) (prefix, suffix string) {
 type findNode struct {
 	display string
 	full    string
-	fi      os.FileInfo
+	fi      os.FileInfo // loaded lazily (find -type f doesn't need it)
+	typ     os.FileMode // from d_type when known (0 = unknown)
 	depth   int
 	pruned  bool
+}
+
+// stat lazily loads the file info; GNU find only stats entries whose
+// predicates need the metadata (the type comes from readdir otherwise).
+// Files that vanish mid-walk get a zero FileInfo so predicates stay
+// nil-safe.
+func (n *findNode) stat() os.FileInfo {
+	if n.fi == nil {
+		fi, err := os.Lstat(n.full)
+		if err != nil {
+			fi = zeroFileInfo{}
+		}
+		n.fi = fi
+	}
+	return n.fi
+}
+
+// zeroFileInfo stands in for entries that disappeared mid-walk.
+type zeroFileInfo struct{}
+
+func (zeroFileInfo) Name() string       { return "" }
+func (zeroFileInfo) Size() int64        { return 0 }
+func (zeroFileInfo) Mode() os.FileMode  { return 0 }
+func (zeroFileInfo) ModTime() time.Time { return time.Time{} }
+func (zeroFileInfo) IsDir() bool        { return false }
+func (zeroFileInfo) Sys() any           { return nil }
+
+// isDir reports whether the node is a directory, preferring d_type.
+func (n *findNode) isDir() bool {
+	if n.typ != 0 {
+		return n.typ.IsDir()
+	}
+	fi := n.stat()
+	return fi != nil && fi.IsDir()
+}
+
+// typeIs matches a find -type letter, preferring d_type over a stat
+// (GNU find only stats entries when it must).
+func (n *findNode) typeIs(letter string) bool {
+	m := n.typ
+	if m == 0 {
+		fi := n.stat()
+		if fi == nil {
+			return false
+		}
+		m = fi.Mode()
+	}
+	switch letter {
+	case "d":
+		return m.IsDir()
+	case "f":
+		return m.IsRegular()
+	case "l":
+		return m&os.ModeSymlink != 0
+	case "s":
+		return m&os.ModeSocket != 0
+	case "p":
+		return m&os.ModeNamedPipe != 0
+	case "b":
+		return m&os.ModeDevice != 0 && m&os.ModeCharDevice == 0
+	case "c":
+		return m&os.ModeCharDevice != 0
+	}
+	return false
 }
 
 type findPredicate func(node *findNode, hc interp.HandlerContext) bool
@@ -849,7 +915,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			return func(n *findNode, _ interp.HandlerContext) bool {
 				// GNU matches -name against the basename of the path
 				// as given ("." for the root), not the resolved name.
-				base := n.fi.Name()
+				base := filepath.Base(n.full)
 				if b := pathBase(n.display); b != "" {
 					base = b
 				}
@@ -864,7 +930,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-iname":
 			pat := strings.ToLower(next())
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				base := n.fi.Name()
+				base := filepath.Base(n.full)
 				if b := pathBase(n.display); b != "" {
 					base = b
 				}
@@ -890,21 +956,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-type":
 			t := next()
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				isDir := n.fi.IsDir()
-				switch t {
-				case "d":
-					return isDir
-				case "f":
-					return !isDir && (n.fi.Mode()&os.ModeType == 0)
-				case "l":
-					return n.fi.Mode()&os.ModeSymlink != 0
-				case "s":
-					return n.fi.Mode()&os.ModeSocket != 0
-				case "p":
-					return n.fi.Mode()&os.ModeNamedPipe != 0
-				default:
-					return false
-				}
+				return n.typeIs(t)
 			}
 		case "-maxdepth":
 			if v, err := strconv.Atoi(next()); err == nil {
@@ -918,18 +970,18 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			return func(*findNode, interp.HandlerContext) bool { return true }
 		case "-prune":
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				if n.fi.IsDir() {
+				if n.isDir() {
 					n.pruned = true
 				}
 				return true
 			}
 		case "-empty":
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				if n.fi.IsDir() {
+				if n.isDir() {
 					entries, err := os.ReadDir(n.full)
 					return err == nil && len(entries) == 0
 				}
-				return n.fi.Size() == 0
+				return n.stat().Size() == 0
 			}
 		case "-size":
 			s := next()
@@ -967,7 +1019,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			val, _ := strconv.ParseInt(s, 10, 64)
 			targetBytes := val * unit
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				sz := n.fi.Size()
+				sz := n.stat().Size()
 				if sign > 0 {
 					return sz > targetBytes
 				} else if sign < 0 {
@@ -988,7 +1040,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			days, _ := strconv.Atoi(s)
 			now := time.Now()
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				ageDays := int(now.Sub(n.fi.ModTime()).Hours() / 24)
+				ageDays := int(now.Sub(n.stat().ModTime()).Hours() / 24)
 				if sign > 0 {
 					return ageDays > days
 				} else if sign < 0 {
@@ -1009,7 +1061,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			mins, _ := strconv.Atoi(s)
 			now := time.Now()
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				ageMins := int(now.Sub(n.fi.ModTime()).Minutes())
+				ageMins := int(now.Sub(n.stat().ModTime()).Minutes())
 				if sign > 0 {
 					return ageMins > mins
 				} else if sign < 0 {
@@ -1086,7 +1138,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 			refTime := fi.ModTime()
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				return n.fi.ModTime().After(refTime)
+				return n.stat().ModTime().After(refTime)
 			}
 		case "-true":
 			return func(*findNode, interp.HandlerContext) bool { return true }
@@ -1110,11 +1162,19 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		// traversal output.
 		return exitError{1}
 	}
+	// Buffered output when no actions run: -print is line-per-file and
+	// slow unbuffered. Actions (-exec) must interleave with output in
+	// order, so those runs stay unbuffered.
+	if !hasAction {
+		bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
+		hc.Stdout = bw
+		defer bw.Flush()
+	}
 
 	code := 0
 	for _, p := range paths {
 		full := resolve(hc.Dir, p)
-		walkFind(ctx, hc, p, full, 0, maxdepth, mindepth, rootPred, hasAction, &code, &stop)
+		walkFind(ctx, hc, p, full, 0, maxdepth, mindepth, rootPred, hasAction, &code, &stop, nil)
 	}
 	if code != 0 {
 		return exitError{code}
@@ -1122,21 +1182,27 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return nil
 }
 
-func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth, maxdepth, mindepth int, pred findPredicate, hasAction bool, code *int, stop *bool) {
+func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth, maxdepth, mindepth int, pred findPredicate, hasAction bool, code *int, stop *bool, ent os.DirEntry) {
 	if ctx.Err() != nil || (stop != nil && *stop) {
-		return
-	}
-	fi, err := os.Lstat(full)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
-		*code = 1
 		return
 	}
 	node := findNode{
 		display: display,
 		full:    full,
-		fi:      fi,
 		depth:   depth,
+	}
+	if ent != nil {
+		// readdir already told us the type; stat lazily if a predicate
+		// actually needs the metadata.
+		node.typ = ent.Type()
+	} else {
+		fi, err := os.Lstat(full)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
+			*code = 1
+			return
+		}
+		node.fi = fi
 	}
 	match := pred(&node, hc)
 	if match && !hasAction && depth >= mindepth {
@@ -1147,7 +1213,7 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 			}
 		}
 	}
-	if !fi.IsDir() || node.pruned {
+	if node.pruned || !node.isDir() {
 		return
 	}
 	if maxdepth >= 0 && depth >= maxdepth {
@@ -1171,7 +1237,7 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		} else {
 			subDisplay = subDisplay + "/" + e.Name()
 		}
-		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code, stop)
+		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code, stop, e)
 	}
 }
 
@@ -1486,7 +1552,7 @@ func validPermSpec(spec string) bool {
 // (-mode), any-bit (/mode). Symbolic specs (u+x) match when all listed
 // bits are present.
 func matchPerm(n *findNode, spec string) bool {
-	perm := n.fi.Mode().Perm()
+	perm := n.stat().Mode().Perm()
 	if strings.HasPrefix(spec, "-") {
 		want, err := strconv.ParseUint(spec[1:], 8, 32)
 		if err != nil {

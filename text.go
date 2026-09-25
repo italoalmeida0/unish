@@ -11,9 +11,10 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"mvdan.cc/sh/v3/interp"
 )
@@ -334,6 +335,18 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{2}
 	}
 
+	// Fast path: a single literal pattern over plain line output can use
+	// the byte primitives instead of the regexp engine.
+	lit, litOK := "", false
+	if len(patterns) == 1 && !ignoreCase && !lineRegexp && !wordRegexp &&
+		after == 0 && before == 0 && maxCount == 0 && !filesOnly && !onlyMatch {
+		if fixed {
+			lit, litOK = patterns[0], true
+		} else if p, ok := grepLiteralPattern(patterns[0]); ok {
+			lit, litOK = p, true
+		}
+	}
+
 	var files []string
 	matchedAny := false
 	hadError := false
@@ -432,6 +445,34 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		if label != "" && (name == "" || name == "standard input" || name == "-") {
 			disp = label
 			showName = true
+		}
+		// Fast path: literal pattern over plain line output.
+		if litOK {
+			if !quiet && !count && !filesOnly && !textMode {
+				// Binary detection wants the whole stream up front.
+				if data, err := io.ReadAll(r); err == nil {
+					if bytes.IndexByte(data, 0) >= 0 {
+						if reMatchAny(re, invert, data) {
+							fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", disp)
+							matchedAny = true
+						}
+						return
+					}
+					m, gerr := grepFastBuf(hc, disp, showName, lit, invert, lineNum, count, quiet, bytes.NewReader(data))
+					matchedAny = matchedAny || m
+					if gerr != nil && isPipeClosed(gerr) {
+						grepStop = true
+					}
+					return
+				}
+			}
+			// -c/-q and text mode stream with constant memory.
+			m, gerr := grepFastBuf(hc, disp, showName, lit, invert, lineNum, count, quiet, r)
+			matchedAny = matchedAny || m
+			if gerr != nil && isPipeClosed(gerr) {
+				grepStop = true
+			}
+			return
 		}
 		// GNU: a matching BINARY file prints "binary file matches" instead
 		// of raw bytes (unless -a/--text is given).
@@ -534,6 +575,127 @@ func breToGo(pat string) string {
 		sb.WriteByte(pat[i])
 	}
 	return sb.String()
+}
+
+// grepLiteralPattern reports whether a BRE/ERE pattern is a plain
+// literal string (no metacharacters at all).
+func grepLiteralPattern(pat string) (string, bool) {
+	if pat == "" || strings.ContainsAny(pat, `\.^$*+?()[]{}|`) {
+		return "", false
+	}
+	return pat, true
+}
+
+// streamLines feeds lines from r to fn in chunks with constant memory
+// (GNU tools never slurp their input). Lines are newline-terminated
+// except possibly the last one (terminated=false); a trailing newline
+// does not produce an extra empty line. Returning false from fn stops
+// the scan.
+func streamLines(r io.Reader, fn func(line []byte, terminated bool) bool) error {
+	buf := make([]byte, 256*1024)
+	var pending []byte
+	for {
+		n, err := r.Read(buf)
+		var data []byte
+		if len(pending) > 0 {
+			data = append(pending, buf[:n]...)
+			pending = nil
+		} else {
+			data = buf[:n]
+		}
+		if n == 0 && len(data) == 0 {
+			if err != nil && err != io.EOF {
+				return err
+			}
+			return nil
+		}
+		// Keep any trailing partial line for the next chunk; a chunk
+		// boundary mid-line must not split the line in two.
+		if err == nil && n > 0 && data[len(data)-1] != '\n' {
+			if j := bytes.LastIndexByte(data, '\n'); j >= 0 {
+				pending = append([]byte(nil), data[j+1:]...)
+				data = data[:j+1]
+			} else {
+				pending = append([]byte(nil), data...)
+				data = nil
+			}
+		}
+		start := 0
+		for start < len(data) {
+			end := bytes.IndexByte(data[start:], '\n')
+			if end < 0 {
+				break
+			}
+			if !fn(data[start:start+end], true) {
+				return nil
+			}
+			start += end + 1
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
+	}
+	// Last line without a trailing newline.
+	if len(pending) > 0 {
+		fn(pending, false)
+	}
+	return nil
+}
+
+// grepFastBuf scans a literal pattern with the byte primitives,
+// streaming in chunks (constant memory, like GNU grep). It covers the
+// everyday grep shape: plain output plus -c/-n/-v/-q/-H.
+func grepFastBuf(hc interp.HandlerContext, name string, showName bool, lit string,
+	invert, lineNum, count, quiet bool, r io.Reader) (bool, error) {
+	prefix := ""
+	if showName && name != "" {
+		prefix = name + ":"
+	}
+	bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
+	defer bw.Flush()
+	litB := []byte(lit)
+	matched, matchedAny := 0, false
+	ln := 0
+
+	handle := func(line []byte, terminated bool) bool {
+		ln++
+		ok := bytes.Contains(line, litB)
+		if invert {
+			ok = !ok
+		}
+		if ok {
+			matchedAny = true
+			if quiet {
+				return false
+			}
+			if count {
+				matched++
+			} else {
+				bw.WriteString(prefix)
+				if lineNum {
+					bw.WriteString(strconv.Itoa(ln))
+					bw.WriteByte(':')
+				}
+				bw.Write(line)
+				if terminated {
+					bw.WriteByte('\n')
+				}
+			}
+		}
+		return true
+	}
+	if err := streamLines(r, handle); err != nil {
+		return matchedAny, err
+	}
+	if count && !quiet {
+		bw.WriteString(prefix)
+		bw.WriteString(strconv.Itoa(matched))
+		bw.WriteByte('\n')
+	}
+	return matchedAny, nil
 }
 
 func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, invert, lineNum, count, filesOnly, quiet, onlyMatch bool, maxCount, after, before int, r io.Reader) (bool, error) {
@@ -1118,28 +1280,214 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if *zeroTerm {
 		delim = 0
 	}
-	var lines []string
+	var all []byte
 	for _, r := range readers {
-		for rec := range splitRecords(r, delim) {
-			lines = append(lines, rec)
+		data, err := io.ReadAll(r)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "sort:", err)
+			return exitError{1}
+		}
+		all = append(all, data...)
+	}
+	lines := splitSortRecords(string(all), delim)
+	// keyEqual and less are defined below via sortConfig.
+	// Fast path: a plain whole-line byte sort needs no keys at all.
+	if !*check && len(cfg.specs) == 1 && cfg.specs[0] == (sortKeySpec{}) &&
+		cfg.mode == sortModeByte && !cfg.fold && !cfg.dict && !cfg.nonprint && !cfg.skipBlank {
+		cmp := func(a, b string) int {
+			c := strings.Compare(a, b)
+			if cfg.reverse {
+				c = -c
+			}
+			return c
+		}
+		if cfg.stable {
+			slices.SortStableFunc(lines, cmp)
+		} else {
+			// With an implicit whole-line key, duplicate lines are
+			// byte-identical, so -u doesn't need a stable order.
+			slices.SortFunc(lines, cmp)
+		}
+		var out *bufio.Writer
+		if *outFile != "" {
+			p := resolve(hc.Dir, *outFile)
+			f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			if err != nil {
+				fmt.Fprintln(hc.Stderr, "sort:", err)
+				return exitError{1}
+			}
+			defer f.Close()
+			out = bufio.NewWriterSize(f, 256*1024)
+		} else {
+			out = bufio.NewWriterSize(hc.Stdout, 256*1024)
+		}
+		defer out.Flush()
+		for i, l := range lines {
+			if cfg.unique && i > 0 && lines[i-1] == l {
+				continue
+			}
+			out.WriteString(l)
+			if *zeroTerm {
+				out.WriteByte(0)
+			} else {
+				out.WriteByte('\n')
+			}
+		}
+		return nil
+	}
+	// Fast path: a single numeric key over plain output sorts a flat
+	// struct directly, letting the compiler inline the comparison.
+	if !*check && len(cfg.specs) == 1 && !cfg.fold && !cfg.dict && !cfg.nonprint &&
+		cfg.specs[0].start.char == 0 && !(cfg.specs[0].hasEnd && cfg.specs[0].end.char > 0) {
+		sp := &cfg.specs[0]
+		mode := sp.mode
+		if mode == sortModeByte {
+			mode = cfg.mode
+		}
+		if mode == sortModeNumeric {
+			type numItem struct {
+				neg    bool
+				ip, fp string
+				line   string
+			}
+			its := make([]numItem, len(lines))
+			fr := cfg.frScr[:0]
+			for i, l := range lines {
+				fr = sortFieldRangesB(fr, l, cfg.sep)
+				as, ae := sp.keyRangeB(l, fr, cfg.skipBlank)
+				neg, ip, fp := sortParseNum(l[as:ae])
+				ip = strings.TrimLeft(ip, "0")
+				fp = strings.TrimRight(fp, "0")
+				if ip == "" {
+					ip = "0"
+				}
+				if ip == "0" && fp == "" {
+					neg = false
+				}
+				its[i] = numItem{neg: neg, ip: ip, fp: fp, line: l}
+			}
+			rev := sp.reverse != cfg.reverse
+			cmp := func(a, b *numItem) int {
+				var c int
+				if a.neg != b.neg {
+					if a.neg {
+						c = -1
+					} else {
+						c = 1
+					}
+				} else {
+					sign := 1
+					if a.neg {
+						sign = -1
+					}
+					mag := 0
+					if a.ip != b.ip {
+						if len(a.ip) != len(b.ip) {
+							if len(a.ip) < len(b.ip) {
+								mag = -1
+							} else {
+								mag = 1
+							}
+						} else if a.ip < b.ip {
+							mag = -1
+						} else {
+							mag = 1
+						}
+					} else {
+						n, m := len(a.fp), len(b.fp)
+						mm := n
+						if m < mm {
+							mm = m
+						}
+						if cc := strings.Compare(a.fp[:mm], b.fp[:mm]); cc != 0 {
+							mag = cc
+						} else if n != m {
+							if n < m {
+								mag = -1
+							} else {
+								mag = 1
+							}
+						}
+					}
+					c = sign * mag
+				}
+				if c != 0 {
+					if rev {
+						return -c
+					}
+					return c
+				}
+				if cfg.stable || cfg.unique {
+					return 0
+				}
+				c = strings.Compare(a.line, b.line)
+				if cfg.reverse {
+					return -c
+				}
+				return c
+			}
+			idx := make([]int32, len(its))
+			for i := range idx {
+				idx[i] = int32(i)
+			}
+			if cfg.stable || cfg.unique {
+				slices.SortStableFunc(idx, func(a, b int32) int { return cmp(&its[a], &its[b]) })
+			} else {
+				slices.SortFunc(idx, func(a, b int32) int { return cmp(&its[a], &its[b]) })
+			}
+			var out *bufio.Writer
+			if *outFile != "" {
+				p := resolve(hc.Dir, *outFile)
+				f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+				if err != nil {
+					fmt.Fprintln(hc.Stderr, "sort:", err)
+					return exitError{1}
+				}
+				defer f.Close()
+				out = bufio.NewWriterSize(f, 256*1024)
+			} else {
+				out = bufio.NewWriterSize(hc.Stdout, 256*1024)
+			}
+			defer out.Flush()
+			for i, j := range idx {
+				if cfg.unique && i > 0 && its[idx[i-1]].neg == its[j].neg && its[idx[i-1]].ip == its[j].ip && its[idx[i-1]].fp == its[j].fp {
+					continue
+				}
+				out.WriteString(its[j].line)
+				if *zeroTerm {
+					out.WriteByte(0)
+				} else {
+					out.WriteByte('\n')
+				}
+			}
+			return nil
 		}
 	}
-	// keyEqual and less are defined below via sortConfig.
+	items := make([]sortItem, len(lines))
+	nSpec := len(cfg.specs)
+	keyArena := make([]sortKeyVal, len(lines)*nSpec)
+	for i, l := range lines {
+		items[i] = cfg.materialize(l, keyArena[i*nSpec:(i+1)*nSpec])
+	}
 	if *check {
-		for i := 1; i < len(lines); i++ {
-			if cfg.compare(lines[i], lines[i-1]) < 0 || (*unique && cfg.keysEqual(lines[i], lines[i-1])) {
+		for i := 1; i < len(items); i++ {
+			if cfg.cmpItems(&items[i], &items[i-1]) < 0 || (*unique && cfg.keysEqualItems(&items[i], &items[i-1])) {
 				name := "-"
 				if len(fs.Args()) > 0 {
 					name = fs.Args()[0]
 				}
-				fmt.Fprintf(hc.Stderr, "sort: %s:%d: disorder: %s\n", name, i+1, lines[i])
+				fmt.Fprintf(hc.Stderr, "sort: %s:%d: disorder: %s\n", name, i+1, items[i].line)
 				return exitError{1}
 			}
 		}
 		return nil
 	}
-	sort.SliceStable(lines, func(i, j int) bool { return cfg.compare(lines[i], lines[j]) < 0 })
-	var out io.Writer = hc.Stdout
+	if *stable || *unique {
+		slices.SortStableFunc(items, func(a, b sortItem) int { return cfg.cmpItems(&a, &b) })
+	} else {
+		slices.SortFunc(items, func(a, b sortItem) int { return cfg.cmpItems(&a, &b) })
+	}
+	var out *bufio.Writer
 	if *outFile != "" {
 		p := resolve(hc.Dir, *outFile)
 		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
@@ -1148,23 +1496,240 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return exitError{1}
 		}
 		defer f.Close()
-		out = f
+		out = bufio.NewWriterSize(f, 256*1024)
+	} else {
+		out = bufio.NewWriterSize(hc.Stdout, 256*1024)
 	}
-	var prev string
-	havePrev := false
-	for _, l := range lines {
-		if *unique && havePrev && cfg.keysEqual(prev, l) {
+	defer out.Flush()
+	var prev *sortItem
+	for i := range items {
+		it := &items[i]
+		if *unique && prev != nil && cfg.keysEqualItems(prev, it) {
 			continue
 		}
+		l := it.line
 		if *zeroTerm {
-			out.Write([]byte(l))
-			out.Write([]byte{0})
+			out.WriteString(l)
+			out.WriteByte(0)
 		} else {
-			fmt.Fprintln(out, l)
+			out.WriteString(l)
+			out.WriteByte('\n')
 		}
-		prev, havePrev = l, true
+		prev = it
 	}
 	return nil
+}
+
+// splitSortRecords splits the whole input into records as zero-copy
+// substrings, so no per-line allocation is needed. Inputs are read as a
+// single stream, like GNU sort does across multiple files.
+func splitSortRecords(data string, delim byte) []string {
+	if data == "" {
+		return nil
+	}
+	if data[len(data)-1] == delim {
+		data = data[:len(data)-1]
+	}
+	n := 1
+	for i := 0; i < len(data); i++ {
+		if data[i] == delim {
+			n++
+		}
+	}
+	lines := make([]string, 0, n)
+	start := 0
+	for i := 0; i < len(data); i++ {
+		if data[i] == delim {
+			lines = append(lines, data[start:i])
+			start = i + 1
+		}
+	}
+	return append(lines, data[start:])
+}
+
+// sortKeyVal is one precomputed key of one line: the key text plus any
+// parsed numeric form, computed once per line instead of per comparison.
+type sortKeyVal struct {
+	s    string // key text (already -d/-i/-f processed)
+	mode int    // effective compare mode
+	neg  bool   // sortModeNumeric parts (normalized)
+	ip   string
+	fp   string
+	f    float64 // sortModeGeneral / sortModeHuman
+	m    int     // sortModeMonth
+}
+
+// sortItem is one input line with its precomputed keys.
+type sortItem struct {
+	line string
+	keys []sortKeyVal
+}
+
+// materialize extracts and pre-parses every key of a line once, filling
+// the caller-provided slice so sorting needs no per-item allocation.
+func (sc *sortConfig) materialize(line string, keys []sortKeyVal) sortItem {
+	var frB [][2]int
+	haveB := false
+	var rs []rune
+	var frR [][2]int
+	for i := range sc.specs {
+		sp := &sc.specs[i]
+		var key string
+		if sp.start.char > 0 || (sp.hasEnd && sp.end.char > 0) {
+			// rune-accurate path for F.C character offsets
+			if rs == nil {
+				rs = []rune(line)
+				frR = sortFieldRanges(rs, sc.sep)
+			}
+			as, ae := sp.keyRange(rs, frR, sc.skipBlank)
+			key = string(rs[as:ae])
+		} else {
+			if !haveB {
+				frB = sortFieldRangesB(sc.frScr[:0], line, sc.sep)
+				sc.frScr = frB
+				haveB = true
+			}
+			as, ae := sp.keyRangeB(line, frB, sc.skipBlank)
+			key = line[as:ae] // zero-copy slice of the line
+		}
+		kv := sortKeyVal{s: key}
+		if sp.dict || sc.dict || sp.nonprint || sc.nonprint {
+			kv.s = sortFilterKey(kv.s, sp.dict || sc.dict, sp.nonprint || sc.nonprint)
+		}
+		if sp.fold || sc.fold {
+			kv.s = strings.ToLower(kv.s)
+		}
+		mode := sp.mode
+		if mode == sortModeByte {
+			mode = sc.mode
+		}
+		kv.mode = mode
+		switch mode {
+		case sortModeNumeric:
+			kv.neg, kv.ip, kv.fp = sortParseNum(kv.s)
+			kv.ip = strings.TrimLeft(kv.ip, "0")
+			kv.fp = strings.TrimRight(kv.fp, "0")
+			if kv.ip == "" {
+				kv.ip = "0"
+			}
+			if kv.ip == "0" && kv.fp == "" {
+				kv.neg = false
+			}
+		case sortModeGeneral:
+			kv.f = sortParseGeneral(kv.s)
+		case sortModeHuman:
+			kv.f = sortParseHuman(kv.s)
+		case sortModeMonth:
+			kv.m = sortParseMonth(kv.s)
+		}
+		keys[i] = kv
+	}
+	return sortItem{line: line, keys: keys}
+}
+
+// compareVal compares two precomputed keys under one key's modifiers.
+func (sc *sortConfig) compareVal(a, b *sortKeyVal, sp *sortKeySpec) int {
+	var c int
+	switch a.mode {
+	case sortModeNumeric:
+		c = compareNumParts(a, b)
+	case sortModeGeneral, sortModeHuman:
+		if a.f < b.f {
+			c = -1
+		} else if a.f > b.f {
+			c = 1
+		}
+	case sortModeMonth:
+		if a.m < b.m {
+			c = -1
+		} else if a.m > b.m {
+			c = 1
+		}
+	case sortModeVersion:
+		c = compareVersion(a.s, b.s)
+	default:
+		c = strings.Compare(a.s, b.s)
+	}
+	if sp.reverse != sc.reverse {
+		c = -c
+	}
+	return c
+}
+
+// compareNumParts compares pre-parsed GNU -n numbers with arbitrary
+// precision (int/frac parts are already normalized).
+func compareNumParts(a, b *sortKeyVal) int {
+	if a.neg != b.neg {
+		if a.neg {
+			return -1
+		}
+		return 1
+	}
+	sign := 1
+	if a.neg {
+		sign = -1
+	}
+	mag := 0
+	if a.ip != b.ip {
+		if len(a.ip) != len(b.ip) {
+			if len(a.ip) < len(b.ip) {
+				mag = -1
+			} else {
+				mag = 1
+			}
+		} else if a.ip < b.ip {
+			mag = -1
+		} else {
+			mag = 1
+		}
+	} else {
+		// Fracs have trailing zeros trimmed: compare the common prefix,
+		// and the longer tail is always bigger.
+		n, m := len(a.fp), len(b.fp)
+		mm := n
+		if m < mm {
+			mm = m
+		}
+		if c := strings.Compare(a.fp[:mm], b.fp[:mm]); c != 0 {
+			mag = c
+		} else if n != m {
+			if n < m {
+				mag = -1
+			} else {
+				mag = 1
+			}
+		}
+	}
+	return sign * mag
+}
+
+// cmpItems applies every key in order, then GNU's last-resort whole-line
+// comparison (reversed by global -r only).
+func (sc *sortConfig) cmpItems(a, b *sortItem) int {
+	for i := range sc.specs {
+		if c := sc.compareVal(&a.keys[i], &b.keys[i], &sc.specs[i]); c != 0 {
+			return c
+		}
+	}
+	if sc.stable || sc.unique {
+		return 0
+	}
+	c := strings.Compare(a.line, b.line)
+	if sc.reverse {
+		c = -c
+	}
+	return c
+}
+
+// keysEqualItems reports whether two lines have equal sort keys (no last
+// resort) — GNU's notion of "equal" for -u dedup and -cu checking.
+func (sc *sortConfig) keysEqualItems(a, b *sortItem) bool {
+	for i := range sc.specs {
+		if sc.compareVal(&a.keys[i], &b.keys[i], &sc.specs[i]) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // compareVersion implements GNU sort -V / ls -v version ordering, a
@@ -1502,6 +2067,101 @@ func sortFieldBounds(fr [][2]int, rs []rune, field int) (int, int) {
 	return len(rs), len(rs)
 }
 
+func isSortBlankB(b byte) bool { return b == ' ' || b == '\t' }
+
+// sortFieldRangesB is the byte-based twin of sortFieldRanges (blanks and
+// separators are ASCII, so byte scanning is UTF-8 safe). It appends to a
+// caller-provided scratch buffer so the hot sort path allocates nothing
+// per line.
+func sortFieldRangesB(into [][2]int, line, sep string) [][2]int {
+	into = into[:0]
+	if sep != "" {
+		sepB := sep[0]
+		start := 0
+		for i := 0; i < len(line); i++ {
+			if line[i] == sepB {
+				into = append(into, [2]int{start, i})
+				start = i + 1
+			}
+		}
+		return append(into, [2]int{start, len(line)})
+	}
+	// Fields are [end of previous run (or 0), end of run].
+	prevEnd, first := 0, true
+	i := 0
+	for i < len(line) {
+		if isSortBlankB(line[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(line) && !isSortBlankB(line[j]) {
+			j++
+		}
+		start := 0
+		if !first {
+			start = prevEnd
+		}
+		into = append(into, [2]int{start, j})
+		prevEnd, first = j, false
+		i = j
+	}
+	if len(into) == 0 {
+		return append(into, [2]int{0, len(line)})
+	}
+	return into
+}
+
+func sortFieldBoundsB(fr [][2]int, n, field int) (int, int) {
+	if field <= 0 {
+		return 0, n
+	}
+	if field <= len(fr) {
+		return fr[field-1][0], fr[field-1][1]
+	}
+	return n, n
+}
+
+// keyRangeB is the byte-based twin of keyRange.
+func (sp sortKeySpec) keyRangeB(line string, fr [][2]int, skipGlobal bool) (int, int) {
+	skip := sp.skipBlank || skipGlobal
+	fs, fe := sortFieldBoundsB(fr, len(line), sp.start.field)
+	st := fs
+	if skip {
+		for st < fe && isSortBlankB(line[st]) {
+			st++
+		}
+	}
+	if sp.start.char > 0 {
+		st += sp.start.char - 1
+	}
+	if st > len(line) {
+		st = len(line)
+	}
+	var en int
+	switch {
+	case !sp.hasEnd:
+		en = len(line)
+	case sp.end.char > 0:
+		efs, efe := sortFieldBoundsB(fr, len(line), sp.end.field)
+		if skip {
+			for efs < efe && isSortBlankB(line[efs]) {
+				efs++
+			}
+		}
+		en = efs + sp.end.char
+		if en > len(line) {
+			en = len(line)
+		}
+	default:
+		_, en = sortFieldBoundsB(fr, len(line), sp.end.field)
+	}
+	if en < st {
+		en = st
+	}
+	return st, en
+}
+
 // keyRange returns the rune range [start,end) of the key within a line.
 func (sp sortKeySpec) keyRange(rs []rune, fr [][2]int, skipGlobal bool) (int, int) {
 	skip := sp.skipBlank || skipGlobal
@@ -1544,7 +2204,8 @@ func (sp sortKeySpec) keyRange(rs []rune, fr [][2]int, skipGlobal bool) (int, in
 
 // sortParseNum extracts GNU's -n numeric prefix: blanks, optional '-',
 // digits*, optional '.' digits*. Anything else is zero (GNU -n does not
-// accept '+', exponents or 0x; it "aligns decimal points").
+// accept '+', exponents or 0x; it "aligns decimal points"). The parts
+// are substrings of the key: no copying, no per-digit allocation.
 func sortParseNum(s string) (bool, string, string) {
 	i := 0
 	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
@@ -1555,18 +2216,19 @@ func sortParseNum(s string) (bool, string, string) {
 		neg = true
 		i++
 	}
-	intp := ""
+	intStart := i
 	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		intp += string(s[i])
 		i++
 	}
+	intp := s[intStart:i]
 	frac := ""
 	if i < len(s) && s[i] == '.' {
 		i++
+		fracStart := i
 		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-			frac += string(s[i])
 			i++
 		}
+		frac = s[fracStart:i]
 	}
 	if intp == "" && frac == "" {
 		return false, "0", ""
@@ -1783,6 +2445,8 @@ type sortConfig struct {
 	unique    bool
 	dict      bool
 	nonprint  bool
+
+	frScr [][2]int // scratch for field ranges (sort is single-threaded)
 }
 
 // sortFilterKey applies -d/-i character restrictions to a key.
@@ -1988,6 +2652,9 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		defer f.Close()
 		w = f
 	}
+	bw := bufio.NewWriterSize(w, 256*1024)
+	defer bw.Flush()
+	w = bw
 	norm := func(s string) string {
 		// GNU comparison key: skip N fields, then N chars, then
 		// optionally truncate to M chars (-w). Raw line is printed.
@@ -2032,11 +2699,12 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		if groupMode != "" {
 			// GNU --group: print EVERY line, groups separated by blank line.
 			if !firstGroup {
-				fmt.Fprintln(w)
+				io.WriteString(w, "\n")
 			}
 			firstGroup = false
 			for i := 0; i < n; i++ {
-				fmt.Fprintln(w, prevRaw)
+				io.WriteString(w, prevRaw)
+				io.WriteString(w, "\n")
 			}
 			return
 		}
@@ -2044,7 +2712,8 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 			if *count {
 				fmt.Fprintf(w, "%7d %s\n", n, prevRaw)
 			} else {
-				fmt.Fprintln(w, prevRaw)
+				io.WriteString(w, prevRaw)
+				io.WriteString(w, "\n")
 			}
 		}
 	}
@@ -2052,9 +2721,10 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		sc := newLineReader(r)
 		for sc.Scan() {
 			line := sc.Text()
-			if n == 0 || norm(line) != prev {
+			key := norm(line)
+			if n == 0 || key != prev {
 				flush()
-				prev, prevRaw, n = norm(line), line, 1
+				prev, prevRaw, n = key, line, 1
 			} else {
 				n++
 			}
@@ -2125,6 +2795,7 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		return vals
 	}
+	wantLines, wantWords, wantChars, wantMax := *lines, *words, *chars, *maxLine
 	for i, r := range readers {
 		l, w, b := 0, 0, 0
 		chars, maxLineLen := 0, 0
@@ -2134,30 +2805,48 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return exitError{1}
 		}
 		b = len(data)
-		text := string(data)
-		chars = len([]rune(text))
-		for _, line := range strings.Split(text, "\n") {
-			// GNU -L counts display width with tab stops every 8.
+		if wantChars {
+			chars = utf8.RuneCount(data)
+		}
+		if wantLines {
+			l = bytes.Count(data, []byte{'\n'})
+		}
+		// Single byte pass for words and display width: non-ASCII
+		// continuation bytes don't advance the column, and tabs move
+		// to the next multiple of 8 (GNU -L).
+		if wantWords || wantMax {
+			inWord := false
 			col := 0
-			for _, r := range line {
-				if r == '\t' {
-					col = (col/8 + 1) * 8
-				} else {
-					col++
+			for _, c := range data {
+				if c == '\n' {
+					if col > maxLineLen {
+						maxLineLen = col
+					}
+					col = 0
+					inWord = false
+					continue
+				}
+				if wantWords {
+					switch c {
+					case ' ', '\t', '\r', '\v', '\f':
+						inWord = false
+					default:
+						if !inWord {
+							inWord = true
+							w++
+						}
+					}
+				}
+				if wantMax {
+					if c == '\t' {
+						col = (col/8 + 1) * 8
+					} else if c&0xC0 != 0x80 {
+						col++
+					}
 				}
 			}
 			if col > maxLineLen {
 				maxLineLen = col
-			}
-		}
-		l = strings.Count(text, "\n")
-		inWord := false
-		for _, ch := range text {
-			if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
-				inWord = false
-			} else if !inWord {
-				inWord = true
-				w++
 			}
 		}
 		tl, tw, tb, tc, tm = tl+l, tw+w, tb+b, tc+chars, max(maxLineLen, tm)
@@ -2305,31 +2994,56 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	}
 	if *del {
-		data, err := io.ReadAll(hc.Stdin)
-		if err != nil {
-			return err
-		}
-		delSet := make(map[byte]bool, len(from))
+		var delSet [256]bool
 		for _, b := range from {
 			delSet[b] = true
 		}
-		out := make([]byte, 0, len(data))
-		for _, b := range data {
-			if !delSet[b] {
-				out = append(out, b)
+		buf := make([]byte, 256*1024)
+		out := make([]byte, 256*1024)
+		for {
+			n, err := hc.Stdin.Read(buf)
+			if n > 0 {
+				k := 0
+				for _, b := range buf[:n] {
+					if !delSet[b] {
+						out[k] = b
+						k++
+					}
+				}
+				if _, werr := hc.Stdout.Write(out[:k]); werr != nil {
+					return werr
+				}
 			}
-		}
-		_, err = hc.Stdout.Write(out)
-		return err
-	}
-	if len(rest) < 2 {
-		if *squeeze {
-			data, err := io.ReadAll(hc.Stdin)
+			if err == io.EOF {
+				break
+			}
 			if err != nil {
 				return err
 			}
-			_, err = hc.Stdout.Write(squeezeBytes(data, from))
-			return err
+		}
+		return nil
+	}
+	if len(rest) < 2 {
+		if *squeeze {
+			buf := make([]byte, 256*1024)
+			var carry byte
+			hasCarry := false
+			for {
+				n, err := hc.Stdin.Read(buf)
+				if n > 0 {
+					chunk := squeezeBytes(buf[:n], from, &carry, &hasCarry)
+					if _, werr := hc.Stdout.Write(chunk); werr != nil {
+						return werr
+					}
+				}
+				if err == io.EOF {
+					break
+				}
+				if err != nil {
+					return err
+				}
+			}
+			return nil
 		}
 		fmt.Fprintln(hc.Stderr, "tr: missing operand after "+rest[0])
 		return flag.ErrHelp
@@ -2357,35 +3071,47 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		table[b] = c
 	}
-	data, err := io.ReadAll(hc.Stdin)
-	if err != nil {
-		return err
+	// Stream in chunks: constant memory and no GC churn in loops.
+	buf := make([]byte, 256*1024)
+	out := make([]byte, 256*1024)
+	var carry byte
+	hasCarry := false
+	for {
+		n, err := hc.Stdin.Read(buf)
+		if n > 0 {
+			for i := 0; i < n; i++ {
+				out[i] = table[buf[i]]
+			}
+			chunk := out[:n]
+			if *squeeze {
+				chunk = squeezeBytes(chunk, to, &carry, &hasCarry)
+			}
+			if _, werr := hc.Stdout.Write(chunk); werr != nil {
+				return werr
+			}
+		}
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return err
+		}
 	}
-	out := make([]byte, len(data))
-	for i, b := range data {
-		out[i] = table[b]
-	}
-	if *squeeze {
-		out = squeezeBytes(out, to)
-	}
-	_, err = hc.Stdout.Write(out)
-	return err
+	return nil
 }
 
-func squeezeBytes(data, set []byte) []byte {
-	inSet := make(map[byte]bool, len(set))
+func squeezeBytes(data, set []byte, carry *byte, hasCarry *bool) []byte {
+	var inSet [256]bool
 	for _, b := range set {
 		inSet[b] = true
 	}
 	out := data[:0:0]
-	var prev byte
-	hasPrev := false
 	for _, b := range data {
-		if hasPrev && b == prev && inSet[b] {
+		if *hasCarry && b == *carry && inSet[b] {
 			continue
 		}
 		out = append(out, b)
-		prev, hasPrev = b, true
+		*carry, *hasCarry = b, true
 	}
 	return out
 }
@@ -2587,6 +3313,34 @@ func cmdSeq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		return strconv.FormatFloat(v, 'f', -1, 64)
 	}
+	// Integer fast path: stream straight into the builder (the common
+	// `seq 100000` shape), avoiding a per-value allocation.
+	if !padWidth && format == "" && decimals == 0 &&
+		first == float64(int64(first)) && step == float64(int64(step)) && last == float64(int64(last)) {
+		iv, istep, ilast := int64(first), int64(step), int64(last)
+		buf := make([]byte, 0, 24)
+		firstOut := true
+		for {
+			if (istep > 0 && iv > ilast) || (istep < 0 && iv < ilast) {
+				break
+			}
+			if !firstOut && sep != "\n" {
+				sb.WriteString(sep)
+			}
+			firstOut = false
+			buf = strconv.AppendInt(buf[:0], iv, 10)
+			sb.Write(buf)
+			if sep == "\n" {
+				sb.WriteByte('\n')
+			}
+			iv += istep
+		}
+		if sep != "\n" {
+			sb.WriteByte('\n')
+		}
+		_, err := io.WriteString(hc.Stdout, sb.String())
+		return err
+	}
 	var vals []string
 	for v := first; (step > 0 && v <= last+1e-12) || (step < 0 && v >= last-1e-12); v += step {
 		vals = append(vals, fmtNum(v))
@@ -2740,6 +3494,47 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	defer closeAll()
+	bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
+	defer bw.Flush()
+	if len(d) == 1 {
+		// Fast byte-level path for the common single-byte delimiters.
+		delimB := d[0]
+		joinerB := joiner
+		for _, r := range readers {
+			err := streamLines(r, func(line []byte, terminated bool) bool {
+				if bytes.IndexByte(line, delimB) < 0 {
+					if !*onlyDelim {
+						bw.Write(line)
+						bw.WriteByte('\n')
+					}
+					return true
+				}
+				fs2, wrote := 0, false
+				fstart := 0
+				for j := 0; j <= len(line); j++ {
+					if j < len(line) && line[j] != delimB {
+						continue
+					}
+					fs2++
+					if in(fs2) {
+						if wrote {
+							bw.WriteString(joinerB)
+						}
+						bw.Write(line[fstart:j])
+						wrote = true
+					}
+					fstart = j + 1
+				}
+				bw.WriteByte('\n')
+				return true
+			})
+			if err != nil {
+				fmt.Fprintln(hc.Stderr, "cut:", err)
+				return exitError{1}
+			}
+		}
+		return nil
+	}
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
@@ -2837,19 +3632,22 @@ func cmdCutChars(hc interp.HandlerContext, list string, files []string, compleme
 	// character-oriented only under a resolvable UTF-8 locale; the
 	// reference environment resolves to C (bytes). Tracked for future
 	// locale-dependent multibyte support.
+	bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
+	defer bw.Flush()
+	out := make([]byte, 0, 256)
 	for _, r := range readers {
-		sc := newLineReader(r)
-		for sc.Scan() {
-			line := sc.Text()
-			var out []byte
-			for i := 0; i < len(line); i++ {
-				if in(i + 1) {
-					out = append(out, line[i])
+		err := streamLines(r, func(line []byte, terminated bool) bool {
+			out = out[:0]
+			for j := 0; j < len(line); j++ {
+				if in(j + 1) {
+					out = append(out, line[j])
 				}
 			}
-			fmt.Fprintln(hc.Stdout, string(out))
-		}
-		if err := sc.Err(); err != nil {
+			bw.Write(out)
+			bw.WriteByte('\n')
+			return true
+		})
+		if err != nil {
 			fmt.Fprintln(hc.Stderr, "cut:", err)
 			return exitError{1}
 		}

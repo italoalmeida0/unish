@@ -23,6 +23,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 
 	"mvdan.cc/sh/v3/interp"
 )
@@ -44,14 +45,14 @@ func cmdPrintf(_ context.Context, hc interp.HandlerContext, args []string) error
 		}
 	}
 	format, operands := args[1], args[2:]
-	specs := parsePrintfSpecs(format)
-	out, warnings, err := renderPrintf(format, specs, operands)
+	tmpl := cachedPrintfTemplate(format)
+	if tmpl.err != nil {
+		fmt.Fprintf(hc.Stderr, "printf: %v\n", tmpl.err)
+		return exitError{1}
+	}
+	out, warnings := tmpl.render(operands)
 	for _, w := range warnings {
 		fmt.Fprintf(hc.Stderr, "printf: %s\n", w)
-	}
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "printf: %v\n", err)
-		return exitError{1}
 	}
 	fmt.Fprint(hc.Stdout, out)
 	for _, w := range warnings {
@@ -112,21 +113,107 @@ func parsePrintfSpecs(format string) []printfSpec {
 // renderPrintf formats operands with format, reusing the format for
 // excess operands like GNU. Warnings (bad numeric conversions) do not
 // stop the formatting; they make the exit status 1 like bash.
-func renderPrintf(format string, specs []printfSpec, operands []string) (string, []string, error) {
+// printfNode is one piece of a compiled format: a pre-expanded literal
+// or a conversion spec.
+type printfNode struct {
+	lit   string
+	spec  *printfSpec
+	wStar bool
+	pStar bool
+}
+
+// printfTemplate is a compiled format string; hot loops (printf in a
+// loop) reuse it instead of re-parsing the format every call.
+type printfTemplate struct {
+	nodes []printfNode
+	err   error
+}
+
+var (
+	ptMu    sync.Mutex
+	ptCache = map[string]*printfTemplate{}
+)
+
+func cachedPrintfTemplate(format string) *printfTemplate {
+	ptMu.Lock()
+	t, ok := ptCache[format]
+	ptMu.Unlock()
+	if ok {
+		return t
+	}
+	t = buildPrintfTemplate(format)
+	ptMu.Lock()
+	if len(ptCache) >= 1024 {
+		ptCache = map[string]*printfTemplate{}
+	}
+	ptCache[format] = t
+	ptMu.Unlock()
+	return t
+}
+
+func buildPrintfTemplate(format string) *printfTemplate {
+	t := &printfTemplate{}
+	specs := parsePrintfSpecs(format)
 	for _, sp := range specs {
 		switch sp.verb {
 		case 's', 'd', 'i', 'u', 'o', 'x', 'X', 'f', 'e', 'E', 'g', 'G', 'c', 'b', 'a', 'A', 'q':
 		case 0:
-			return "", nil, fmt.Errorf("format ends with %%")
+			t.err = fmt.Errorf("format ends with %%")
+			return t
 		default:
-			return "", nil, fmt.Errorf("invalid format char: %c", sp.verb)
+			t.err = fmt.Errorf("invalid format char: %c", sp.verb)
+			return t
 		}
 	}
-	if len(specs) == 0 {
-		// No conversions: still expand backslash escapes in format
-		// (and %% collapses to %).
-		return strings.ReplaceAll(expandPrintfEscapes(format, false), "%%", "%"), nil, nil
+	si := 0
+	for i := 0; i < len(format); {
+		if format[i] != '%' {
+			// Literal run, with backslash escapes expanded once.
+			j := i
+			for j < len(format) && format[j] != '%' {
+				j++
+			}
+			t.nodes = append(t.nodes, printfNode{lit: expandPrintfEscapes(format[i:j], false)})
+			i = j
+			continue
+		}
+		i++ // '%'
+		if i < len(format) && format[i] == '%' {
+			t.nodes = append(t.nodes, printfNode{lit: "%"})
+			i++
+			continue
+		}
+		sp := specs[si]
+		si++
+		// Advance past flags/width/precision/verb of this spec.
+		for i < len(format) && strings.IndexByte("-+ #0", format[i]) >= 0 {
+			i++
+		}
+		for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
+			i++
+		}
+		if i < len(format) && format[i] == '.' {
+			i++
+			for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
+				i++
+			}
+		}
+		if i < len(format) {
+			i++ // verb
+		}
+		t.nodes = append(t.nodes, printfNode{
+			spec:  &sp,
+			wStar: sp.width == "*",
+			pStar: sp.prec == "*",
+		})
 	}
+	return t
+}
+
+// render formats operands with the template, reusing the format for
+// excess operands like GNU. Warnings (bad numeric conversions) do not
+// stop the formatting; they make the exit status 1 like bash.
+func (t *printfTemplate) render(operands []string) (string, []string) {
 	var sb strings.Builder
 	var warnings []string
 	ai := 0 // operand index
@@ -134,53 +221,20 @@ func renderPrintf(format string, specs []printfSpec, operands []string) (string,
 	// arguments; stop when a pass consumes nothing new.
 	for pass := 0; ; pass++ {
 		startAI := ai
-		si := 0
-		for i := 0; i < len(format); {
-			if format[i] != '%' {
-				// Copy literal run, expanding backslash escapes.
-				j := i
-				for j < len(format) && format[j] != '%' {
-					j++
-				}
-				sb.WriteString(expandPrintfEscapes(format[i:j], false))
-				i = j
+		for ni := range t.nodes {
+			nd := &t.nodes[ni]
+			if nd.spec == nil {
+				sb.WriteString(nd.lit)
 				continue
 			}
-			i++ // '%'
-			if i < len(format) && format[i] == '%' {
-				sb.WriteByte('%')
-				i++
-				continue
-			}
-			sp := specs[si]
-			si++
-			// Advance past flags/width/precision/verb of this spec.
-			for i < len(format) && strings.IndexByte("-+ #0", format[i]) >= 0 {
-				i++
-			}
-			for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
-				i++
-			}
-			if i < len(format) && format[i] == '.' {
-				i++
-				for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
-					i++
-				}
-			}
-			if i < len(format) {
-				i++ // verb
-			}
+			sp := nd.spec
 			// Resolve * width/precision from operands.
 			width, prec, flags := sp.width, sp.prec, sp.flags
-			if strings.Contains(width, "*") || strings.Contains(prec, "*") {
-				if width == "*" {
-					width, _, ai = nextOperand(operands, ai)
-				}
-				if prec == "*" {
-					var v string
-					v, _, ai = nextOperand(operands, ai)
-					prec = v
-				}
+			if nd.wStar {
+				width, _, ai = nextOperand(operands, ai)
+			}
+			if nd.pStar {
+				prec, _, ai = nextOperand(operands, ai)
 			}
 			arg := ""
 			argOK := true
@@ -192,7 +246,7 @@ func renderPrintf(format string, specs []printfSpec, operands []string) (string,
 				warnings = append(warnings, warn)
 			}
 			if err != nil {
-				return "", warnings, err
+				return sb.String(), warnings
 			}
 			sb.WriteString(s)
 		}
@@ -200,7 +254,7 @@ func renderPrintf(format string, specs []printfSpec, operands []string) (string,
 			break
 		}
 	}
-	return sb.String(), warnings, nil
+	return sb.String(), warnings
 }
 
 func nextOperand(operands []string, i int) (string, bool, int) {

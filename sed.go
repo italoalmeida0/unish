@@ -804,11 +804,7 @@ func (r *sedRunner) runCycle(prog []*sedCmd, pc int, idx *int, lines []string) i
 		}
 	}
 	if !r.quiet {
-		if r.lastLine && !r.trailNL {
-			fmt.Fprint(r.out, r.pat)
-		} else {
-			fmt.Fprintln(r.out, r.pat)
-		}
+		r.writeLine(r.pat, !(r.lastLine && !r.trailNL))
 	}
 	r.flushPending()
 	return cycleNext
@@ -976,16 +972,16 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 		}
 		return jumpToEnd
 	case 'p':
-		fmt.Fprintln(r.out, r.pat)
+		r.writeLine(r.pat, true)
 	case 'P':
 		if i := strings.IndexByte(r.pat, '\n'); i >= 0 {
-			fmt.Fprintln(r.out, r.pat[:i])
+			r.writeLine(r.pat[:i], true)
 		} else {
-			fmt.Fprintln(r.out, r.pat)
+			r.writeLine(r.pat, true)
 		}
 	case 'n':
 		if !r.quiet {
-			fmt.Fprintln(r.out, r.pat)
+			r.writeLine(r.pat, true)
 		}
 		if *idx+1 < len(lines) {
 			*idx++
@@ -1008,18 +1004,14 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 		// GNU: with no next input, N stops processing; the pattern
 		// space is printed (unless -n) and sed exits.
 		if !r.quiet {
-			if r.lastLine && !r.trailNL {
-				fmt.Fprint(r.out, r.pat)
-			} else {
-				fmt.Fprintln(r.out, r.pat)
-			}
+			r.writeLine(r.pat, !(r.lastLine && !r.trailNL))
 		}
 		r.flushPending()
 		r.quit = true
 		return jumpQuit
 	case 'q':
 		if !r.quiet {
-			fmt.Fprintln(r.out, r.pat)
+			r.writeLine(r.pat, true)
 		}
 		r.exitCode = sedExitCode(c.arg)
 		r.quit = true
@@ -1110,6 +1102,21 @@ func (r *sedRunner) doSub(sub *sedSub) {
 		r.quit = true
 		return
 	}
+	if sub.plain && sub.nth == 0 && !sub.nocase && sub.rePat != "" && sedLiteralPat(sub.rePat) {
+		// Fast path: literal pattern and literal replacement need no
+		// regexp engine at all. No match means no substitution (and no
+		// s///p/t side effects), like the engine path below.
+		if !strings.Contains(r.pat, sub.rePat) {
+			return
+		}
+		if sub.global {
+			r.pat = strings.ReplaceAll(r.pat, sub.rePat, sub.repl)
+		} else {
+			r.pat = strings.Replace(r.pat, sub.rePat, sub.repl, 1)
+		}
+		r.afterSub(sub)
+		return
+	}
 	if sub.plain && sub.nth == 0 {
 		if sub.global {
 			r.pat = re.ReplaceAllString(r.pat, sub.repl)
@@ -1179,7 +1186,7 @@ func (r *sedRunner) doSub(sub *sedSub) {
 func (r *sedRunner) afterSub(sub *sedSub) {
 	r.subbed = true
 	if sub.print {
-		fmt.Fprintln(r.out, r.pat)
+		r.writeLine(r.pat, true)
 	}
 	if sub.write != "" {
 		if f := r.wfile(sub.write); f != nil {
@@ -1195,6 +1202,18 @@ func isPlainRepl(repl string) bool {
 		}
 	}
 	return true
+}
+
+// sedLiteralPat reports whether a BRE/ERE pattern is a plain literal
+// string (no metacharacters and no escapes).
+func sedLiteralPat(pat string) bool {
+	for i := 0; i < len(pat); i++ {
+		switch pat[i] {
+		case '\\', '.', '[', ']', '*', '^', '$', '(', ')', '{', '}', '+', '?', '|':
+			return false
+		}
+	}
+	return pat != ""
 }
 
 func expandSubMatch(orig string, sub *sedSub, m []int) string {
@@ -1331,6 +1350,15 @@ func sedList(s string) string {
 		}
 	}
 	return sb.String()
+}
+
+// writeLine writes a line to the output without fmt overhead (the hot
+// path of every sed script).
+func (r *sedRunner) writeLine(s string, nl bool) {
+	io.WriteString(r.out, s)
+	if nl {
+		io.WriteString(r.out, "\n")
+	}
 }
 
 func (r *sedRunner) flushPending() {
