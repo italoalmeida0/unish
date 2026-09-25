@@ -9,7 +9,7 @@ rediscover any of it.
 | Group | Cases | Result |
 |---|---|---|
 | Output parity (GNU oracle) | 372 | 0 failures, 9 documented wording deltas |
-| Flag cases (oracle at run time) | 166 | 0 failures, 46 known differences |
+| Flag cases (oracle at run time) | 192 | 0 failures, 49 known differences |
 | Functional (does it DO it) | 21 | 0 failures, 5 known gaps |
 | Gaps: the 15 uncovered commands | 37 | 0 failures, 1 known gap |
 | End-to-end (real processes) | 38 | 0 failures |
@@ -17,6 +17,21 @@ rediscover any of it.
 | Go unit suite | 86 tests | 0 failures, 5 platform skips |
 
 CI runs all of it on Linux, macOS and Windows (9 jobs, all green).
+
+## Flag coverage: 192 of 503 (38%)
+
+The audit measured 232 flags that work, 194 that are accepted and
+ignored, 46 needing setup and 31 skipped for safety. 192 now have a
+regression case.
+
+The remaining ~310 are not a generator problem: each needs bespoke setup
+a generic sweep cannot invent — a real archive to extract (`tar -x`), a
+socket to connect (`nc`, `ss`), a process to signal (`pgrep`, `pkill`),
+two differing files (`diff`, `cmp`), a compressed file (`gunzip`). Those
+belong in per-command test files. 21 commands still have flags with no
+case: diff, cmp, ps, free, ss, pgrep, pkill, nc, netcat, env, nice,
+touch, xargs, timeout, shasum, gzip, gunzip, ln, hexdump, strings,
+expand.
 
 ## Real findings in unish
 
