@@ -84,12 +84,12 @@ read the results.
 
 | Group | Commands |
 |---|---|
-| text | `grep` (-E BRE/ERE, -r, -o, -a/--text, -q/-s/-h/-H/-m/-l/-c/-n/-i/-v/-x/-w/-F, -A/-B/-C, --include/--exclude), `sed` (s/// with `w` flag, addresses, ranges, hold space, `y`, `a`/`i`/`c`, `=`, `N`, -n/-e/-f/-i/-E), `head` (-n, -c, -q/-v), `tail` (-n `+N`, -c, -q/-v), `sort` (-n, -r, -u, -c, -k, -t, -f, -s, -V, -o, -z), `uniq` (-c/-d/-u/-i/-f/-s/-w, --group), `wc` (-l/-w/-c/-m/-L), `tee`, `tr` (-d/-s/-c/-t, classes), `seq` (-s, -w, -f), `cut` (-d/-f/-c/-b, --complement, --output-delimiter), `paste` (-d, -s, `- -`), `comm` (-1/-2/-3, --check-order), `split` (-l/-b/-a/-d, --suffix-length, -n chunks), `diff` (-q, -u, -s/--brief), `cmp` (-s, -l), `hexdump` (-C, -n, -s, -e), `strings` (-n, -t), `od` (-An, -t, -A, -j, -N), `nl` (-ba, -v), `tac`, `rev`, `fold` (-w, -s, -b), `expand` (-t), `unexpand` (-a), `join` (-1/-2/-j/-t/-e/-a/-o, -v), `cat` (-n/-b/-s/-E/-T, unbounded lines) |
+| text | `grep` (-E BRE/ERE, -r, -o, -a/--text, -q/-s/-h/-H/-m/-l/-c/-n/-i/-v/-x/-w/-F, -A/-B/-C, --include/--exclude), `sed` (s/// with `w` flag, addresses, ranges, hold space, `y`, `a`/`i`/`c`, `=`, `N`, -n/-e/-f/-i/-E), `head` (-n, -c, -q/-v), `tail` (-n `+N`, -c, -q/-v), `sort` (-n, -r, -u, -c, -k, -t, -f, -s, -V, -o, -z), `uniq` (-c/-d/-u/-i/-f/-s/-w, --group), `wc` (-l/-w/-c/-m/-L), `tee`, `tr` (-d/-s/-c/-t, classes), `seq` (-s, -w, -f), `cut` (-d/-f/-c/-b, --complement, --output-delimiter), `paste` (-d, -s, `- -`), `comm` (-1/-2/-3, --check-order), `split` (-l/-b/-a/-d, --suffix-length, -n chunks), `diff` (-q, -u, -s/--brief), `cmp` (-s, -l), `hexdump` (-C, -n, -s, -e format), `strings` (-n, -t, -a), `od` (-An, -t, -A, -j, -N), `nl` (-ba, -v), `tac`, `rev`, `fold` (-w, -s, -b), `expand` (-t, -i), `unexpand` (-a), `join` (-1/-2/-j/-t/-e/-a/-o, -v), `cat` (-n/-b/-s/-E/-T, unbounded lines) |
 | files | `ls` (-a with `.`/`..`, -l, -R, -S, -t, -m, -C, -x, -i, -F, -Q, -d, …), `find` (-name/-iname, -path, -type, -maxdepth/-mindepth, -size, -mtime/-mmin, -newer, -empty, -perm, -not, -prune, -exec, -delete, -print0), `mktemp`, `cp` (-r, -v, -n, -p), `mv` (-v `renamed …`, -n), `rm` (never removes `.`/`..`, --preserve-root), `mkdir`, `touch` (-d, -r/--reference, -c), `chmod` (symbolic), `xargs` (-0, -n, -I, -r), `base64` (-d, -w, -i), `tar` (-cf/-xf/-tf/-czf, --exclude, slip defense), `gzip`/`gunzip`/`gzcat`, `dirname`, `basename`, `realpath`, `readlink`, `ln` (-s, -f), `du` (-s, -h, -b) |
-| system | `sleep`, `timeout` (-s, -k, --preserve-status), `kill` (-s/-n, `%jobspec`), `pwd`, `true`, `false`, `yes`, `which`, `printenv`, `whoami`, `nproc`, `clear`, `echo`, `date` (+strftime), `uname` (-s/-n/-r/-v/-m/-a, real kernel on Linux), `hostname`, `md5sum`, `sha1sum`, `sha256sum`, `shasum` (+`md5sum -c` check) |
-| sysinfo | `df` (-h, -k, -P), `ps` (aux/-ef), `free`, `uptime`, `env` (-i), `stat` (full + -c), `ss` (-t/-u/-l), `id`, `arch`, `tty`, `logname`, `sync`, `nohup`, `nice` |
-| shell | `umask`, `ulimit` (-n/-a, -Sn/-Hn), `hash` (real table), `type`, `jobs` (real PIDs), `wait`, `history` (interactive) |
-| network | `nc`/`netcat`, `pgrep`, `pkill` |
+| system | `sleep`, `timeout` (-s, -k, --preserve-status), `kill` (-s/-n, `%jobspec`, `-0` existence check), `pwd`, `true`, `false`, `yes`, `which`, `printenv`, `whoami`, `nproc`, `clear`, `echo`, `date` (+strftime, -r, -d), `uname` (-s/-n/-r/-v/-m/-p/-i/-a, real kernel + machine), `hostname`, `md5sum`, `sha1sum`, `sha256sum`, `shasum` (-a, -c, -q/-s) |
+| sysinfo | `df` (-h, -k, -P), `ps` (aux/-ef/-o columns), `free` (-h/-m/-g), `uptime`, `env` (-i), `stat` (full + -c), `ss` (-t/-u/-l/-a/-n/-p), `id`, `arch`, `tty`, `logname`, `sync`, `nohup`, `nice` |
+| shell | `umask`, `ulimit` (-n/-a, -Sn/-Hn), `hash` (real table), `type`, `jobs` (real PIDs), `wait`, `history` (interactive), `compgen` |
+| network | `nc`/`netcat` (-l, -u, -z, -w, -p, -v), `pgrep` (-f/-x/-i/-l/-c), `pkill` (-f/-x/-i/-e/-s/-l/-n/-a/-g) |
 
 ## Interactive shell
 
@@ -114,9 +114,15 @@ to the system binary.
 ## Compatibility notes
 
 - `FOO=42 printenv FOO` works (reads the shell environment).
-- `kill` works (declared but unimplemented upstream; intercepted).
+- **Job control works**: `$!` is a real pid, so `kill $!`, `kill %1`,
+  `jobs`, `wait` and `trap ... TERM` behave like bash. Background
+  statements run as real child processes.
 - `/dev/stdin` works as an operand (`-`, `/dev/stdin`, repeated) even
-  on Windows, where the OS has no such file.
+  on Windows, where the OS has no such file (`/dev/null` is mapped to
+  `NUL`).
+- `ps`, `pgrep` and `pkill` read the real process table on every OS
+  (`/proc` on Linux, `kern.proc.all` on macOS, `CreateToolhelp32Snapshot`
+  on Windows).
 - Ctrl-C / timeout: exit 130 / 124 (bash/timeout convention).
 - Syntax errors: exit 2, like bash.
 
@@ -135,7 +141,7 @@ No installer, no dependencies:
 | `unish-macos-amd64` | macOS | x86_64 (Intel) |
 | `unish-macos-arm64` | macOS | Apple Silicon |
 
-Or with Go (1.24+):
+Or with Go (1.26+):
 
 ```
 go install github.com/italoalmeida0/unish@latest
@@ -158,11 +164,21 @@ go vet ./...
 go test ./...        # unit + GNU parity regression oracles
 ```
 
-The differential suite in `parity/` runs ~370 scripts under both unish
-and a real GNU bash and requires identical stdout, exit codes and file
-effects; it runs in CI on every push (and weekly) and is the safety net
-for all the GNU edge cases (`sort` keys, `sed` cycles, `printf`
-conversions, trailing-newline semantics, …). See `parity/README.md`.
+The differential suite in `parity/` runs ~1100 cases under both unish and
+a real GNU bash and requires identical stdout, exit codes and file
+effects. It covers every embedded command, every declared flag, the shell
+builtins, edge cases and end-to-end process behaviour, and it runs in CI
+on every push (and weekly). See `parity/README.md` and `parity/REPORT.md`
+(the latter records what the campaign found).
+
+CI runs the full suite on **six native targets** (linux, windows and
+macOS, each amd64 + arm64), plus:
+
+- a **musl** job that proves the Linux binaries are glibc-free: they are
+  executed on a bare Alpine image and checked with `file(1)` for
+  `statically linked`, and the whole Go suite runs on a musl userland
+- a **docker sandbox** job for the process/network tools (`pgrep`,
+  `pkill`, `ss`, `nc`), which cannot be tested safely against the runner
 
 Benchmarks live in `bench/`; see `bench/README.md`.
 
