@@ -916,6 +916,11 @@ func stripNonAlphabet(s string) string {
 // parseTouchDate parses GNU touch -d operands: RFC3339, "2006-01-02",
 // "2006-01-02 15:04:05", "@epoch", and common variants.
 func parseTouchDate(s string) (time.Time, error) {
+	// GNU interprets a date without a zone in the LOCAL timezone. Go's
+	// time.Parse returns UTC, which shifts the wall clock by the offset
+	// and made `touch -d '2020-01-02 03:04:05'` read back as 2020-01-01
+	// in negative-offset zones (seen on a Windows ARM64 runner). Parse in
+	// time.Local to match.
 	formats := []string{
 		time.RFC3339,
 		"2006-01-02T15:04:05",
@@ -934,7 +939,7 @@ func parseTouchDate(s string) (time.Time, error) {
 		time.Kitchen,
 	}
 	for _, f := range formats {
-		if t, err := time.Parse(f, s); err == nil {
+		if t, err := time.ParseInLocation(f, s, time.Local); err == nil {
 			return t, nil
 		}
 	}

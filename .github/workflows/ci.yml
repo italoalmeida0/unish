@@ -12,141 +12,11 @@ permissions:
   contents: read
 
 jobs:
+  # Native vet + full Go test suite + build on EVERY target unish ships
+  # for. The release matrix cross-compiles them; this proves each one
+  # builds and passes on its own hardware.
   test:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - name: vet
-        run: go vet ./...
-      - name: test
-        run: go test -count=1 ./...
-      - name: build
-        run: go build -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
-
-  # Functional tests: does the shell actually DO it? These spawn real
-  # processes, kill and wait for them, and check observable effects —
-  # different from output parity. They run on every OS because the
-  # question ("does kill/wait/trap work") is platform-independent, and
-  # known gaps are tagged in the data instead of being skipped.
-  functional:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - name: build
-        run: go build -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
-      - name: functional + flags + gaps + e2e + edge
-        shell: bash
-        env:
-          ORACLE_PATH: ${{ matrix.os == 'windows-latest' && 'C:/Program Files/Git/usr/bin' || '/usr/bin' }}
-        run: python parity/runner.py --unish ./unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} --oracle /bin/bash --filter "__none__"
-
-  # Differential output parity. On Linux the oracle is the runner's real
-  # GNU bash + coreutils 9.4 (authoritative). On Windows it is Git Bash
-  # (coreutils 8.32: a few wording deltas are tagged old-oracle). macOS
-  # runs a BSD userland, so a GNU oracle is unavailable; its job runs
-  # the suite and reports instead of pretending.
-  parity-linux:
-    runs-on: ubuntu-latest
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - name: build
-        run: go build -trimpath -ldflags="-s -w" -o unish .
-      - name: parity suite (GNU)
-        run: python3 parity/runner.py --unish ./unish --oracle /bin/bash
-
-  parity-windows:
-    runs-on: windows-latest
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - name: build
-        run: go build -trimpath -ldflags="-s -w" -o unish.exe .
-      - name: parity suite (Git Bash)
-        shell: cmd
-        run: python parity\runner.py --unish .\unish.exe --oracle "C:/Program Files/Git/bin/bash.exe@C:/Program Files/Git/usr/bin"
-
-  # macOS: BSD userland. Output parity against GNU is not meaningful, so
-  # this job runs the functional suite plus the Go tests and reports
-  # platform skips — honest, not theatre.
-  parity-macos:
-    runs-on: macos-latest
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - name: build
-        run: go build -trimpath -ldflags="-s -w" -o unish .
-      - name: go test skip report
-        run: python3 parity/runner.py --go-tests --verbose
-
-  # Process/network tools (pgrep, pkill, ss, nc) can only be tested in a
-  # sandbox: their job is to look at or signal OTHER processes, so running
-  # them against the runner would either prove nothing or be destructive.
-  # Inside a container they see only their own processes.
-  sandbox:
-    runs-on: ubuntu-latest
-    env:
-      CGO_ENABLED: "0"
-    steps:
-      - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
-        with:
-          go-version: "1.26"
-      - uses: actions/setup-python@v7
-        with:
-          python-version: "3.x"
-      - name: build (linux/amd64)
-        run: go build -trimpath -ldflags="-s -w" -o unish-linux-amd64 .
-      - name: sandbox suite (docker)
-        run: python3 parity/sandbox.py --unish ./unish-linux-amd64 --platform linux/amd64
-
-  # Native build + full test suite on every OS/arch unish ships for. The
-  # release matrix builds all six; this proves each one also BUILDS and
-  # PASSES natively, not just cross-compiles.
-  arch:
-    name: Native (${{ matrix.name }})
+    name: Test (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 25
     strategy:
@@ -174,10 +44,85 @@ jobs:
           go-version: "1.26"
       - name: vet
         run: go vet ./...
-      - name: build (native)
-        run: go build -mod=vendor -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
       - name: tests (native, full)
         run: go test -count=1 -timeout 900s ./...
+      - name: build (native)
+        run: go build -mod=vendor -trimpath -ldflags="-s -w" -o unish${{ startsWith(matrix.os, 'windows') && '.exe' || '' }} .
+
+  # The whole behavioural suite (parity, functional, flags, gaps, e2e,
+  # edge, builtins) on EVERY native target unish ships for. The oracle is
+  # chosen per platform: GNU bash on Linux, Git Bash on Windows, the system
+  # bash on macOS (BSD userland, so the GNU-flag group self-skips).
+  suite:
+    name: Suite (${{ matrix.name }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux amd64
+            os: ubuntu-latest
+            oracle: /bin/bash
+            exe: ""
+          - name: linux arm64
+            os: ubuntu-24.04-arm
+            oracle: /bin/bash
+            exe: ""
+          - name: windows amd64
+            os: windows-latest
+            oracle: "C:/Program Files/Git/bin/bash.exe@C:/Program Files/Git/usr/bin"
+            exe: ".exe"
+          - name: windows arm64
+            os: windows-11-arm
+            oracle: "C:/Program Files/Git/bin/bash.exe@C:/Program Files/Git/usr/bin"
+            exe: ".exe"
+          - name: macos arm64
+            os: macos-latest
+            oracle: /bin/bash
+            exe: ""
+          - name: macos amd64
+            os: macos-15-intel
+            oracle: /bin/bash
+            exe: ""
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+      - name: build
+        run: go build -mod=vendor -trimpath -ldflags="-s -w" -o unish${{ matrix.exe }} .
+      - name: behaviour suite
+        shell: bash
+        env:
+          ORACLE_PATH: ${{ startsWith(matrix.os, 'windows') && 'C:/Program Files/Git/usr/bin' || '/usr/bin' }}
+        run: python parity/runner.py --unish ./unish${{ matrix.exe }} --oracle "${{ matrix.oracle }}" --filter "__none__"
+
+  # Process/network tools (pgrep, pkill, ss, nc) can only be tested in a
+  # sandbox: their job is to look at or signal OTHER processes, so running
+  # them against the runner would either prove nothing or be destructive.
+  # Inside a container they see only their own processes.
+  sandbox:
+    runs-on: ubuntu-latest
+    env:
+      CGO_ENABLED: "0"
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: "1.26"
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.x"
+      - name: build (linux/amd64)
+        run: go build -trimpath -ldflags="-s -w" -o unish-linux-amd64 .
+      - name: sandbox suite (docker)
+        run: python3 parity/sandbox.py --unish ./unish-linux-amd64 --platform linux/amd64
 
   # glibc-free proof: the Linux artifacts must run on a bare musl userland.
   # A glibc-linked binary cannot even exec on Alpine, so this is a real
