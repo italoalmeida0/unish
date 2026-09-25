@@ -55,8 +55,10 @@ jobs:
           python-version: "3.x"
       - name: build
         run: go build -trimpath -ldflags="-s -w" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
-      - name: functional suite
+      - name: functional + flags + gaps + e2e + edge
         shell: bash
+        env:
+          ORACLE_PATH: ${{ matrix.os == 'windows-latest' && 'C:/Program Files/Git/usr/bin' || '/usr/bin' }}
         run: python parity/runner.py --unish ./unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} --oracle /bin/bash --filter "__none__"
 
   # Differential output parity. On Linux the oracle is the runner's real
