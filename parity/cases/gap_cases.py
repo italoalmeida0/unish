@@ -31,16 +31,9 @@ ORACLE_CASES = [
     ("expand -t4", "printf 'a\\tb\\n' | expand -t4"),
     ("expand file", "printf 'x\\ty\\n' > f; expand f"),
     ("unexpand", "printf 'a       b\\n' | unexpand"),
-    ("hostname shape", "hostname | wc -l"),
-    ("nproc shape", "nproc | grep -c '^[0-9][0-9]*$'"),
-    ("pwd shape", "pwd | wc -l"),
-    ("pwd -P shape", "pwd -P | wc -l"),
-    ("uname shape", "uname | wc -l"),
-    # uname reports the REAL platform (Windows/aarch64 here), so the Git
-    # Bash oracle (MINGW64/x86_64) is the wrong expectation. Shape only.
-    ("uname -s shape", "uname -s | wc -l"),
-    ("uname -m shape", "uname -m | wc -l"),
-    ("whoami shape", "whoami | wc -l"),
+    # hostname/nproc/pwd/uname/whoami are covered in FIXED_CASES with a
+    # portable shape expectation; they are NOT oracle cases, because BSD
+    # and GNU differ in ways that say nothing about unish.
     ("sha1sum known", "printf 'hello\\n' | sha1sum | cut -d' ' -f1"),
     ("sha256sum known", "printf 'hello\\n' | sha256sum | cut -d' ' -f1"),
     ("md5sum known", "printf 'hello\\n' | md5sum | cut -d' ' -f1"),
