@@ -26,7 +26,7 @@ CASES = [
     'mkdir d; echo x > d/f; tar -cf a.tar d; rm -rf d; tar -xf a.tar -C nosuch 2>&1; echo rc=$?; ls',
     'mkdir d; echo x > d/f; tar -cf a.tar d; rm -rf d; mkdir out; tar -xf a.tar -C out; cat out/d/f',
     "printf 'x\\n' | xargs false; echo rc=$?",
-    "printf 'x\\n' | xargs nosuchcmd123 2>&1; echo rc=$?",
+    ("printf 'x\\n' | xargs nosuchcmd123 2>&1; echo rc=$?", "old-oracle"),
     "printf 'a\\nb\\n' | xargs -n2 echo",
     "touch -d '2020-01-02 03:04:05' f; date -r f '+%Y-%m-%d %H:%M:%S' 2>&1",
     "printf 'a::b\\n' | cut -d:: -f2 2>&1; echo rc=$?",
