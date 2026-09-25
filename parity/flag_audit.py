@@ -145,8 +145,11 @@ def read_flags():
     ):
         name, bools, values, longs = m.groups()
         fl = ["-" + c for c in bools] + ["-" + c for c in values]
-        fl += [s.split("=")[0] for s in re.findall(r'"([^"]+)":\s*"[^"]+"', longs)]
-        takes_value = set("-" + c for c in values)
+        # Long options keep their `--` prefix: handing GNU `cat number`
+        # instead of `cat --number` produces empty output and looks like a
+        # unish bug.
+        for lm in re.finditer(r'"([^"]+)":\s*"[^"]+"', longs):
+            fl.append("--" + lm.group(1))
         out[name] = sorted(set(fl))
     return out
 
@@ -192,29 +195,56 @@ def unsafe(argv):
 
 
 def oracle_path(cmd):
-    for d in os.environ.get("PATH", "").split(os.pathsep):
-        p = os.path.join(d, cmd)
-        if os.path.isfile(p):
-            return p
+    """Find the GNU tool for `cmd`, honouring ORACLE_PATH when set.
+
+    ORACLE_PATH exists because the shell under test (unish) shadows these
+    names with builtins: a bare PATH lookup inside a unish session finds
+    the builtin, not GNU. CI exports ORACLE_PATH=/usr/bin; on Windows it
+    points at Git's usr/bin.
+    """
+    dirs = []
+    env = os.environ.get("ORACLE_PATH", "")
+    if env:
+        dirs += env.split(os.pathsep)
+    dirs += os.environ.get("PATH", "").split(os.pathsep)
+    for d in dirs:
+        if not d:
+            continue
+        for name in (cmd, cmd + ".exe"):
+            p = os.path.join(d, name)
+            if os.path.isfile(p):
+                return p
     return None
 
 
-def run(binary, argv, cwd, stdin=b""):
-    """Run an embedded command the way a shell user does: via -c.
+def run(binary, argv, cwd, stdin=b"", shell=False):
+    """Run a command and return (rc, stdout, stderr).
 
-    unish and bash are *shells*; their utilities are builtins, so
-    `binary head a.txt` would make bash try to run the file `head`.
-    Quoting each word keeps the command a faithful argv.
+    shell=False -> the binary takes the argv directly (GNU tools).
+    shell=True  -> the binary is a SHELL and the command is a builtin, so
+                   it goes through `-c` the way a user invokes it
+                   (`unish -c "head -n 2 a.txt"`).
+
+    Getting this wrong is why an earlier run reported 363 "no output":
+    GNU cat was being handed a `-c` flag it does not have.
     """
     if unsafe(argv):
         return -2, b"<REFUSED: unsafe argv>", b""
-    cmdline = " ".join(shlex.quote(a) for a in argv)
+    if not shell:
+        # argv already names the command (["cat","-n","a.txt"]); `binary`
+        # is the resolved path to it, so drop the leading name or GNU sees
+        # it as an extra operand (the `cat cat -n a.txt` bug).
+        if argv and os.path.basename(binary).split(".")[0] == argv[0]:
+            argv = argv[1:]
+    full = [binary] + (["-c", " ".join(shlex.quote(a) for a in argv)] if shell else argv)
     try:
-        p = subprocess.run([binary, "-c", cmdline], cwd=cwd, input=stdin,
+        p = subprocess.run(full, cwd=cwd, input=stdin,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
         return p.returncode, p.stdout, p.stderr
     except subprocess.TimeoutExpired:
         return 124, b"<TIMEOUT>", b""
+    except FileNotFoundError:
+        return -3, b"<NO-BINARY: %s>" % binary.encode(), b""
     except Exception as e:  # noqa: BLE001
         return -1, b"<ERROR %s>" % str(e).encode(), b""
 
@@ -251,8 +281,8 @@ def main():
             # "head a.txt".) Flags precede operands, as a user writes them.
             argv = [cmd, fl] + base_argv
             base_run = [cmd] + base_argv if base_argv else [cmd]
-            u_rc, u_out, u_err = run(unish, argv, work)
-            b_rc, b_out, b_err = run(unish, base_run, work)
+            u_rc, u_out, u_err = run(unish, argv, work, shell=True)
+            b_rc, b_out, b_err = run(unish, base_run, work, shell=True)
 
             if u_rc != 0 and b_rc == 0 and b_err:
                 results.append((cmd, fl, "BROKEN", u_err.decode("utf-8", "replace").strip()[:80]))

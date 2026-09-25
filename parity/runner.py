@@ -33,6 +33,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from cases import misc_cases, printf_cases, sed_cases, shell_cases, sort_cases
 from functional import CASES as FUNCTIONAL_CASES
+from cases.flag_cases import FLAG_CASES
 
 CASE_GROUPS = [
     ("sort", sort_cases.CASES),
@@ -111,6 +112,8 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--skip-platform", action="store_true",
                     help="skip cases that need GNU/busybox tooling absent here")
+    ap.add_argument("--only-flags", action="store_true",
+                    help="run only the generated flag cases")
     ap.add_argument("--go-tests", action="store_true",
                     help="also run go test -json and report platform skips")
     args = ap.parse_args()
@@ -118,6 +121,10 @@ def main():
     if args.go_tests:
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return run_go_tests(repo, args.verbose)
+
+    if args.only_flags:
+        unish_abs = os.path.abspath(args.unish)
+        return 1 if run_flag_cases(unish_abs, args.timeout, args.verbose) else 0
 
     oracle, env = parse_shell(args.oracle)
     unish = os.path.abspath(args.unish)
@@ -182,7 +189,8 @@ def main():
     print("=== %d cases: %d failures, %d known deltas (xfail), %d xpass" %
           (total, failed, xfailed, xpassed))
     fn_failed = run_functional(unish, args.timeout, args.verbose)
-    return 1 if (failed or fn_failed) else 0
+    fl_failed = run_flag_cases(unish, args.timeout, args.verbose)
+    return 1 if (failed or fn_failed or fl_failed) else 0
 
 
 def run_go_tests(unish_dir, verbose):
@@ -220,6 +228,56 @@ def run_go_tests(unish_dir, verbose):
     if skipped_tests and verbose:
         for t in skipped_tests:
             print("    skip: %s" % t)
+    return failed
+
+
+def run_flag_cases(unish, timeout, verbose):
+    """Run generated flag cases: exact argv in, exact expected stdout out.
+
+    The expectation was captured from GNU by parity/gen_flag_cases.py, so
+    this checks real behavior rather than "it ran without crashing".
+    """
+    total = failed = xfail = 0
+    work = tempfile.mkdtemp(prefix="flags_")
+    try:
+        for argv, expect, xf, files in FLAG_CASES:
+            total += 1
+            # each case gets a clean fixture dir
+            for name in os.listdir(work):
+                p_ = os.path.join(work, name)
+                if os.path.isdir(p_):
+                    shutil.rmtree(p_, ignore_errors=True)
+                else:
+                    os.remove(p_)
+            # Recreate the exact fixtures the expectation was captured
+            # with; generic content would invalidate the expectation.
+            for name, content in files.items():
+                with open(os.path.join(work, name), "w") as fh:
+                    fh.write(content)
+            cmdline = " ".join(argv)
+            try:
+                p = subprocess.run([unish, "-c", cmdline], cwd=work, input=b"",
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                failed += 1
+                print("FAIL  [flag] %s (timeout)" % cmdline)
+                continue
+            got = norm(p.stdout).decode("utf-8", "replace")
+            if got == expect:
+                if verbose:
+                    print("ok    [flag] %s" % cmdline)
+            elif xf:
+                xfail += 1
+                if verbose:
+                    print("KNOWN [flag] %s" % cmdline)
+            else:
+                failed += 1
+                print("FAIL  [flag] %s" % cmdline)
+                print("      want %r" % expect[:120])
+                print("      got  %r" % got[:120])
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+    print("=== flags: %d cases, %d failures, %d known differences" % (total, failed, xfail))
     return failed
 
 
