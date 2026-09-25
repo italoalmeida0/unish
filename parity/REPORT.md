@@ -10,6 +10,7 @@ rediscover any of it.
 |---|---|---|
 | Output parity (GNU oracle) | 372 | 0 failures, 9 documented wording deltas |
 | Flag cases (oracle at run time) | 192 | 0 failures, 49 known differences |
+| Per-command fixture cases | 51 | 0 failures, 2 known gaps |
 | Functional (does it DO it) | 21 | 0 failures, 5 known gaps |
 | Gaps: the 15 uncovered commands | 37 | 0 failures, 1 known gap |
 | End-to-end (real processes) | 38 | 0 failures |
@@ -18,20 +19,19 @@ rediscover any of it.
 
 CI runs all of it on Linux, macOS and Windows (9 jobs, all green).
 
-## Flag coverage: 192 of 503 (38%)
+## Flag coverage: 223 of 503 (44%), every command covered
 
-The audit measured 232 flags that work, 194 that are accepted and
-ignored, 46 needing setup and 31 skipped for safety. 192 now have a
-regression case.
+All 90 embedded commands now have at least one flag case. The 223 with a
+case are the ones a generic sweep or a hand-written fixture can set up
+honestly.
 
-The remaining ~310 are not a generator problem: each needs bespoke setup
-a generic sweep cannot invent — a real archive to extract (`tar -x`), a
-socket to connect (`nc`, `ss`), a process to signal (`pgrep`, `pkill`),
-two differing files (`diff`, `cmp`), a compressed file (`gunzip`). Those
-belong in per-command test files. 21 commands still have flags with no
-case: diff, cmp, ps, free, ss, pgrep, pkill, nc, netcat, env, nice,
-touch, xargs, timeout, shasum, gzip, gunzip, ln, hexdump, strings,
-expand.
+The remaining ~280 are not a coverage failure waiting to be fixed by
+more generation: each needs state a test cannot invent safely — a live
+socket (`nc`/`ss` beyond usage), another user's process, a filesystem
+with specific attributes (`chattr`-style flags), or a signal target that
+is not this machine's processes. Writing cases for them would mean
+asserting behaviour the test itself cannot establish, which is the
+theatre this campaign set out to avoid.
 
 ## Real findings in unish
 
@@ -66,6 +66,22 @@ background statements as real processes — a shell-core change.
 ### `expand -i` is not implemented
 
 GNU leaves leading tabs untouched with `-i`; unish rejects the flag.
+
+### `env -i` does not clear the environment
+
+`env -i printenv PATH` still prints the full PATH. The flag is parsed and
+discarded (`_ = ignore`), and the implementation calls `os.Clearenv` /
+`os.Setenv`, mutating the whole shell process instead of the child.
+
+### `pgrep`/`pkill` on macOS exit 2
+
+Where the process list cannot be read, they return 2; GNU returns 1 for
+"no match".
+
+### `ps` on macOS
+
+The header is BSD-style, so anything asserting the GNU header is not
+portable.
 
 ### `tee /dev/null` fails on Windows
 
