@@ -284,7 +284,9 @@ def oracle_path(cmd):
     for d in dirs:
         if not d:
             continue
-        for name in (cmd, cmd + ".exe"):
+        # Prefer the .exe: in Git Bash some tools (gunzip) are shell
+        # scripts, and CreateProcess cannot run those (WinError 193).
+        for name in (cmd + ".exe", cmd):
             p = os.path.join(d, name)
             if os.path.isfile(p):
                 return p

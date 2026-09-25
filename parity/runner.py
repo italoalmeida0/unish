@@ -291,7 +291,7 @@ def run_flag_cases(unish, oracle_spec, timeout, verbose):
     total = failed = xfail = gaps = 0
     work = tempfile.mkdtemp(prefix="flags_")
     try:
-        for argv, xf, files in FLAG_CASES:
+        for argv, xf, files, want_rc in FLAG_CASES:
             total += 1
             for name in os.listdir(work):
                 p_ = os.path.join(work, name)
@@ -322,6 +322,12 @@ def run_flag_cases(unish, oracle_spec, timeout, verbose):
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
             except subprocess.TimeoutExpired:
                 continue
+            except OSError:
+                # The oracle is a shell script (Git Bash gunzip) and cannot
+                # be exec'd directly; not a unish problem.
+                if verbose:
+                    print("skip  [flag] %s (oracle not executable)" % cmdline)
+                continue
             want = norm(op.stdout)
             # BSD tools (macOS) reject GNU long options and print nothing:
             # an empty oracle result means "this flag is not a GNU flag",
@@ -330,7 +336,7 @@ def run_flag_cases(unish, oracle_spec, timeout, verbose):
                 if verbose:
                     print("skip  [flag] %s (oracle rejects the flag here)" % cmdline)
                 continue
-            if got == want:
+            if got == want and p.returncode == want_rc:
                 if verbose:
                     print("ok    [flag] %s" % cmdline)
             elif argv[0] == "uname" and argv[1] in ("-p", "-i", "--processor", "--hardware-platform"):
