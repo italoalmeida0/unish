@@ -58,6 +58,17 @@ func cmdTar(_ context.Context, hc interp.HandlerContext, args []string) error {
 	base := hc.Dir
 	if *dir != "" {
 		base = resolve(hc.Dir, *dir)
+		fi, err := os.Stat(base)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "tar: %s: Cannot open: No such file or directory\n", *dir)
+			fmt.Fprintln(hc.Stderr, "tar: Error is not recoverable: exiting now")
+			return exitError{2}
+		}
+		if !fi.IsDir() {
+			fmt.Fprintf(hc.Stderr, "tar: %s: Cannot open: Not a directory\n", *dir)
+			fmt.Fprintln(hc.Stderr, "tar: Error is not recoverable: exiting now")
+			return exitError{2}
+		}
 	}
 	archive := resolve(hc.Dir, *file)
 	switch {

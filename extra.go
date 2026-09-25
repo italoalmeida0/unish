@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -11,9 +12,12 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"time"
 
+	"golang.org/x/term"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 )
@@ -118,7 +122,7 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 				return nil
 			}
 		}
-			hc := interp.HandlerCtx(ctx)
+		hc := interp.HandlerCtx(ctx)
 		err := cmd.main(ctx, hc, splitAttached(args[0], args))
 		if isPipeClosed(err) || isPipeClosed(ctx.Err()) {
 			// SIGPIPE semantics: downstream closed the pipe early
@@ -282,7 +286,10 @@ func callOverride(ctx context.Context, args []string) ([]string, error) {
 		// Bypass mvdan/sh's printf (no precision specs like %.0s).
 		hc := interp.HandlerCtx(ctx)
 		if err := cmdPrintf(ctx, hc, args); err != nil {
-			return []string{"false"}, nil
+			if ee, ok := err.(exitError); ok {
+				return []string{"true"}, interp.BuiltinExit(uint8(ee.code))
+			}
+			return []string{"true"}, interp.BuiltinExit(1)
 		}
 		return []string{"true"}, nil
 	case "hash":
@@ -316,6 +323,18 @@ func callOverride(ctx context.Context, args []string) ([]string, error) {
 			return []string{"false"}, nil
 		}
 		return []string{"true"}, nil
+	case "test", "[":
+		// Own GNU test implementation: the /dev/null family always
+		// exists (Windows has no such nodes) and diagnostics match GNU.
+		hc := interp.HandlerCtx(ctx)
+		switch err := runTest(hc, args); {
+		case err == nil:
+			return []string{"true"}, nil
+		case errors.Is(err, errTestFalse):
+			return []string{"false"}, nil
+		default:
+			return []string{"true"}, interp.BuiltinExit(2)
+		}
 	case "wait":
 		// Tracked externals wait here; everything else flows through
 		// to mvdan/sh's builtin (in-process jobs, real pids, errors).
@@ -567,7 +586,7 @@ func pinAX(m map[string]string) {
 		}
 		if _, dup := m["/var/log"]; !dup {
 			ld := filepath.Join(tmp, "unish-log")
-		// Create once so `cmd >> /var/log/x` never fails on a
+			// Create once so `cmd >> /var/log/x` never fails on a
 			// fresh machine; ignore errors (fallback: open fails
 			// loudly like bash would).
 			_ = os.MkdirAll(ld, 0o755)
@@ -592,7 +611,7 @@ func shellOpenHandler() interp.OpenHandlerFunc {
 		mc := interp.HandlerCtx(ctx)
 		if runtime.GOOS == "windows" && path == "/dev/null" {
 			path = "NUL"
-		flag &^= os.O_TRUNC
+			flag &^= os.O_TRUNC
 		} else if path != "" {
 			path = resolve(mc.Dir, path)
 		}
@@ -630,10 +649,14 @@ var flagSpecs = map[string]flagSpec{
 		"lines": "n", "bytes": "c", "quiet": "q", "silent": "q",
 		"verbose": "v", "follow": "f",
 	}},
-	"sort": {bools: "rufnczsV", values: "tko", long: map[string]string{
+	"sort": {bools: "rufnczsVbdighM", values: "tko", long: map[string]string{
 		"reverse": "r", "unique": "u", "ignore-case": "f", "numeric-sort": "n",
 		"check": "c", "key": "k", "zero-terminated": "z",
 		"stable": "s", "version-sort": "V", "output": "o",
+		"ignore-leading-blanks": "b", "field-separator": "t",
+		"dictionary-order": "d", "ignore-nonprinting": "i",
+		"general-numeric-sort": "g", "human-numeric-sort": "h",
+		"month-sort": "M",
 	}},
 	"uniq": {bools: "cduig", values: "fsw", long: map[string]string{
 		"count": "c", "repeated": "d", "unique": "u", "ignore-case": "i",
@@ -665,6 +688,7 @@ var flagSpecs = map[string]flagSpec{
 		"all": "a", "long": "l", "human-readable": "h", "directory": "d",
 		"recursive": "R", "classify": "F", "quoted": "Q",
 		"size": "S", "reverse": "r", "time": "t",
+		"full-time": "full-time", "time-style": "time-style",
 	}},
 	"comm": {bools: "123", values: ""},
 	"split": {bools: "dv", values: "labn", long: map[string]string{
@@ -760,7 +784,7 @@ var flagSpecs = map[string]flagSpec{
 	"ln": {bools: "sf", values: "", long: map[string]string{
 		"symbolic": "s", "force": "f",
 	}},
-	"date": {bools: "u", values: "d", long: map[string]string{"universal": "u", "utc": "u", "date": "d"}},
+	"date": {bools: "u", values: "dr", long: map[string]string{"universal": "u", "utc": "u", "date": "d", "reference": "r"}},
 	"uname": {bools: "amnrsvpi", values: "", long: map[string]string{
 		"all": "a", "machine": "m", "nodename": "n",
 		"release": "r", "sysname": "s",
@@ -1033,17 +1057,19 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	squeeze := fs.Bool("s", false, "")
 	showEnds := fs.Bool("E", false, "")
 	showTabs := fs.Bool("T", false, "")
+	showNonprint := fs.Bool("v", false, "")
 	showAll := fs.Bool("A", false, "")
 	fs.BoolVar(numAll, "number", false, "")
 	fs.BoolVar(numNonBlank, "number-nonblank", false, "")
 	fs.BoolVar(squeeze, "squeeze-blank", false, "")
 	fs.BoolVar(showEnds, "show-ends", false, "")
 	fs.BoolVar(showTabs, "show-tabs", false, "")
+	fs.BoolVar(showNonprint, "show-nonprinting", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *showAll {
-		*showEnds, *showTabs = true, true
+		*showEnds, *showTabs, *showNonprint = true, true, true
 	}
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
@@ -1051,7 +1077,7 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	defer closeAll()
-	if !*numAll && !*numNonBlank && !*squeeze && !*showEnds && !*showTabs {
+	if !*numAll && !*numNonBlank && !*squeeze && !*showEnds && !*showTabs && !*showNonprint {
 		for _, r := range readers {
 			if _, err := io.Copy(hc.Stdout, r); err != nil {
 				fmt.Fprintln(hc.Stderr, "cat:", err)
@@ -1072,18 +1098,25 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 			}
 			prevBlank = blank
 			out := line
+			if *showNonprint {
+				out = catVisible(out)
+			}
 			if *showTabs {
 				out = strings.ReplaceAll(out, "\t", "^I")
 			}
-			if *showEnds {
+			if *showEnds && sc.EndedWithNewline() {
 				out += "$"
+			}
+			nl := "\n"
+			if !sc.EndedWithNewline() {
+				nl = ""
 			}
 			number := *numAll || (*numNonBlank && !blank)
 			if number {
 				ln++
-				fmt.Fprintf(hc.Stdout, "%6d\t%s\n", ln, out)
+				fmt.Fprintf(hc.Stdout, "%6d\t%s%s", ln, out, nl)
 			} else {
-				fmt.Fprintln(hc.Stdout, out)
+				fmt.Fprint(hc.Stdout, out+nl)
 			}
 		}
 		if err := sc.Err(); err != nil {
@@ -1094,10 +1127,349 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
+// catVisible renders control and 8-bit bytes like GNU cat -v: ^X for
+// controls, ^? for DEL, M-x / M-^X for high-bit bytes.
+func catVisible(s string) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == 127:
+			b.WriteString("^?")
+		case c < 32:
+			b.WriteByte('^')
+			b.WriteByte(c + 64)
+		case c >= 128:
+			b.WriteString("M-")
+			x := c - 128
+			switch {
+			case x == 127:
+				b.WriteString("^?")
+			case x < 32:
+				b.WriteByte('^')
+				b.WriteByte(x + 64)
+			default:
+				b.WriteByte(x)
+			}
+		default:
+			b.WriteByte(c)
+		}
+	}
+	return b.String()
+}
+
 func cmdPwd(_ context.Context, hc interp.HandlerContext, args []string) error {
 	_ = args
 	fmt.Fprintln(hc.Stdout, hc.Dir)
 	return nil
+}
+
+// ---- test / [ builtin ----
+
+var errTestFalse = errors.New("test false")
+var errTestUsage = errors.New("test usage error")
+
+// runTest implements the test/[ builtin with GNU semantics, including
+// the /dev/null device family (which does not exist on Windows).
+// A nil return means the expression is true.
+func runTest(hc interp.HandlerContext, args []string) error {
+	a := args[1:]
+	if args[0] == "[" {
+		if len(a) == 0 || a[len(a)-1] != "]" {
+			fmt.Fprintln(hc.Stderr, "[: missing `]'")
+			return errTestUsage
+		}
+		a = a[:len(a)-1]
+	}
+	if len(a) == 0 {
+		return errTestFalse
+	}
+	t := &testParser{hc: hc, toks: a}
+	ok, err := t.orExpr()
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+		return errTestUsage
+	}
+	if t.pos != len(t.toks) {
+		fmt.Fprintf(hc.Stderr, "%s: too many arguments\n", args[0])
+		return errTestUsage
+	}
+	if !ok {
+		return errTestFalse
+	}
+	return nil
+}
+
+type testParser struct {
+	hc   interp.HandlerContext
+	toks []string
+	pos  int
+}
+
+func (t *testParser) peek() string {
+	if t.pos < len(t.toks) {
+		return t.toks[t.pos]
+	}
+	return ""
+}
+
+func (t *testParser) orExpr() (bool, error) {
+	left, err := t.andExpr()
+	if err != nil {
+		return false, err
+	}
+	for t.peek() == "-o" {
+		t.pos++
+		right, err := t.andExpr()
+		if err != nil {
+			return false, err
+		}
+		left = left || right
+	}
+	return left, nil
+}
+
+func (t *testParser) andExpr() (bool, error) {
+	left, err := t.notExpr()
+	if err != nil {
+		return false, err
+	}
+	for t.peek() == "-a" {
+		t.pos++
+		right, err := t.notExpr()
+		if err != nil {
+			return false, err
+		}
+		left = left && right
+	}
+	return left, nil
+}
+
+func (t *testParser) notExpr() (bool, error) {
+	if t.peek() == "!" {
+		t.pos++
+		v, err := t.notExpr()
+		return !v, err
+	}
+	return t.primary()
+}
+
+func (t *testParser) primary() (bool, error) {
+	if t.peek() == "(" {
+		t.pos++
+		v, err := t.orExpr()
+		if err != nil {
+			return false, err
+		}
+		if t.peek() != ")" {
+			return false, errors.New("expected `)'")
+		}
+		t.pos++
+		return v, nil
+	}
+	if t.peek() == ")" {
+		return false, errors.New("unexpected `)'")
+	}
+	// Operands available before a closing paren (GNU test quirk: [ '(' x ')' ]).
+	avail := 0
+	for t.pos+avail < len(t.toks) && t.toks[t.pos+avail] != ")" {
+		avail++
+	}
+	switch avail {
+	case 1:
+		t.pos++
+		return t.toks[t.pos-1] != "", nil
+	case 2:
+		op, arg := t.toks[t.pos], t.toks[t.pos+1]
+		t.pos += 2
+		return testUnary(t.hc, op, arg)
+	default:
+		a, op, b := t.toks[t.pos], t.toks[t.pos+1], t.toks[t.pos+2]
+		if isTestBinaryOp(op) {
+			t.pos += 3
+			return testBinary(t.hc, a, op, b)
+		}
+		// GNU: with 3 tokens and no operator this is "missing argument".
+		if a == "!" || isTestUnaryOp(a) {
+			t.pos += 2
+			v, err := testUnary(t.hc, a, b)
+			return v, err
+		}
+		return false, errors.New("binary operator expected")
+	}
+}
+
+func isTestUnaryOp(op string) bool {
+	switch op {
+	case "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-L", "-p",
+		"-r", "-s", "-S", "-t", "-w", "-x", "-O", "-G", "-N",
+		"-n", "-z":
+		return true
+	}
+	return false
+}
+
+func isTestBinaryOp(op string) bool {
+	switch op {
+	case "=", "==", "!=", "-eq", "-ne", "-lt", "-le", "-gt", "-ge",
+		"-nt", "-ot", "-ef":
+		return true
+	}
+	return false
+}
+
+// testDevNodes are the device files that must exist even on Windows.
+var testDevNodes = map[string]bool{
+	"/dev/null": true, "/dev/zero": true, "/dev/stdin": true,
+	"/dev/stdout": true, "/dev/stderr": true,
+}
+
+type testFile struct {
+	exists  bool
+	mode    os.FileMode
+	size    int64
+	modTime time.Time
+	synth   bool // synthesized device node (no real stat)
+}
+
+func testStat(hc interp.HandlerContext, path string) testFile {
+	if testDevNodes[strings.ToLower(path)] {
+		if _, err := os.Stat(resolve(hc.Dir, path)); err != nil {
+			return testFile{exists: true, mode: os.ModeDevice | os.ModeCharDevice, synth: true}
+		}
+	}
+	fi, err := os.Stat(resolve(hc.Dir, path))
+	if err != nil {
+		return testFile{}
+	}
+	return testFile{exists: true, mode: fi.Mode(), size: fi.Size(), modTime: fi.ModTime()}
+}
+
+func testUnary(hc interp.HandlerContext, op, arg string) (bool, error) {
+	switch op {
+	case "-n":
+		return arg != "", nil
+	case "-z":
+		return arg == "", nil
+	case "-t":
+		fd, err := strconv.Atoi(arg)
+		if err != nil {
+			return false, errors.New("integer expression expected")
+		}
+		return term.IsTerminal(fd), nil
+	}
+	tf := testStat(hc, arg)
+	if op == "-e" {
+		return tf.exists, nil
+	}
+	if !tf.exists {
+		return false, nil
+	}
+	switch op {
+	case "-f":
+		return tf.mode.IsRegular(), nil
+	case "-d":
+		return tf.mode.IsDir(), nil
+	case "-b":
+		return tf.mode&os.ModeDevice != 0 && tf.mode&os.ModeCharDevice == 0, nil
+	case "-c":
+		return tf.mode&os.ModeCharDevice != 0, nil
+	case "-h", "-L":
+		return tf.mode&os.ModeSymlink != 0, nil
+	case "-p":
+		return tf.mode&os.ModeNamedPipe != 0, nil
+	case "-S":
+		return tf.mode&os.ModeSocket != 0, nil
+	case "-s":
+		return tf.size > 0, nil
+	case "-r":
+		if tf.synth {
+			return true, nil
+		}
+		f, err := os.Open(resolve(hc.Dir, arg))
+		if err == nil {
+			f.Close()
+		}
+		return err == nil, nil
+	case "-w":
+		if tf.synth {
+			return true, nil
+		}
+		f, err := os.OpenFile(resolve(hc.Dir, arg), os.O_WRONLY, 0)
+		if err == nil {
+			f.Close()
+		}
+		return err == nil, nil
+	case "-x":
+		if tf.synth {
+			return false, nil
+		}
+		return tf.mode.Perm()&0111 != 0, nil
+	case "-O":
+		return true, nil // best-effort: no uid tracking
+	case "-G":
+		return true, nil
+	case "-N":
+		return false, nil // best-effort: assume not modified since read
+	}
+	return false, fmt.Errorf("unary operator expected")
+}
+
+func testBinary(hc interp.HandlerContext, a, op, b string) (bool, error) {
+	switch op {
+	case "=", "==":
+		return a == b, nil
+	case "!=":
+		return a != b, nil
+	case "-eq", "-ne", "-lt", "-le", "-gt", "-ge":
+		x, err1 := strconv.ParseInt(strings.TrimSpace(a), 0, 64)
+		y, err2 := strconv.ParseInt(strings.TrimSpace(b), 0, 64)
+		if err1 != nil {
+			return false, fmt.Errorf("%s: integer expression expected", a)
+		}
+		if err2 != nil {
+			return false, fmt.Errorf("%s: integer expression expected", b)
+		}
+		switch op {
+		case "-eq":
+			return x == y, nil
+		case "-ne":
+			return x != y, nil
+		case "-lt":
+			return x < y, nil
+		case "-le":
+			return x <= y, nil
+		case "-gt":
+			return x > y, nil
+		default:
+			return x >= y, nil
+		}
+	case "-nt", "-ot", "-ef":
+		ta, tb := testStat(hc, a), testStat(hc, b)
+		if !ta.exists {
+			return false, nil
+		}
+		if op == "-ef" {
+			if !tb.exists {
+				return false, nil
+			}
+			fa, _ := os.Stat(resolve(hc.Dir, a))
+			fb, _ := os.Stat(resolve(hc.Dir, b))
+			if fa == nil || fb == nil {
+				return false, nil
+			}
+			return os.SameFile(fa, fb), nil
+		}
+		if !tb.exists {
+			return op == "-nt", nil
+		}
+		if op == "-nt" {
+			return ta.modTime.After(tb.modTime), nil
+		}
+		return ta.modTime.Before(tb.modTime), nil
+	}
+	return false, errors.New("binary operator expected")
 }
 
 func cmdTrue(_ context.Context, _ interp.HandlerContext, _ []string) error {
@@ -1429,6 +1801,7 @@ func isPipeClosed(err error) bool {
 	msg := err.Error()
 	for _, s := range []string{
 		"The pipe is being closed",
+		"The pipe has been ended", // Go on Windows, head -c path
 		"broken pipe",
 		"pipe is closed",
 		"EPIPE",

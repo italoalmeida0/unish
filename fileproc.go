@@ -30,11 +30,19 @@ func cmdDirname(_ context.Context, hc interp.HandlerContext, args []string) erro
 		// filepath.Dir cleans it away (Dir("./a/b") == "a").
 		prefix := ""
 		q := p
-		if strings.Trim(q, "/") != "" {
-			q = strings.TrimSuffix(p, "/")
-		}
 		if strings.HasPrefix(q, "./") {
 			prefix = "./"
+			q = q[2:]
+		}
+		// GNU strips ALL trailing slashes before taking the directory.
+		q = strings.TrimRight(q, "/")
+		if q == "" {
+			if p != "" && strings.Trim(p, "/") == "" {
+				fmt.Fprintln(hc.Stdout, "/")
+			} else {
+				fmt.Fprintln(hc.Stdout, ".")
+			}
+			continue
 		}
 		d := filepath.ToSlash(filepath.Dir(q))
 		if prefix != "" && d != "." && d != "/" {
@@ -62,10 +70,33 @@ func cmdBasename(_ context.Context, hc interp.HandlerContext, args []string) err
 		paths = paths[:len(paths)-1]
 	}
 	for _, p := range paths {
-		base := filepath.Base(strings.TrimSuffix(p, "/"))
-		fmt.Fprintln(hc.Stdout, strings.TrimSuffix(base, *suffix))
+		base := gnuBasename(p)
+		out := base
+		// GNU only strips SUFFIX when it is strictly shorter than the
+		// base name (basename c c -> "c").
+		if *suffix != "" && len(*suffix) < len(out) && strings.HasSuffix(out, *suffix) {
+			out = strings.TrimSuffix(out, *suffix)
+		}
+		fmt.Fprintln(hc.Stdout, out)
 	}
 	return nil
+}
+
+// gnuBasename implements the POSIX basename(1) path trimming: trailing
+// slashes go away ("a/b///" -> "b"), all-slash names become "/", and an
+// empty name stays empty.
+func gnuBasename(p string) string {
+	if p == "" {
+		return ""
+	}
+	trimmed := strings.TrimRight(p, "/")
+	if trimmed == "" {
+		return "/"
+	}
+	if i := strings.LastIndexAny(trimmed, `/\`); i >= 0 {
+		trimmed = trimmed[i+1:]
+	}
+	return trimmed
 }
 
 func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -462,6 +493,19 @@ func cmdDate(_ context.Context, hc interp.HandlerContext, args []string) error {
 			}
 			// Keep wall clock, like GNU -d (no forced zone shift).
 			now = t
+		case a == "-r" || a == "--reference":
+			// GNU date -r FILE: use FILE's modification time.
+			if k+1 >= len(argv) {
+				fmt.Fprintln(hc.Stderr, "date: option requires an argument -- 'r'")
+				return exitError{1}
+			}
+			k++
+			fi, err := os.Stat(resolve(hc.Dir, argv[k]))
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "date: %s: No such file or directory\n", argv[k])
+				return exitError{1}
+			}
+			now = fi.ModTime()
 		case strings.HasPrefix(a, "+"):
 			format = a[1:]
 		}
@@ -694,6 +738,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	maxdepth := -1
 	mindepth := 0
 	hasAction := false
+	stop := false // set when stdout pipe closes (head -c/N): abort walk
 
 	pos := 0
 	peek := func() string {
@@ -741,6 +786,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	var parseAnd func() findPredicate
 	var parseNot func() findPredicate
 	var parsePrimary func() findPredicate
+	var parseErr error
 
 	parseOr = func() findPredicate {
 		left := parseAnd()
@@ -974,13 +1020,21 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-print":
 			hasAction = true
 			return func(n *findNode, hc interp.HandlerContext) bool {
-				fmt.Fprintln(hc.Stdout, filepath.ToSlash(n.display))
+				if _, err := fmt.Fprintln(hc.Stdout, filepath.ToSlash(n.display)); err != nil {
+					if isPipeClosed(err) {
+						stop = true
+					}
+				}
 				return true
 			}
 		case "-print0":
 			hasAction = true
 			return func(n *findNode, hc interp.HandlerContext) bool {
-				fmt.Fprintf(hc.Stdout, "%s\x00", filepath.ToSlash(n.display))
+				if _, err := fmt.Fprintf(hc.Stdout, "%s\x00", filepath.ToSlash(n.display)); err != nil {
+					if isPipeClosed(err) {
+						stop = true
+					}
+				}
 				return true
 			}
 		case "-delete":
@@ -1015,6 +1069,10 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 		case "-perm":
 			modeStr := next()
+			if !validPermSpec(modeStr) {
+				fmt.Fprintf(hc.Stderr, "find: invalid mode \u2018%s\u2019\n", modeStr)
+				parseErr = fmt.Errorf("invalid mode")
+			}
 			return func(n *findNode, _ interp.HandlerContext) bool {
 				return matchPerm(n, modeStr)
 			}
@@ -1035,9 +1093,8 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-false":
 			return func(*findNode, interp.HandlerContext) bool { return false }
 		default:
-			if strings.HasPrefix(tok, "-") {
-				fmt.Fprintf(hc.Stderr, "find: unknown predicate `%s`\n", tok)
-			}
+			fmt.Fprintf(hc.Stderr, "find: unknown predicate `%s'\n", tok)
+			parseErr = fmt.Errorf("unknown predicate")
 			return func(*findNode, interp.HandlerContext) bool { return true }
 		}
 	}
@@ -1048,11 +1105,16 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	} else {
 		rootPred = func(*findNode, interp.HandlerContext) bool { return true }
 	}
+	if parseErr != nil {
+		// GNU find reports the bad predicate and exits 1 without any
+		// traversal output.
+		return exitError{1}
+	}
 
 	code := 0
 	for _, p := range paths {
 		full := resolve(hc.Dir, p)
-		walkFind(ctx, hc, p, full, 0, maxdepth, mindepth, rootPred, hasAction, &code)
+		walkFind(ctx, hc, p, full, 0, maxdepth, mindepth, rootPred, hasAction, &code, &stop)
 	}
 	if code != 0 {
 		return exitError{code}
@@ -1060,8 +1122,8 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return nil
 }
 
-func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth, maxdepth, mindepth int, pred findPredicate, hasAction bool, code *int) {
-	if ctx.Err() != nil {
+func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth, maxdepth, mindepth int, pred findPredicate, hasAction bool, code *int, stop *bool) {
+	if ctx.Err() != nil || (stop != nil && *stop) {
 		return
 	}
 	fi, err := os.Lstat(full)
@@ -1078,7 +1140,12 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 	}
 	match := pred(&node, hc)
 	if match && !hasAction && depth >= mindepth {
-		fmt.Fprintln(hc.Stdout, filepath.ToSlash(display))
+		if _, err := fmt.Fprintln(hc.Stdout, filepath.ToSlash(display)); err != nil {
+			if isPipeClosed(err) {
+				*stop = true
+				return
+			}
+		}
 	}
 	if !fi.IsDir() || node.pruned {
 		return
@@ -1093,6 +1160,9 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		return
 	}
 	for _, e := range entries {
+		if stop != nil && *stop {
+			return
+		}
 		subDisplay := display
 		if subDisplay == "." {
 			subDisplay = "./" + e.Name()
@@ -1101,7 +1171,7 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		} else {
 			subDisplay = subDisplay + "/" + e.Name()
 		}
-		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code)
+		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code, stop)
 	}
 }
 
@@ -1387,6 +1457,29 @@ func validSignalNumber(n string) bool {
 		return true
 	}
 	return false
+}
+
+// validPermSpec reports whether a find -perm MODE operand parses.
+func validPermSpec(spec string) bool {
+	s := strings.TrimLeft(spec, "-/")
+	if s == "" {
+		return false
+	}
+	if _, err := strconv.ParseUint(s, 8, 32); err == nil {
+		return true
+	}
+	for _, clause := range strings.Split(spec, ",") {
+		op := strings.IndexAny(clause, "+-=")
+		if op <= 0 {
+			return false
+		}
+		for _, c := range clause[op+1:] {
+			if c != 'r' && c != 'w' && c != 'x' && c != 'X' && c != 's' && c != 't' && c != 'u' && c != 'g' && c != 'o' {
+				return false
+			}
+		}
+	}
+	return true
 }
 
 // matchPerm implements find -perm MODE: exact match (644), all-bits

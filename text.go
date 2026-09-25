@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -21,13 +22,13 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 	var (
 		count, filesOnly, fixed, ignoreCase, invert, lineNum,
 		noName, quiet, recursive, extended, onlyMatch bool
-		lineRegexp, wordRegexp, withName, noMessages bool
-		label                                        string
-		patterns                                     []string
-		patternFiles                                 []string
-		maxCount, after, before, context_            uint64
-		excludes, includes, excludeDirs              stringList
-		positionals                                  []string
+		lineRegexp, wordRegexp, withName, noMessages, textMode bool
+		label                                                  string
+		patterns                                               []string
+		patternFiles                                           []string
+		maxCount, after, before, context_                      uint64
+		excludes, includes, excludeDirs                        stringList
+		positionals                                            []string
 	)
 	uintVal := func(v string) (uint64, error) {
 		n, err := strconv.ParseUint(v, 10, 64)
@@ -145,8 +146,7 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 				onlyMatch = true
 			case "text", "a":
 				// GNU -a/--text: process binary files as text.
-				// This is already the default behavior (no NUL
-				// short-circuit skips content), so just accept it.
+				textMode = true
 			case "devices", "directories", "binary-files", "D", "d", "I", "U":
 				// Accepted for compatibility; consume optional value.
 				if !hasVal && i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
@@ -196,6 +196,7 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 			case 'R':
 				recursive = true
 			case 'a':
+				textMode = true
 			case 'E':
 				extended = true
 			case 'o':
@@ -407,6 +408,7 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 	// descending into a directory (-r with a FILE operand behaves like a
 	// direct file search: no filename prefix).
 	descendedDir := false
+	grepStop := false
 	if recursive {
 		for _, f := range rest {
 			if f == "" || f == "-" {
@@ -424,13 +426,16 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	emit := func(name string, r io.Reader) {
 		disp := name
+		if name == "" || name == "-" || name == "/dev/stdin" || name == "standard input" {
+			disp = "(standard input)"
+		}
 		if label != "" && (name == "" || name == "standard input" || name == "-") {
 			disp = label
 			showName = true
 		}
-		// GNU: a matching BINARY file prints "Binary file X matches"
-		// instead of raw bytes (unless -a given, which we treat as text).
-		if name != "" && name != "-" && !quiet && !count && !filesOnly {
+		// GNU: a matching BINARY file prints "binary file matches" instead
+		// of raw bytes (unless -a/--text is given).
+		if !quiet && !count && !filesOnly && !textMode {
 			if data, err := io.ReadAll(r); err == nil {
 				if bytes.IndexByte(data, 0) >= 0 {
 					if reMatchAny(re, invert, data) {
@@ -439,13 +444,19 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 					}
 					return
 				}
-				m, _ := grepReaderWord(hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, int(maxCount), int(after), int(before), bytes.NewReader(data))
+				m, gerr := grepReaderWord(hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, int(maxCount), int(after), int(before), bytes.NewReader(data))
 				matchedAny = matchedAny || m
+				if gerr != nil && isPipeClosed(gerr) {
+					grepStop = true
+				}
 				return
 			}
 		}
-		m, _ := grepReaderWord(hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, int(maxCount), int(after), int(before), r)
+		m, gerr := grepReaderWord(hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, int(maxCount), int(after), int(before), r)
 		matchedAny = matchedAny || m
+		if gerr != nil && isPipeClosed(gerr) {
+			grepStop = true
+		}
 	}
 	if len(files) == 0 {
 		if !recursive && len(rest) == 0 {
@@ -453,6 +464,9 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	} else {
 		for _, f := range files {
+			if grepStop {
+				break
+			}
 			if f == "" || f == "-" || f == "/dev/stdin" {
 				emit("", hc.Stdin)
 				continue
@@ -534,17 +548,19 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 	printed := 0
 	// GNU context format: match lines use ":" separators, context
 	// lines use "-" (e.g. "12: match" vs "11- context").
-	printLine := func(ln int, line string, isMatch bool) {
+	printLine := func(ln int, line string, isMatch bool) bool {
 		if quiet {
-			return
+			return true
 		}
 		if filesOnly {
-			fmt.Fprintln(hc.Stdout, name)
-			return
+			if _, err := fmt.Fprintln(hc.Stdout, name); err != nil && isPipeClosed(err) {
+				return false
+			}
+			return true
 		}
 		if count {
 			matched++
-			return
+			return true
 		}
 		if onlyMatch {
 			for _, m := range re.FindAllString(line, -1) {
@@ -552,12 +568,16 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 					continue
 				}
 				if lineNum {
-					fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, m)
+					if _, err := fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, m); err != nil && isPipeClosed(err) {
+						return false
+					}
 				} else {
-					fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, m)
+					if _, err := fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, m); err != nil && isPipeClosed(err) {
+						return false
+					}
 				}
 			}
-			return
+			return true
 		}
 		// GNU markers: with -n, "12:match"/"11-context"; with a
 		// filename, "f:12:match"/"f-11-context"; otherwise no marker.
@@ -566,12 +586,19 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 			if (after > 0 || before > 0) && !isMatch {
 				sep = "-"
 			}
-			fmt.Fprintf(hc.Stdout, "%s%d%s%s\n", prefix, ln, sep, line)
+			if _, err := fmt.Fprintf(hc.Stdout, "%s%d%s%s\n", prefix, ln, sep, line); err != nil && isPipeClosed(err) {
+				return false
+			}
 		} else if prefix != "" && (after > 0 || before > 0) && !isMatch {
-			fmt.Fprintf(hc.Stdout, "%s-%s\n", prefix, line)
+			if _, err := fmt.Fprintf(hc.Stdout, "%s-%s\n", prefix, line); err != nil && isPipeClosed(err) {
+				return false
+			}
 		} else {
-			fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, line)
+			if _, err := fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, line); err != nil && isPipeClosed(err) {
+				return false
+			}
 		}
+		return true
 	}
 	ln := 0
 	lastOut := 0
@@ -596,11 +623,15 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 				fmt.Fprintln(hc.Stdout, "--")
 			}
 			for _, pl := range pending {
-				printLine(pl.ln, pl.text, false)
+				if !printLine(pl.ln, pl.text, false) {
+					return matchedAny, epipeErr{}
+				}
 				lastOut = pl.ln
 			}
 			pending = nil
-			printLine(ln, line, true)
+			if !printLine(ln, line, true) {
+				return matchedAny, epipeErr{}
+			}
 			lastOut = ln
 			sinceMatch = 0
 			printed++
@@ -614,7 +645,9 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 			if sinceMatch >= 0 {
 				sinceMatch++
 				if sinceMatch <= after {
-					printLine(ln, line, false)
+					if !printLine(ln, line, false) {
+						return matchedAny, epipeErr{}
+					}
 					lastOut = ln
 				} else {
 					sinceMatch = -1
@@ -654,9 +687,13 @@ func grepReaderWord(hc interp.HandlerContext, name string, showName bool, re *re
 			if len(subs) == 0 {
 				matchedAny = true
 				if lineNum {
-					fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, line)
+					if _, err := fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, line); err != nil && isPipeClosed(err) {
+						return matchedAny, epipeErr{}
+					}
 				} else {
-					fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, line)
+					if _, err := fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, line); err != nil && isPipeClosed(err) {
+						return matchedAny, epipeErr{}
+					}
 				}
 			}
 			continue
@@ -670,9 +707,13 @@ func grepReaderWord(hc interp.HandlerContext, name string, showName bool, re *re
 				return true, nil
 			}
 			if lineNum {
-				fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, m[1])
+				if _, err := fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, m[1]); err != nil && isPipeClosed(err) {
+					return matchedAny, epipeErr{}
+				}
 			} else {
-				fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, m[1])
+				if _, err := fmt.Fprintf(hc.Stdout, "%s%s\n", prefix, m[1]); err != nil && isPipeClosed(err) {
+					return matchedAny, epipeErr{}
+				}
 			}
 		}
 	}
@@ -781,7 +822,11 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 		sc := newLineReader(r)
 		var c uint64
 		for c < n && sc.Scan() {
-			fmt.Fprintln(hc.Stdout, sc.Text())
+			nl := "\n"
+			if !sc.EndedWithNewline() {
+				nl = ""
+			}
+			fmt.Fprint(hc.Stdout, sc.Text()+nl)
 			c++
 		}
 		if err := sc.Err(); err != nil {
@@ -921,7 +966,11 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			for sc.Scan() {
 				ln++
 				if ln >= fromLine {
-					fmt.Fprintln(hc.Stdout, sc.Text())
+					nl := "\n"
+					if !sc.EndedWithNewline() {
+						nl = ""
+					}
+					fmt.Fprint(hc.Stdout, sc.Text()+nl)
 				}
 			}
 			if err := sc.Err(); err != nil {
@@ -935,10 +984,12 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			continue
 		}
 		ring := make([]string, n)
+		ringNL := make([]bool, n)
 		var count, pos uint64
 		sc := newLineReader(r)
 		for sc.Scan() {
 			ring[pos] = sc.Text()
+			ringNL[pos] = sc.EndedWithNewline()
 			pos = (pos + 1) % n
 			count++
 		}
@@ -955,7 +1006,12 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			shown = n
 		}
 		for k := uint64(0); k < shown; k++ {
-			fmt.Fprintln(hc.Stdout, ring[(start+k)%n])
+			i := (start + k) % n
+			nl := "\n"
+			if k == shown-1 && !ringNL[i] {
+				nl = ""
+			}
+			fmt.Fprint(hc.Stdout, ring[i]+nl)
 		}
 	}
 	return nil
@@ -963,6 +1019,9 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 
 func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("sort", hc.Stderr)
+	var keyFlagVals sortKeyFlagList
+	fs.Var(&keyFlagVals, "k", "")
+	fs.Var(&keyFlagVals, "key", "")
 	reverse := fs.Bool("r", false, "")
 	unique := fs.Bool("u", false, "")
 	ignoreCase := fs.Bool("f", false, "")
@@ -971,15 +1030,84 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	stable := fs.Bool("s", false, "")
 	zeroTerm := fs.Bool("z", false, "")
 	fs.BoolVar(zeroTerm, "zero-terminated", false, "")
+	skipBlank := fs.Bool("b", false, "")
+	fs.BoolVar(skipBlank, "ignore-leading-blanks", false, "")
+	dictOrder := fs.Bool("d", false, "")
+	fs.BoolVar(dictOrder, "dictionary-order", false, "")
+	nonprint := fs.Bool("i", false, "")
+	fs.BoolVar(nonprint, "ignore-nonprinting", false, "")
+	general := fs.Bool("g", false, "")
+	fs.BoolVar(general, "general-numeric-sort", false, "")
+	human := fs.Bool("h", false, "")
+	fs.BoolVar(human, "human-numeric-sort", false, "")
+	month := fs.Bool("M", false, "")
+	fs.BoolVar(month, "month-sort", false, "")
 	sep := fs.String("t", "", "")
-	key := fs.String("k", "", "")
+	fs.StringVar(sep, "field-separator", "", "")
 	outFile := fs.String("o", "", "")
+	fs.StringVar(outFile, "output", "", "")
 	versionSort := fs.Bool("V", false, "")
 	fs.BoolVar(versionSort, "version-sort", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	_ = stable // SliceStable below is already stable; flag accepted for parity.
+	mode := sortModeByte
+	modeFlags := 0
+	for _, m := range []struct {
+		on  bool
+		m   int
+		tag string
+	}{{*numeric, sortModeNumeric, "n"}, {*general, sortModeGeneral, "g"},
+		{*human, sortModeHuman, "h"}, {*month, sortModeMonth, "M"},
+		{*versionSort, sortModeVersion, "V"}} {
+		if m.on {
+			modeFlags++
+			mode = m.m
+		}
+	}
+	if modeFlags > 1 {
+		var tags string
+		for _, m := range []struct {
+			on  bool
+			tag string
+		}{{*numeric, "n"}, {*general, "g"}, {*human, "h"}, {*month, "M"}, {*versionSort, "V"}} {
+			if m.on {
+				tags += m.tag
+			}
+		}
+		fmt.Fprintf(hc.Stderr, "sort: options '-%s' are incompatible\n", tags)
+		return exitError{2}
+	}
+	if *sep != "" {
+		if n := len([]rune(*sep)); n > 1 {
+			fmt.Fprintf(hc.Stderr, "sort: multi-character tab \u2018%s\u2019\n", *sep)
+			return exitError{2}
+		}
+	}
+	var specs []sortKeySpec
+	for _, ks := range keyFlagVals {
+		sp, err := parseSortKeySpec(ks)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "sort: invalid key \u2018%s\u2019\n", ks)
+			return exitError{2}
+		}
+		specs = append(specs, sp)
+	}
+	cfg := sortConfig{
+		specs:     specs,
+		sep:       *sep,
+		mode:      mode,
+		reverse:   *reverse,
+		fold:      *ignoreCase,
+		skipBlank: *skipBlank,
+		stable:    *stable,
+		unique:    *unique,
+		dict:      *dictOrder,
+		nonprint:  *nonprint,
+	}
+	if len(cfg.specs) == 0 {
+		cfg.specs = []sortKeySpec{{}} // implicit whole-line key
+	}
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "sort:", err)
@@ -996,70 +1124,10 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 			lines = append(lines, rec)
 		}
 	}
-	keySpec := parseSortKey(*key)
-	keyFn := func(s string) string {
-		if keySpec != nil {
-			return sortKeyField(s, *sep, keySpec)
-		}
-		if *sep != "" {
-			if i := strings.Index(s, *sep); i >= 0 {
-				s = s[:i]
-			}
-		}
-		if *ignoreCase {
-			s = strings.ToLower(s)
-		}
-		return s
-	}
-	less := func(a, b sortItem) bool {
-		if *versionSort {
-			c := compareVersion(a.line, b.line)
-			if c != 0 {
-				if *reverse {
-					return c > 0
-				}
-				return c < 0
-			}
-			if a.line != b.line {
-				if *reverse {
-					return a.line > b.line
-				}
-				return a.line < b.line
-			}
-			return false
-		}
-		x, y := a.key, b.key
-		num := *numeric
-		rev := *reverse
-		if keySpec != nil {
-			num = keySpec.numeric || num
-			if keySpec.reverse {
-				rev = !rev
-			}
-		}
-		if num {
-			if a.num != b.num {
-				if rev {
-					return a.num > b.num
-				}
-				return a.num < b.num
-			}
-			if x != y {
-				if rev {
-					return x > y
-				}
-				return x < y
-			}
-			return false
-		}
-		if rev {
-			return x > y
-		}
-		return x < y
-	}
+	// keyEqual and less are defined below via sortConfig.
 	if *check {
 		for i := 1; i < len(lines); i++ {
-			if less(sortItem{lines[i], keyFn(lines[i]), numKey(keyFn(lines[i]))}, sortItem{lines[i-1], keyFn(lines[i-1]), numKey(keyFn(lines[i-1]))}) {
+			if cfg.compare(lines[i], lines[i-1]) < 0 || (*unique && cfg.keysEqual(lines[i], lines[i-1])) {
 				name := "-"
 				if len(fs.Args()) > 0 {
 					name = fs.Args()[0]
@@ -1070,12 +1138,7 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		return nil
 	}
-	items := make([]sortItem, len(lines))
-	for i, l := range lines {
-		k := keyFn(l)
-		items[i] = sortItem{line: l, key: k, num: numKey(k)}
-	}
-	sort.SliceStable(items, func(i, j int) bool { return less(items[i], items[j]) })
+	sort.SliceStable(lines, func(i, j int) bool { return cfg.compare(lines[i], lines[j]) < 0 })
 	var out io.Writer = hc.Stdout
 	if *outFile != "" {
 		p := resolve(hc.Dir, *outFile)
@@ -1087,10 +1150,10 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 		defer f.Close()
 		out = f
 	}
-	prev := ""
-	for i, it := range items {
-		l := it.line
-		if *unique && i > 0 && l == prev {
+	var prev string
+	havePrev := false
+	for _, l := range lines {
+		if *unique && havePrev && cfg.keysEqual(prev, l) {
 			continue
 		}
 		if *zeroTerm {
@@ -1099,75 +1162,156 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 		} else {
 			fmt.Fprintln(out, l)
 		}
-		prev = l
+		prev, havePrev = l, true
 	}
 	return nil
 }
 
-// compareVersion implements GNU sort -V (version sort): splits strings
-// into alternating digit/non-digit runs; digit runs compare numerically
-// (leading zeros ignored, longer-wins on tie), other runs compare
-// byte-wise. Empty compares less than non-empty.
+// compareVersion implements GNU sort -V / ls -v version ordering, a
+// faithful port of gnulib's filevercmp/filenvercmp. It first cuts a
+// file suffix (matching (\.[A-Za-z~][A-Za-z0-9~]*)*$) and compares the
+// prefixes with the Debian verrevcmp algorithm, falling back to a
+// comparison of the whole strings when the prefixes (and suffixes)
+// compare equal. Byte ordering inside a run follows gnulib's order():
+// '~' < end-of-string < digits < letters < all other bytes.
 func compareVersion(a, b string) int {
-	splitV := func(s string) []string {
-		var parts []string
-		i := 0
-		for i < len(s) {
-			j := i
-			if s[j] >= '0' && s[j] <= '9' {
-				for j < len(s) && s[j] >= '0' && s[j] <= '9' {
-					j++
-				}
-			} else {
-				for j < len(s) && (s[j] < '0' || s[j] > '9') {
-					j++
-				}
-			}
-			parts = append(parts, s[i:j])
-			i = j
+	if a == "" {
+		if b == "" {
+			return 0
 		}
-		return parts
+		return -1
 	}
-	isNum := func(p string) bool { return len(p) > 0 && p[0] >= '0' && p[0] <= '9' }
-	pa, pb := splitV(a), splitV(b)
-	for i := 0; i < len(pa) && i < len(pb); i++ {
-		x, y := pa[i], pb[i]
-		if isNum(x) && isNum(y) {
-			sx, sy := strings.TrimLeft(x, "0"), strings.TrimLeft(y, "0")
-			if len(sx) != len(sy) {
-				if len(sx) < len(sy) {
-					return -1
-				}
-				return 1
-			}
-			if sx != sy {
-				if sx < sy {
-					return -1
-				}
-				return 1
-			}
-			if len(x) != len(y) {
-				// Numeric tie (e.g. 01 vs 1): fewer leading
-				// zeros (shorter raw) sorts first.
-				if len(x) < len(y) {
-					return -1
-				}
-				return 1
-			}
-			continue
+	if b == "" {
+		return 1
+	}
+	// Leading "." special cases: "." then ".." then other dotfiles.
+	if a[0] == '.' {
+		if b[0] != '.' {
+			return -1
 		}
-		if x != y {
-			if x < y {
+		adot := len(a) == 1
+		bdot := len(b) == 1
+		if adot || bdot {
+			switch {
+			case adot && bdot:
+				return 0
+			case adot:
 				return -1
+			default:
+				return 1
 			}
+		}
+		adotdot := len(a) == 2 && a[1] == '.'
+		bdotdot := len(b) == 2 && b[1] == '.'
+		if adotdot || bdotdot {
+			switch {
+			case adotdot && bdotdot:
+				return 0
+			case adotdot:
+				return -1
+			default:
+				return 1
+			}
+		}
+	} else if b[0] == '.' {
+		return 1
+	}
+
+	aPrefix := verPrefixLen(a)
+	bPrefix := verPrefixLen(b)
+	onePass := aPrefix == len(a) && bPrefix == len(b)
+	if r := verrevcmp(a, aPrefix, b, bPrefix); r != 0 {
+		return r
+	}
+	if onePass {
+		return 0
+	}
+	return verrevcmp(a, len(a), b, len(b))
+}
+
+// verPrefixLen returns the length of a prefix of s that leaves a suffix
+// matching (\.[A-Za-z~][A-Za-z0-9~]*)*$ — a port of gnulib's
+// file_prefixlen, matching coreutils 8.32/Git-Bash behavior: a suffix
+// also starts at a '.' that ends the string (never returns the whole
+// nonempty string).
+func verPrefixLen(s string) int {
+	n := len(s)
+	prefix := 0
+	for i := 0; ; {
+		if i == n {
+			return prefix
+		}
+		i++
+		prefix = i
+		for i+1 <= n && s[i] == '.' && (i+1 == n || isVerAlpha(s[i+1]) || s[i+1] == '~') {
+			i++
+			for i < n && (isVerAlnum(s[i]) || s[i] == '~') {
+				i++
+			}
+		}
+	}
+}
+
+func isVerAlpha(c byte) bool { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') }
+func isVerDigit(c byte) bool { return c >= '0' && c <= '9' }
+func isVerAlnum(c byte) bool { return isVerAlpha(c) || isVerDigit(c) }
+
+// verOrder returns the sort weight of s[pos]; pos==len sorts before every
+// byte except '~'. (gnulib order())
+func verOrder(s string, pos, length int) int {
+	if pos >= length {
+		return -1
+	}
+	c := s[pos]
+	switch {
+	case isVerDigit(c):
+		return 0
+	case isVerAlpha(c):
+		return int(c)
+	case c == '~':
+		return -2
+	default:
+		return int(c) + 256
+	}
+}
+
+// verrevcmp is a port of gnulib's verrevcmp (Debian version compare)
+// over the first n1 bytes of s1 and n2 bytes of s2.
+func verrevcmp(s1 string, n1 int, s2 string, n2 int) int {
+	p1, p2 := 0, 0
+	for p1 < n1 || p2 < n2 {
+		firstDiff := 0
+		for (p1 < n1 && !isVerDigit(s1[p1])) || (p2 < n2 && !isVerDigit(s2[p2])) {
+			c1 := verOrder(s1, p1, n1)
+			c2 := verOrder(s2, p2, n2)
+			if c1 != c2 {
+				return c1 - c2
+			}
+			p1++
+			p2++
+		}
+		for p1 < n1 && s1[p1] == '0' {
+			p1++
+		}
+		for p2 < n2 && s2[p2] == '0' {
+			p2++
+		}
+		for p1 < n1 && p2 < n2 && isVerDigit(s1[p1]) && isVerDigit(s2[p2]) {
+			if firstDiff == 0 {
+				firstDiff = int(s1[p1]) - int(s2[p2])
+			}
+			p1++
+			p2++
+		}
+		if p1 < n1 && isVerDigit(s1[p1]) {
 			return 1
 		}
-	}
-	switch {
-	case len(pa) < len(pb):
-		return -1
-	case len(pa) > len(pb):
-		return 1
+		if p2 < n2 && isVerDigit(s2[p2]) {
+			return -1
+		}
+		if firstDiff != 0 {
+			return firstDiff
+		}
 	}
 	return 0
 }
@@ -1196,34 +1340,331 @@ func splitRecords(r io.Reader, delim byte) <-chan string {
 	return ch
 }
 
-type sortItem struct {
-	line string
-	key  string
-	num  float64
+// ---------- GNU sort key machinery ----------
+//
+// Field/key semantics follow GNU sort exactly:
+//   - default (blank-separated) fields are "leading blanks + non-blank
+//     run"; field 1 starts at column 0, so leading blanks belong to the
+//     field; trailing blanks at end of line belong to no field
+//   - F.C character offsets count from the field start (from the first
+//     non-blank with -b) and are not clamped to the field end, only to
+//     the end of the line
+//   - a key with no end position extends to the end of the line
+//   - ties fall back to a whole-line byte comparison (last resort)
+//     unless -s/-u; that fallback is reversed by global -r only
+
+type sortPos struct {
+	field int // 1-based field number
+	char  int // 1-based char offset within the field; 0 = field boundary
 }
 
-func numKey(k string) float64 {
-	s := strings.TrimSpace(firstField(k))
+type sortKeySpec struct {
+	start, end sortPos
+	hasEnd     bool
+	mode       int // sortMode*
+	reverse    bool
+	fold       bool
+	skipBlank  bool
+	dict       bool // -d
+	nonprint   bool // -i
+}
+
+type sortKeyFlagList []string
+
+func (k *sortKeyFlagList) String() string { return strings.Join(*k, " ") }
+func (k *sortKeyFlagList) Set(v string) error {
+	*k = append(*k, v)
+	return nil
+}
+
+// parseSortPos parses F[.C][bfnr]* and folds the modifiers into spec.
+func parseSortPos(s string, spec *sortKeySpec) (sortPos, string, error) {
+	p := sortPos{}
 	i := 0
-	if i < len(s) && (s[i] == '+' || s[i] == '-') {
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		p.field = p.field*10 + int(s[i]-'0')
 		i++
 	}
-	dig := 0
-	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-		i++
-		dig++
+	if i == 0 {
+		return p, s, errors.New("invalid key")
 	}
 	if i < len(s) && s[i] == '.' {
 		i++
+		j := i
 		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			p.char = p.char*10 + int(s[i]-'0')
 			i++
+		}
+		if i == j {
+			return p, s, errors.New("invalid key")
+		}
+	}
+	for i < len(s) {
+		switch s[i] {
+		case 'b':
+			spec.skipBlank = true
+		case 'f':
+			spec.fold = true
+		case 'n':
+			spec.mode = sortModeNumeric
+		case 'g':
+			spec.mode = sortModeGeneral
+		case 'h':
+			spec.mode = sortModeHuman
+		case 'M':
+			spec.mode = sortModeMonth
+		case 'd':
+			spec.dict = true
+		case 'i':
+			spec.nonprint = true
+		case 'r':
+			spec.reverse = true
+		default:
+			return p, s[i:], nil
+		}
+		i++
+	}
+	return p, "", nil
+}
+
+// parseSortKeySpec parses one GNU -k spec: F[.C][bfnr]*[,F[.C][bfnr]*].
+func parseSortKeySpec(s string) (sortKeySpec, error) {
+	spec := sortKeySpec{}
+	var err error
+	spec.start, s, err = parseSortPos(s, &spec)
+	if err != nil {
+		return spec, err
+	}
+	if strings.HasPrefix(s, ",") {
+		spec.end, s, err = parseSortPos(s[1:], &spec)
+		if err != nil {
+			return spec, err
+		}
+		spec.hasEnd = true
+	}
+	if s != "" {
+		return spec, errors.New("invalid key")
+	}
+	return spec, nil
+}
+
+func isSortBlank(r rune) bool { return r == ' ' || r == '\t' }
+
+// sortFieldRanges returns the rune range [start,end) of every GNU field.
+func sortFieldRanges(rs []rune, sep string) [][2]int {
+	if sep != "" {
+		sepR := []rune(sep)[0]
+		fr := make([][2]int, 0, 8)
+		start := 0
+		for i, r := range rs {
+			if r == sepR {
+				fr = append(fr, [2]int{start, i})
+				start = i + 1
+			}
+		}
+		return append(fr, [2]int{start, len(rs)})
+	}
+	var runs [][2]int
+	i := 0
+	for i < len(rs) {
+		if isSortBlank(rs[i]) {
+			i++
+			continue
+		}
+		j := i
+		for j < len(rs) && !isSortBlank(rs[j]) {
+			j++
+		}
+		runs = append(runs, [2]int{i, j})
+		i = j
+	}
+	if len(runs) == 0 {
+		return [][2]int{{0, len(rs)}}
+	}
+	fr := make([][2]int, 0, len(runs))
+	for k, run := range runs {
+		start := 0
+		if k > 0 {
+			start = runs[k-1][1]
+		}
+		fr = append(fr, [2]int{start, run[1]})
+	}
+	return fr
+}
+
+func sortFieldBounds(fr [][2]int, rs []rune, field int) (int, int) {
+	if field <= 0 {
+		return 0, len(rs)
+	}
+	if field <= len(fr) {
+		return fr[field-1][0], fr[field-1][1]
+	}
+	return len(rs), len(rs)
+}
+
+// keyRange returns the rune range [start,end) of the key within a line.
+func (sp sortKeySpec) keyRange(rs []rune, fr [][2]int, skipGlobal bool) (int, int) {
+	skip := sp.skipBlank || skipGlobal
+	fs, fe := sortFieldBounds(fr, rs, sp.start.field)
+	st := fs
+	if skip {
+		for st < fe && isSortBlank(rs[st]) {
+			st++
+		}
+	}
+	if sp.start.char > 0 {
+		st += sp.start.char - 1
+	}
+	if st > len(rs) {
+		st = len(rs)
+	}
+	var en int
+	switch {
+	case !sp.hasEnd:
+		en = len(rs)
+	case sp.end.char > 0:
+		efs, efe := sortFieldBounds(fr, rs, sp.end.field)
+		if skip {
+			for efs < efe && isSortBlank(rs[efs]) {
+				efs++
+			}
+		}
+		en = efs + sp.end.char
+		if en > len(rs) {
+			en = len(rs)
+		}
+	default:
+		_, en = sortFieldBounds(fr, rs, sp.end.field)
+	}
+	if en < st {
+		en = st
+	}
+	return st, en
+}
+
+// sortParseNum extracts GNU's -n numeric prefix: blanks, optional '-',
+// digits*, optional '.' digits*. Anything else is zero (GNU -n does not
+// accept '+', exponents or 0x; it "aligns decimal points").
+func sortParseNum(s string) (bool, string, string) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	neg := false
+	if i < len(s) && s[i] == '-' {
+		neg = true
+		i++
+	}
+	intp := ""
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		intp += string(s[i])
+		i++
+	}
+	frac := ""
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+			frac += string(s[i])
+			i++
+		}
+	}
+	if intp == "" && frac == "" {
+		return false, "0", ""
+	}
+	if intp == "" {
+		intp = "0"
+	}
+	return neg, intp, frac
+}
+
+// sortNumCompare compares -n numbers with arbitrary precision.
+func sortNumCompare(a, b string) int {
+	negA, ia, fa := sortParseNum(a)
+	negB, ib, fb := sortParseNum(b)
+	ia = strings.TrimLeft(ia, "0")
+	ib = strings.TrimLeft(ib, "0")
+	fa = strings.TrimRight(fa, "0")
+	fb = strings.TrimRight(fb, "0")
+	zeroA := ia == "" && fa == ""
+	zeroB := ib == "" && fb == ""
+	if ia == "" {
+		ia = "0"
+	}
+	if ib == "" {
+		ib = "0"
+	}
+	if zeroA {
+		negA = false
+	}
+	if zeroB {
+		negB = false
+	}
+	if negA != negB {
+		if negA {
+			return -1
+		}
+		return 1
+	}
+	sign := 1
+	if negA {
+		sign = -1
+	}
+	mag := 0
+	if ia != ib {
+		if len(ia) != len(ib) {
+			if len(ia) < len(ib) {
+				mag = -1
+			} else {
+				mag = 1
+			}
+		} else if ia < ib {
+			mag = -1
+		} else {
+			mag = 1
+		}
+	} else {
+		n := len(fa)
+		if len(fb) > n {
+			n = len(fb)
+		}
+		fa2 := fa + strings.Repeat("0", n-len(fa))
+		fb2 := fb + strings.Repeat("0", n-len(fb))
+		if fa2 < fb2 {
+			mag = -1
+		} else if fa2 > fb2 {
+			mag = 1
+		}
+	}
+	return sign * mag
+}
+
+// sortParseGeneral extracts a leading C float (with optional exponent)
+// for sort -g. Unparseable text is zero, like GNU.
+func sortParseGeneral(s string) float64 {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	j := i
+	if j < len(s) && (s[j] == '+' || s[j] == '-') {
+		j++
+	}
+	dig := 0
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+		dig++
+	}
+	if j < len(s) && s[j] == '.' {
+		j++
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
 			dig++
 		}
 	}
 	if dig == 0 {
 		return 0
 	}
-	if j := i; j < len(s) && (s[j] == 'e' || s[j] == 'E') {
+	if j < len(s) && (s[j] == 'e' || s[j] == 'E') {
 		k := j + 1
 		if k < len(s) && (s[k] == '+' || s[k] == '-') {
 			k++
@@ -1234,87 +1675,225 @@ func numKey(k string) float64 {
 			d++
 		}
 		if d > 0 {
-			i = k
+			j = k
 		}
 	}
-	f, _ := strconv.ParseFloat(s[:i], 64)
+	f, _ := strconv.ParseFloat(s[i:j], 64)
 	return f
 }
 
-type sortKey struct {
-	start, end int
-	numeric    bool
-	reverse    bool
+// sortParseHuman parses GNU's -h number: a float with an optional
+// 1024-power suffix [KMGTPEZY]. Unparseable text is zero.
+func sortParseHuman(s string) float64 {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	j := i
+	for j < len(s) && (s[j] == '+' || s[j] == '-' || s[j] == '.' ||
+		(s[j] >= '0' && s[j] <= '9') || s[j] == 'e' || s[j] == 'E') {
+		j++
+	}
+	f, _ := strconv.ParseFloat(s[i:j], 64)
+	if j >= len(s) {
+		return f
+	}
+	mult := 1024.0
+	pow := 0
+	switch s[j] {
+	case 'K', 'k':
+		pow = 1
+	case 'M', 'm':
+		pow = 2
+	case 'G', 'g':
+		pow = 3
+	case 'T', 't':
+		pow = 4
+	case 'P', 'p':
+		pow = 5
+	case 'E', 'e':
+		pow = 6
+	case 'Z', 'z':
+		pow = 7
+	case 'Y', 'y':
+		pow = 8
+	default:
+		return f
+	}
+	for n := 0; n < pow; n++ {
+		f *= mult
+	}
+	return f
 }
 
-func parseSortKey(s string) *sortKey {
-	if s == "" {
-		return nil
+// sortParseMonth maps GNU's -M month names to numbers; unknown is 0.
+func sortParseMonth(s string) int {
+	s = strings.TrimLeft(s, " \t")
+	if len(s) < 3 {
+		return 0
 	}
-	k := &sortKey{end: -1}
-	part := s
-	if i := strings.IndexByte(s, ','); i >= 0 {
-		part = s[:i]
-		rest := s[i+1:]
-		num := ""
-		for _, c := range rest {
-			if c >= '0' && c <= '9' {
-				num += string(c)
-			} else if c == 'n' {
-				k.numeric = true
-			} else if c == 'r' {
-				k.reverse = true
-			}
-		}
-		if num != "" {
-			if v, err := strconv.Atoi(num); err == nil {
-				k.end = v
-			}
-		}
+	m := strings.ToUpper(s[:3])
+	switch m {
+	case "JAN":
+		return 1
+	case "FEB":
+		return 2
+	case "MAR":
+		return 3
+	case "APR":
+		return 4
+	case "MAY":
+		return 5
+	case "JUN":
+		return 6
+	case "JUL":
+		return 7
+	case "AUG":
+		return 8
+	case "SEP":
+		return 9
+	case "OCT":
+		return 10
+	case "NOV":
+		return 11
+	case "DEC":
+		return 12
 	}
-	num := ""
-	for _, c := range part {
-		if c >= '0' && c <= '9' {
-			num += string(c)
-		} else if c == 'n' {
-			k.numeric = true
-		} else if c == 'r' {
-			k.reverse = true
-		}
-	}
-	if num == "" {
-		return nil
-	}
-	if v, err := strconv.Atoi(num); err == nil {
-		k.start = v
-	} else {
-		return nil
-	}
-	return k
+	return 0
 }
 
-func sortKeyField(line, sep string, k *sortKey) string {
-	if sep == "" {
-		sep = " "
+// sortKeyOpts are the per-key comparison modes.
+const (
+	sortModeByte = iota
+	sortModeNumeric
+	sortModeGeneral
+	sortModeHuman
+	sortModeMonth
+	sortModeVersion
+)
+
+type sortConfig struct {
+	specs     []sortKeySpec
+	sep       string // "" = blank-separated
+	mode      int    // global mode when a key has none
+	reverse   bool
+	fold      bool
+	skipBlank bool
+	stable    bool
+	unique    bool
+	dict      bool
+	nonprint  bool
+}
+
+// sortFilterKey applies -d/-i character restrictions to a key.
+func sortFilterKey(k string, dict, nonprint bool) string {
+	if !dict && !nonprint {
+		return k
 	}
-	var fields []string
-	if sep == " " {
-		fields = strings.Fields(line)
-	} else {
-		fields = strings.Split(line, sep)
+	var b strings.Builder
+	for _, r := range k {
+		if dict {
+			if !(r == ' ' || r == '\t' || (r >= '0' && r <= '9') ||
+				(r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z')) {
+				continue
+			}
+		}
+		if nonprint && (r < 0x20 || r == 0x7f) {
+			continue
+		}
+		b.WriteRune(r)
 	}
-	lo := k.start - 1
-	if lo < 0 {
-		lo = 0
+	return b.String()
+}
+
+// compareKey compares two key strings under one key's modifiers.
+func (sc *sortConfig) compareKey(ka, kb string, sp *sortKeySpec) int {
+	ka = sortFilterKey(ka, sp.dict || sc.dict, sp.nonprint || sc.nonprint)
+	kb = sortFilterKey(kb, sp.dict || sc.dict, sp.nonprint || sc.nonprint)
+	mode := sp.mode
+	if mode == sortModeByte {
+		mode = sc.mode
 	}
-	hi := len(fields)
-	if k.end > 0 && k.end < hi {
-		hi = k.end
+	var c int
+	switch mode {
+	case sortModeNumeric:
+		c = sortNumCompare(ka, kb)
+	case sortModeGeneral:
+		fa, fb := sortParseGeneral(ka), sortParseGeneral(kb)
+		if fa < fb {
+			c = -1
+		} else if fa > fb {
+			c = 1
+		}
+	case sortModeHuman:
+		fa, fb := sortParseHuman(ka), sortParseHuman(kb)
+		if fa < fb {
+			c = -1
+		} else if fa > fb {
+			c = 1
+		}
+	case sortModeMonth:
+		ma, mb := sortParseMonth(ka), sortParseMonth(kb)
+		if ma < mb {
+			c = -1
+		} else if ma > mb {
+			c = 1
+		}
+	case sortModeVersion:
+		c = compareVersion(ka, kb)
+	default:
+		if sp.fold || sc.fold {
+			c = strings.Compare(strings.ToLower(ka), strings.ToLower(kb))
+		} else {
+			c = strings.Compare(ka, kb)
+		}
 	}
-	if lo >= len(fields) {
-		return ""
+	if sp.reverse != sc.reverse {
+		c = -c
 	}
-	return strings.Join(fields[lo:hi], sep)
+	return c
+}
+
+// compare applies every key in order, then GNU's last-resort whole-line
+// comparison (reversed by global -r only).
+func (sc *sortConfig) compare(a, b string) int {
+	ra, rb := []rune(a), []rune(b)
+	fa := sortFieldRanges(ra, sc.sep)
+	fb := sortFieldRanges(rb, sc.sep)
+	for i := range sc.specs {
+		sp := &sc.specs[i]
+		as, ae := sp.keyRange(ra, fa, sc.skipBlank)
+		bs, be := sp.keyRange(rb, fb, sc.skipBlank)
+		c := sc.compareKey(string(ra[as:ae]), string(rb[bs:be]), sp)
+		if c != 0 {
+			return c
+		}
+	}
+	if sc.stable || sc.unique {
+		return 0
+	}
+	c := strings.Compare(a, b)
+	if sc.reverse {
+		c = -c
+	}
+	return c
+}
+
+// keysEqual reports whether two lines have equal sort keys (no last
+// resort) — GNU's notion of "equal" for -u dedup and -cu checking.
+func (sc *sortConfig) keysEqual(a, b string) bool {
+	ra, rb := []rune(a), []rune(b)
+	fa := sortFieldRanges(ra, sc.sep)
+	fb := sortFieldRanges(rb, sc.sep)
+	for i := range sc.specs {
+		sp := &sc.specs[i]
+		as, ae := sp.keyRange(ra, fa, sc.skipBlank)
+		bs, be := sp.keyRange(rb, fb, sc.skipBlank)
+		if sc.compareKey(string(ra[as:ae]), string(rb[bs:be]), sp) != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func firstField(s string) string {
@@ -1362,6 +1941,12 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if err := fs.Parse(preArgs); err != nil {
 		return err
 	}
+	wSet := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "w" {
+			wSet = true
+		}
+	})
 	groupMode := ""
 	for _, a := range args[1:] {
 		if a == "--group" || a == "-g" {
@@ -1418,11 +2003,12 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 				k = ""
 			}
 		}
-		if *checkChars > 0 {
+		if *checkChars > 0 || wSet {
 			runes := []rune(k)
 			if len(runes) > int(*checkChars) {
-				k = string(runes[:*checkChars])
+				runes = runes[:*checkChars]
 			}
+			k = string(runes)
 		}
 		if *ignoreCase {
 			return strings.ToLower(k)
@@ -1551,8 +2137,17 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 		text := string(data)
 		chars = len([]rune(text))
 		for _, line := range strings.Split(text, "\n") {
-			if n := len([]rune(line)); n > maxLineLen {
-				maxLineLen = n
+			// GNU -L counts display width with tab stops every 8.
+			col := 0
+			for _, r := range line {
+				if r == '\t' {
+					col = (col/8 + 1) * 8
+				} else {
+					col++
+				}
+			}
+			if col > maxLineLen {
+				maxLineLen = col
 			}
 		}
 		l = strings.Count(text, "\n")
@@ -1600,10 +2195,22 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if anyPipe {
 		width = 7
 	}
+	multi := len(rows) > 1
+	// GNU wc pads the columns when listing several inputs, or when a
+	// non-regular input is listed across several columns.
+	ncols := 1
+	if len(rows) > 0 {
+		ncols = len(rows[0].vals)
+	}
+	pad := multi || (anyPipe && ncols > 1)
 	for _, r := range rows {
 		line := ""
-		if len(r.vals) == 1 {
-			line = strconv.Itoa(r.vals[0])
+		if !pad {
+			strs := make([]string, len(r.vals))
+			for i, v := range r.vals {
+				strs[i] = strconv.Itoa(v)
+			}
+			line = strings.Join(strs, " ")
 		} else {
 			strs := make([]string, len(r.vals))
 			for i, v := range r.vals {
@@ -1676,7 +2283,11 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "tr: missing operand")
 		return flag.ErrHelp
 	}
-	from := expandTrSet(rest[0])
+	from, err := expandTrSet(rest[0])
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, "tr:", err)
+		return exitError{1}
+	}
 	if *complement && !*del && len(rest) < 2 {
 		_, err := io.Copy(hc.Stdout, hc.Stdin)
 		return err
@@ -1723,7 +2334,11 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "tr: missing operand after "+rest[0])
 		return flag.ErrHelp
 	}
-	to := expandTrSet(rest[1])
+	to, err := expandTrSet(rest[1])
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, "tr:", err)
+		return exitError{1}
+	}
 	var table [256]byte
 	for i := range table {
 		table[i] = byte(i)
@@ -1775,7 +2390,7 @@ func squeezeBytes(data, set []byte) []byte {
 	return out
 }
 
-func expandTrSet(s string) []byte {
+func expandTrSet(s string) ([]byte, error) {
 	var out []byte
 	i := 0
 	for i < len(s) {
@@ -1822,7 +2437,10 @@ func expandTrSet(s string) []byte {
 				continue
 			}
 		}
-		if i+2 < len(s) && s[i+1] == '-' && s[i] <= s[i+2] {
+		if i+2 < len(s) && s[i+1] == '-' {
+			if s[i] > s[i+2] {
+				return nil, fmt.Errorf("range-endpoints of '%s' are in reverse collating sequence order", s[i:i+3])
+			}
 			for c := s[i]; c <= s[i+2]; c++ {
 				out = append(out, c)
 			}
@@ -1832,7 +2450,7 @@ func expandTrSet(s string) []byte {
 		out = append(out, s[i])
 		i++
 	}
-	return out
+	return out, nil
 }
 
 // expandTrClass expands POSIX classes like [:upper:] for tr.
@@ -2054,6 +2672,29 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 	outDelim := fs.String("output-delimiter", "", "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	// GNU cut validates the operand shapes up front.
+	dGiven := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "d" {
+			dGiven = true
+		}
+	})
+	lists := 0
+	for _, s := range []string{*bytes_, *chars, *fields} {
+		if s != "" {
+			lists++
+		}
+	}
+	if lists > 1 {
+		fmt.Fprintln(hc.Stderr, "cut: only one list may be specified")
+		fmt.Fprintln(hc.Stderr, "Try 'cut --help' for more information.")
+		return exitError{1}
+	}
+	if dGiven && len([]rune(*delim)) != 1 {
+		fmt.Fprintln(hc.Stderr, "cut: the delimiter must be a single character")
+		fmt.Fprintln(hc.Stderr, "Try 'cut --help' for more information.")
+		return exitError{1}
 	}
 	// -b (bytes) behaves like -c for UTF-8-unaware output; GNU differs
 	// only on multibyte chars, where byte slicing can split runes.
@@ -2943,7 +3584,7 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 		return err
 	}
 	_ = verbose // -v: no line suppression in our output anyway; accept for parity.
-	_ = format // -e custom formats: accepted; raw format string echoed? no — GNU applies it; we apply simple %02x passthrough below
+	_ = format  // -e custom formats: accepted; raw format string echoed? no — GNU applies it; we apply simple %02x passthrough below
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "hexdump:", err)

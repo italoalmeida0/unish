@@ -18,7 +18,9 @@ import (
 	"context"
 	"io"
 	"net"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
@@ -172,6 +174,7 @@ func TestZombieProcSubstEarlyError(t *testing.T) {
 	// Unit form: OpenConsumer on a CmdIn substitution whose producer
 	// errored before finishProducer must fail fast, not hang forever.
 	if runtime.GOOS == "windows" {
+		beforeTemps := listProcSubstTemps()
 		psf, err := procSubstHandler(context.Background(), syntax.CmdIn)
 		if err != nil {
 			t.Fatal(err)
@@ -198,6 +201,28 @@ func TestZombieProcSubstEarlyError(t *testing.T) {
 			t.Fatalf("Z3: OpenConsumer ignored ctx cancel (deadlock: pure <-chan with _ = ctx)")
 		}
 		_ = psf.Cleanup()
+		// CmdIn Cleanup intentionally doesn't delete (the consumer
+		// owns removal on close); with no consumer ever opening,
+		// remove our synthetic temp so the suite stays clean.
+		removeNewProcSubstTemps(t, beforeTemps)
+	}
+}
+
+func listProcSubstTemps() map[string]bool {
+	m := map[string]bool{}
+	for _, f := range globProcSubstTemps() {
+		m[f] = true
+	}
+	return m
+}
+
+func removeNewProcSubstTemps(t *testing.T, before map[string]bool) {
+	t.Helper()
+	for _, f := range globProcSubstTemps() {
+		if !before[f] {
+			_ = os.Remove(f)
+			winProcSubstRemove(f)
+		}
 	}
 }
 
@@ -277,3 +302,8 @@ type dummyAddr struct{}
 
 func (dummyAddr) Network() string { return "tcp" }
 func (dummyAddr) String() string  { return "halfopen" }
+
+func globProcSubstTemps() []string {
+	m, _ := filepath.Glob(filepath.Join(os.TempDir(), "unish-procsub-*"))
+	return m
+}

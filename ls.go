@@ -29,8 +29,13 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	cols := fs.Bool("C", false, "")
 	across := fs.Bool("x", false, "")
 	inode := fs.Bool("i", false, "")
+	timeStyle := fs.String("time-style", "", "")
+	fullTime := fs.Bool("full-time", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	if *fullTime {
+		*timeStyle = "full-iso"
 	}
 	names := fs.Args()
 	if len(names) == 0 {
@@ -54,7 +59,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 			continue
 		}
 		if !fi.IsDir() || *dirOnly {
-			printLsEntryInode(hc, name, full, fi, *long, *human, *classify, *quoted, *inode)
+			printLsEntryInode(hc, name, full, fi, *long, *human, *classify, *quoted, *inode, *timeStyle)
 			continue
 		}
 		if multi {
@@ -65,7 +70,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		if *recurse {
 			first := true
-			if err := lsRecursive(hc, name, full, lsOpts{*all, *long, *human, *classify, *quoted, *sortSize, *reverse, *sortTime, *inode}, &first); err != nil {
+			if err := lsRecursive(hc, name, full, lsOpts{*all, *long, *human, *classify, *quoted, *sortSize, *reverse, *sortTime, *inode, *timeStyle}, &first); err != nil {
 				code = 2
 			}
 			continue
@@ -90,7 +95,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 			fmt.Fprintln(hc.Stdout, strings.Join(names2, "  "))
 		} else {
 			for _, e := range entries {
-				printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *long, *human, *classify, *quoted, *inode)
+				printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *long, *human, *classify, *quoted, *inode, *timeStyle)
 			}
 		}
 	}
@@ -103,6 +108,7 @@ func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
 type lsOpts struct {
 	all, long, human, classify, quoted, sortSize, reverse, sortTime bool
 	inode                                                           bool
+	timeStyle                                                       string
 }
 
 func lsRecursive(hc interp.HandlerContext, display, full string, o lsOpts, first *bool) error {
@@ -117,7 +123,7 @@ func lsRecursive(hc interp.HandlerContext, display, full string, o lsOpts, first
 	*first = false
 	fmt.Fprintf(hc.Stdout, "%s:\n", display)
 	for _, e := range entries {
-		printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), o.long, o.human, o.classify, o.quoted, o.inode)
+		printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), o.long, o.human, o.classify, o.quoted, o.inode, o.timeStyle)
 	}
 	for _, e := range entries {
 		// Never descend into "." or ".." (infinite recursion); GNU
@@ -230,7 +236,33 @@ func readDirSorted(dir string, all, sortSize, reverse, sortTime bool) ([]os.DirE
 	return entries, nil
 }
 
-func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted bool) {
+// lsTimeFormat renders mtime per --time-style / --full-time (GNU names):
+// full-iso, long-iso, iso, locale, +FORMAT (strftime-ish, only the
+// verbs agents use: %Y %m %d %H %M %S %N %T %F). Default: "Jan _2 15:04".
+func lsTimeFormat(mt time.Time, style string) string {
+	switch style {
+	case "full-iso":
+		return mt.Format("2006-01-02 15:04:05.000000000 -0700")
+	case "long-iso":
+		return mt.Format("2006-01-02 15:04")
+	case "iso":
+		return mt.Format("01-02 15:04")
+	case "locale":
+		return mt.Format("Jan _2 15:04")
+	}
+	if strings.HasPrefix(style, "+") {
+		f := style[1:]
+		r := strings.NewReplacer(
+			"%Y", "2006", "%m", "01", "%d", "02",
+			"%H", "15", "%M", "04", "%S", "05",
+			"%N", "000000000", "%T", "15:04:05", "%F", "2006-01-02",
+		)
+		return mt.Format(r.Replace(f))
+	}
+	return mt.Format("Jan _2 15:04")
+}
+
+func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted bool, timeStyle string) {
 	name := display
 	if quoted {
 		name = fmt.Sprintf("%q", display)
@@ -250,7 +282,7 @@ func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo
 	}
 	fmt.Fprintf(hc.Stdout, "%s %d %s %s %s %s %s\n",
 		lsPerm(fi), 1, lsUser(), lsGroup(), lsSize(fi, human),
-		fi.ModTime().Format("Jan _2 15:04"), name)
+		lsTimeFormat(fi.ModTime(), timeStyle), name)
 }
 
 func lsIndicator(fi os.FileInfo) string {
@@ -330,7 +362,7 @@ func lsDisplayName(display, full string, fi os.FileInfo, classify, quoted bool) 
 	return name
 }
 
-func printLsEntryInode(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted, inode bool) {
+func printLsEntryInode(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted, inode bool, timeStyle string) {
 	if inode && !long {
 		var ino string
 		if _, err := os.Lstat(full); err == nil {
@@ -352,8 +384,8 @@ func printLsEntryInode(hc interp.HandlerContext, display, full string, fi os.Fil
 		old := hc.Stdout
 		_ = old
 		fmt.Fprintf(hc.Stdout, "%s ", ino)
-		printLsEntry(hc, display, full, fi, long, human, classify, quoted)
+		printLsEntry(hc, display, full, fi, long, human, classify, quoted, timeStyle)
 		return
 	}
-	printLsEntry(hc, display, full, fi, long, human, classify, quoted)
+	printLsEntry(hc, display, full, fi, long, human, classify, quoted, timeStyle)
 }

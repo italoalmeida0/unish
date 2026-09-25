@@ -104,8 +104,8 @@ func main() {
 		os.Exit(2)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 
 	runnerOpts := []interp.RunnerOption{
 		interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
@@ -125,6 +125,20 @@ func main() {
 		fmt.Fprintln(os.Stderr, "bash:", err)
 		os.Exit(1)
 	}
+
+	// Ctrl-C: run the script's INT trap when it has one (bash semantics),
+	// otherwise interrupt the shell like before.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	defer signal.Stop(sigCh)
+	go func() {
+		for sig := range sigCh {
+			if r.QueueSignal(sig) {
+				continue
+			}
+			cancel()
+		}
+	}()
 
 	if err := r.Run(ctx, prog); err != nil {
 		var es interp.ExitStatus

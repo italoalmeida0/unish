@@ -27,28 +27,43 @@ type sedAddr struct {
 	re   *regexp.Regexp
 	step int
 	zero bool
+
+	// addr2 relative forms: +N (N lines after the range starts) and
+	// ~N (up to the next line whose number is a multiple of N).
+	plus  int
+	tilde int
+
+	// lazy "previous regular expression" support: pat == "" means the
+	// address reuses the last regex used (GNU semantics)
+	pat      string
+	reNocase bool
+	reExt    bool
 }
 
 type sedCmd struct {
-	a1, a2 *sedAddr
-	bang   bool
-	name   byte
-	arg    string
-	sub    *sedSub
-	blk    []*sedCmd
-	label  string
+	a1, a2  *sedAddr
+	bang    bool
+	name    byte
+	arg     string
+	sub     *sedSub
+	blk     []*sedCmd
+	label   string
 	rangeID int
 }
 
 type sedSub struct {
-	re     *regexp.Regexp
-	repl   string
-	plain  bool
-	global bool
-	nth    int
-	nocase bool
-	print  bool
-	write  string
+	re *regexp.Regexp
+	// rePat == "" means "use the previous regular expression" (GNU).
+	rePat   string
+	reExt   bool
+	ngroups int
+	repl    string
+	plain   bool
+	global  bool
+	nth     int
+	nocase  bool
+	print   bool
+	write   string
 }
 
 var sedRangeSeq int
@@ -121,7 +136,7 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	r := &sedRunner{hc: hc, quiet: *quiet, extended: *extended,
 		labels: map[string]int{}, wfiles: map[string]*os.File{},
-		ranges: map[int]bool{}, rangeSeen: map[int]bool{}}
+		ranges: map[int]bool{}, rangeSeen: map[int]bool{}, rangeStart: map[int]int{}}
 	for i, c := range prog {
 		if c.name == ':' {
 			r.labels[c.label] = i
@@ -149,6 +164,31 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	for _, f := range r.wfiles {
 		f.Close()
+	}
+	return sedFinish(hc, r)
+}
+
+// sedExitCode parses the optional N argument of qN/QN.
+func sedExitCode(arg string) int {
+	arg = strings.TrimSpace(arg)
+	if arg == "" {
+		return 0
+	}
+	n, err := strconv.Atoi(arg)
+	if err != nil || n < 0 || n > 255 {
+		return 1
+	}
+	return n
+}
+
+// sedFinish converts runner state into GNU-compatible errors/exit codes.
+func sedFinish(hc interp.HandlerContext, r *sedRunner) error {
+	if r.err != nil {
+		fmt.Fprintf(hc.Stderr, "sed: -e expression #1, char 0: %v\n", r.err)
+		return exitError{1}
+	}
+	if r.exitCode != 0 {
+		return exitError{r.exitCode}
 	}
 	return nil
 }
@@ -231,20 +271,20 @@ func splitCommands(line string) []string {
 	for i < len(line) {
 		ch := line[i]
 		if ch == 'a' || ch == 'i' || ch == 'c' {
-		j := i + 1
-		for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
-			j++
-		}
-		if j < len(line) && line[j] == '\\' {
-			break
+			j := i + 1
+			for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
+				j++
+			}
+			if j < len(line) && line[j] == '\\' {
+				break
 			}
 		}
 		if ch == 's' || ch == 'y' {
 			if i+1 < len(line) {
 				d := line[i+1]
-			j := i + 2
-			count := 0
-			need := 2
+				j := i + 2
+				count := 0
+				need := 2
 				for j < len(line) && count < need {
 					if line[j] == '\\' {
 						j += 2
@@ -302,9 +342,23 @@ func parseSedLine(line string, extended bool) ([]*sedCmd, error) {
 	}
 	if a1 != nil && strings.HasPrefix(s, ",") {
 		s = s[1:]
-		s, a2, err = parseAddr(s, extended)
-		if err != nil {
-			return nil, err
+		if len(s) > 1 && (s[0] == '+' || s[0] == '~') && s[1] >= '0' && s[1] <= '9' {
+			i := 1
+			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+				i++
+			}
+			n, _ := strconv.Atoi(s[1:i])
+			if s[0] == '+' {
+				a2 = &sedAddr{kind: 6, plus: n}
+			} else {
+				a2 = &sedAddr{kind: 7, tilde: n}
+			}
+			s = s[i:]
+		} else {
+			s, a2, err = parseAddr(s, extended)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 	s = strings.TrimLeft(s, " \t")
@@ -446,15 +500,16 @@ func parseAddr(s string, extended bool) (string, *sedAddr, error) {
 		if end < 0 {
 			return s, nil, fmt.Errorf("unterminated address regex")
 		}
-		re, err := compileSedRe(rest[:end], false, extended)
-		if err != nil {
-			return s, nil, err
+		body := rest[:end]
+		var re *regexp.Regexp
+		if body != "" {
+			var err error
+			re, err = compileSedRe(body, false, extended)
+			if err != nil {
+				return s, nil, err
+			}
 		}
-		a := &sedAddr{kind: 3, re: re}
-		sedRangeSeq++
-		aID := sedRangeSeq
-		_ = aID
-		rest2, a := parseStep(rest[end+1:], &sedAddr{kind: 3, re: re})
+		rest2, a := parseStep(rest[end+1:], &sedAddr{kind: 3, re: re, pat: body, reExt: extended})
 		return rest2, a, nil
 	}
 	if s[0] >= '0' && s[0] <= '9' {
@@ -489,24 +544,27 @@ func parseStep(s string, a *sedAddr) (string, *sedAddr) {
 
 func parseSub(s string, extended bool) (*sedSub, error) {
 	if s == "" {
-		return nil, fmt.Errorf("s: missing delimiter")
+		return nil, fmt.Errorf("unterminated `s' command")
 	}
 	d := s[0]
 	rest := s[1:]
 	pat, rest2, ok := takeUntil(rest, d)
 	if !ok {
-		return nil, fmt.Errorf("s: unterminated pattern")
+		return nil, fmt.Errorf("unterminated `s' command")
 	}
 	repl, rest3, ok := takeUntil(rest2, d)
 	if !ok {
-		return nil, fmt.Errorf("s: unterminated replacement")
+		return nil, fmt.Errorf("unterminated `s' command")
 	}
-	sub := &sedSub{}
-	re, err := compileSedRe(pat, false, extended)
-	if err != nil {
-		return nil, err
+	sub := &sedSub{rePat: pat, reExt: extended}
+	if pat != "" {
+		re, err := compileSedRe(pat, false, extended)
+		if err != nil {
+			return nil, err
+		}
+		sub.re = re
+		sub.ngroups = re.NumSubexp()
 	}
-	sub.re = re
 	sub.repl = repl
 	sub.plain = isPlainRepl(repl)
 	flags := strings.TrimSpace(rest3)
@@ -519,11 +577,13 @@ func parseSub(s string, extended bool) (*sedSub, error) {
 			sub.print = true
 		case 'i', 'I':
 			sub.nocase = true
-			re2, err := compileSedRe(pat, true, extended)
-			if err != nil {
-				return nil, err
+			if pat != "" {
+				re2, err := compileSedRe(pat, true, extended)
+				if err != nil {
+					return nil, err
+				}
+				sub.re = re2
 			}
-			sub.re = re2
 		case 'w':
 			sub.write = strings.TrimSpace(flags[i+1:])
 			i = len(flags)
@@ -531,6 +591,11 @@ func parseSub(s string, extended bool) (*sedSub, error) {
 			if f >= '0' && f <= '9' {
 				sub.nth = sub.nth*10 + int(f-'0')
 			}
+		}
+	}
+	if pat != "" {
+		if err := checkSubRefs(repl, sub.ngroups); err != nil {
+			return nil, err
 		}
 	}
 	return sub, nil
@@ -591,22 +656,72 @@ func unescapeSedText(s string) string {
 }
 
 type sedRunner struct {
-	hc       interp.HandlerContext
-	quiet    bool
-	extended bool
-	pat      string
-	hold     string
-	quit     bool
-	lineNo   int
-	lastLine bool
-	labels   map[string]int
-	wfiles   map[string]*os.File
-	ranges   map[int]bool
-	rangeSeen map[int]bool
-	subbed   bool
-	out      io.Writer
-	pending  []pendingOut
-	trailNL  bool
+	hc         interp.HandlerContext
+	quiet      bool
+	extended   bool
+	pat        string
+	hold       string
+	quit       bool
+	lineNo     int
+	lastLine   bool
+	labels     map[string]int
+	wfiles     map[string]*os.File
+	ranges     map[int]bool
+	rangeSeen  map[int]bool
+	rangeStart map[int]int
+	subbed     bool
+	out        io.Writer
+	pending    []pendingOut
+	trailNL    bool
+
+	// GNU parity state
+	err        error // runtime script error (e.g. no previous regexp)
+	exitCode   int   // from qN/QN
+	rangeEnd   bool  // the current command's range closed on this line
+	lastRe     string
+	lastReRe   *regexp.Regexp
+	lastReCase bool
+	lastReExt  bool
+}
+
+// sedReFor resolves a command's regular expression, implementing GNU's
+// "previous regular expression": an empty pattern reuses the last one.
+// The regex becomes the new "last used" on success.
+func sedReFor(r *sedRunner, pre *regexp.Regexp, pat string, nocase, ext bool) (*regexp.Regexp, bool) {
+	if pat == "" {
+		if r.lastRe == "" {
+			r.err = fmt.Errorf("no previous regular expression")
+			return nil, false
+		}
+		return r.lastReRe, true
+	}
+	re := pre
+	if re == nil || nocase {
+		var err error
+		re, err = compileSedRe(pat, nocase, ext)
+		if err != nil {
+			r.err = err
+			return nil, false
+		}
+	}
+	r.lastRe, r.lastReRe, r.lastReCase, r.lastReExt = pat, re, nocase, ext
+	return re, true
+}
+
+// checkSubRefs validates backreferences in a s/// replacement against
+// the pattern's group count (GNU: "invalid reference \1 on `s' RHS").
+func checkSubRefs(repl string, ngroups int) error {
+	for i := 0; i+1 < len(repl); i++ {
+		if repl[i] != '\\' {
+			continue
+		}
+		n := repl[i+1]
+		if n >= '1' && n <= '9' && int(n-'0') > ngroups {
+			return fmt.Errorf("invalid reference \\%c on `s' command's RHS", n)
+		}
+		i++
+	}
+	return nil
 }
 
 func (r *sedRunner) runStream(prog []*sedCmd, rd io.Reader) {
@@ -699,11 +814,37 @@ func (r *sedRunner) runCycle(prog []*sedCmd, pc int, idx *int, lines []string) i
 	return cycleNext
 }
 
+// runBlock runs a {…} block as part of the enclosing cycle. Unlike
+// runCycle it never auto-prints; a cycle-ending command (d, D, q, Q, b
+// without label, …) ends the whole cycle and is propagated to the
+// caller so the pattern space is not printed by mistake.
+func (r *sedRunner) runBlock(prog []*sedCmd, idx *int, lines []string) int {
+	for pc := 0; pc < len(prog); {
+		if r.quit {
+			return jumpQuit
+		}
+		c := prog[pc]
+		pc++
+		if !r.addrMatch(c) {
+			continue
+		}
+		res := r.exec(c, prog, pc, idx, lines)
+		switch res {
+		case jumpToEnd, jumpRestart, jumpQuit, jumpReadNext:
+			return res
+		}
+		if res >= 0 {
+			pc = res
+		}
+	}
+	return -1
+}
+
 const (
-	jumpToEnd   = -2
-	jumpRestart = -3
+	jumpToEnd    = -2
+	jumpRestart  = -3
 	jumpReadNext = -4
-	jumpQuit    = -5
+	jumpQuit     = -5
 )
 
 func (r *sedRunner) addrMatch(c *sedCmd) bool {
@@ -715,28 +856,48 @@ func (r *sedRunner) addrMatch(c *sedCmd) bool {
 }
 
 func (r *sedRunner) matchOnce(a1, a2 *sedAddr, id int) bool {
+	r.rangeEnd = false
 	if a1 == nil {
+		r.rangeEnd = true
 		return true
 	}
 	if a2 == nil {
-		return matchAddr(r, a1)
+		m := matchAddr(r, a1)
+		r.rangeEnd = m
+		return m
+	}
+	rangeEnds := func() bool {
+		switch a2.kind {
+		case 6: // addr1,+N
+			return r.lineNo >= r.rangeStart[id]+a2.plus
+		case 7: // addr1,~N
+			return a2.tilde > 0 && r.lineNo%a2.tilde == 0
+		default:
+			return matchAddr(r, a2)
+		}
 	}
 	if r.ranges[id] {
-		if matchAddr(r, a2) {
+		if rangeEnds() {
 			delete(r.ranges, id)
+			r.rangeEnd = true
 		}
 		return true
 	}
 	if a1.zero && r.lineNo == 1 && !r.rangeSeen[id] {
 		r.rangeSeen[id] = true
 		r.ranges[id] = true
-		if matchAddr(r, a2) {
+		r.rangeStart[id] = r.lineNo
+		if rangeEnds() {
 			delete(r.ranges, id)
+			r.rangeEnd = true
 		}
 		return true
 	}
 	if matchAddr(r, a1) {
-		if !matchAddr(r, a2) {
+		r.rangeStart[id] = r.lineNo
+		if rangeEnds() {
+			r.rangeEnd = true
+		} else {
 			r.ranges[id] = true
 		}
 		return true
@@ -762,7 +923,11 @@ func matchAddr(r *sedRunner, a *sedAddr) bool {
 	case 2:
 		return r.lastLine
 	case 3:
-		return a.re.MatchString(r.pat)
+		re, ok := sedReFor(r, a.re, a.pat, a.reNocase, a.reExt)
+		if !ok {
+			return false
+		}
+		return re.MatchString(r.pat)
 	}
 	return true
 }
@@ -770,8 +935,7 @@ func matchAddr(r *sedRunner, a *sedAddr) bool {
 func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []string) int {
 	switch c.name {
 	case '{':
-		r.runCycle(c.blk, 0, idx, lines)
-		return -1
+		return r.runBlock(c.blk, idx, lines)
 	case ':':
 		return -1
 	case 'b':
@@ -796,6 +960,10 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 		return -1
 	case 's':
 		r.doSub(c.sub)
+		if r.err != nil {
+			// Runtime script error: end the cycle without auto-print.
+			return jumpQuit
+		}
 	case 'y':
 		parts := strings.SplitN(c.arg, "\x00", 2)
 		r.pat = trString(r.pat, parts[0], parts[1])
@@ -835,14 +1003,29 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 			*idx++
 			r.lineNo++
 			r.lastLine = *idx == len(lines)-1
+			break
 		}
+		// GNU: with no next input, N stops processing; the pattern
+		// space is printed (unless -n) and sed exits.
+		if !r.quiet {
+			if r.lastLine && !r.trailNL {
+				fmt.Fprint(r.out, r.pat)
+			} else {
+				fmt.Fprintln(r.out, r.pat)
+			}
+		}
+		r.flushPending()
+		r.quit = true
+		return jumpQuit
 	case 'q':
 		if !r.quiet {
 			fmt.Fprintln(r.out, r.pat)
 		}
+		r.exitCode = sedExitCode(c.arg)
 		r.quit = true
 		return jumpQuit
 	case 'Q':
+		r.exitCode = sedExitCode(c.arg)
 		r.quit = true
 		return jumpQuit
 	case 'h':
@@ -860,6 +1043,11 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 	case 'i':
 		fmt.Fprintln(r.out, c.arg)
 	case 'c':
+		// GNU emits the text once, when the range ends; inside an open
+		// range the pattern space is just deleted.
+		if c.a2 != nil && !r.rangeEnd {
+			return jumpToEnd
+		}
 		fmt.Fprintln(r.out, c.arg)
 		return jumpToEnd
 	case 'r':
@@ -912,11 +1100,21 @@ func resolvePath(hc interp.HandlerContext, p string) string {
 }
 
 func (r *sedRunner) doSub(sub *sedSub) {
+	re, ok := sedReFor(r, sub.re, sub.rePat, sub.nocase, sub.reExt)
+	if !ok {
+		r.quit = true
+		return
+	}
+	if err := checkSubRefs(sub.repl, re.NumSubexp()); err != nil {
+		r.err = err
+		r.quit = true
+		return
+	}
 	if sub.plain && sub.nth == 0 {
 		if sub.global {
-			r.pat = sub.re.ReplaceAllString(r.pat, sub.repl)
+			r.pat = re.ReplaceAllString(r.pat, sub.repl)
 		} else {
-			loc := sub.re.FindStringIndex(r.pat)
+			loc := re.FindStringIndex(r.pat)
 			if loc == nil {
 				return
 			}
@@ -925,12 +1123,31 @@ func (r *sedRunner) doSub(sub *sedSub) {
 		r.afterSub(sub)
 		return
 	}
-	matches := sub.re.FindAllStringSubmatchIndex(r.pat, -1)
+	matches := re.FindAllStringSubmatchIndex(r.pat, -1)
 	if len(matches) == 0 {
 		return
 	}
 	if sub.nth > 0 {
 		if sub.nth > len(matches) {
+			return
+		}
+		// GNU sed: a numeric flag with 'g' replaces every match from the
+		// nth onward; without 'g' it replaces only the nth match.
+		if sub.global {
+			var sb strings.Builder
+			sb.Grow(len(r.pat) + 16)
+			last := 0
+			for _, m := range matches[sub.nth-1:] {
+				if m[0] == m[1] {
+					continue
+				}
+				sb.WriteString(r.pat[last:m[0]])
+				sb.WriteString(expandSubMatch(r.pat, sub, m))
+				last = m[1]
+			}
+			sb.WriteString(r.pat[last:])
+			r.pat = sb.String()
+			r.afterSub(sub)
 			return
 		}
 		m := matches[sub.nth-1]
@@ -1147,7 +1364,7 @@ func sedInplace(hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, 
 		var out strings.Builder
 		r := &sedRunner{hc: hc, quiet: quiet, extended: extended,
 			labels: map[string]int{}, wfiles: map[string]*os.File{},
-			ranges: map[int]bool{}, rangeSeen: map[int]bool{}, out: &out}
+			ranges: map[int]bool{}, rangeSeen: map[int]bool{}, rangeStart: map[int]int{}, out: &out}
 		for i, c := range prog {
 			if c.name == ':' {
 				r.labels[c.label] = i
@@ -1177,6 +1394,11 @@ func sedInplace(hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, 
 		}
 		for _, f := range r.wfiles {
 			f.Close()
+		}
+		if err := sedFinish(hc, r); err != nil {
+			if ee, ok := err.(exitError); ok && code == 0 {
+				code = ee.code
+			}
 		}
 		if suffix != "" {
 			os.WriteFile(full+suffix, data, 0o644)

@@ -15,16 +15,18 @@ import (
 // with a 1.3MB minified line was silently skipped by grep, producing
 // wrong counts (31894 instead of 31895).
 //
-// Semantics match bufio.ScanLines exactly:
-//   - lines split on '\n'; trailing '\n' does not yield an extra record;
-//   - final unterminated line is still returned;
-//   - a trailing '\r' is stripped (CRLF handling, like ScanLines);
+// Semantics match GNU line handling:
+//   - lines split on '\n'; a trailing '\n' does not yield an extra record;
+//   - the final unterminated line is still returned;
+//   - NO '\r' stripping: GNU tools are byte-transparent, so a CRLF file
+//     keeps its '\r' at end of every line;
 //   - streams incrementally (safe on infinite inputs like `yes | head`).
 type lineReader struct {
-	br   *bufio.Reader
-	line string
-	err  error
-	done bool
+	br      *bufio.Reader
+	line    string
+	endedNL bool
+	err     error
+	done    bool
 }
 
 func newLineReader(r io.Reader) *lineReader {
@@ -50,6 +52,7 @@ func (l *lineReader) Scan() bool {
 					return false
 				}
 				l.line = dropTrailingNewline(buf)
+				l.endedNL = false
 				l.done = true
 				return true
 			}
@@ -59,6 +62,7 @@ func (l *lineReader) Scan() bool {
 		}
 		// err == nil: frag ends with '\n'.
 		l.line = dropTrailingNewline(buf)
+		l.endedNL = true
 		return true
 	}
 }
@@ -66,17 +70,18 @@ func (l *lineReader) Scan() bool {
 // Text returns the most recent line (without line ending).
 func (l *lineReader) Text() string { return l.line }
 
+// EndedWithNewline reports whether the most recent line ended with a
+// newline (the final line of a stream may not).
+func (l *lineReader) EndedWithNewline() bool { return l.endedNL }
+
 // Err returns the first non-EOF read error, if any.
 func (l *lineReader) Err() error { return l.err }
 
-// dropTrailingNewline strips one trailing '\n' and, like bufio.ScanLines,
-// one trailing '\r' before it (CRLF).
+// dropTrailingNewline strips one trailing '\n' and nothing else (GNU
+// tools are byte-transparent; '\r' is line content).
 func dropTrailingNewline(buf []byte) string {
 	if n := len(buf); n > 0 && buf[n-1] == '\n' {
 		buf = buf[:n-1]
-		if n := len(buf); n > 0 && buf[n-1] == '\r' {
-			buf = buf[:n-1]
-		}
 	}
 	return string(buf)
 }

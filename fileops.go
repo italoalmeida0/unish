@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/base64"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -21,6 +23,9 @@ func init() {
 		extraCmd{"cp", cmdCp},
 		extraCmd{"mv", cmdMv},
 		extraCmd{"rm", cmdRm},
+		extraCmd{"del", cmdDel},
+		extraCmd{"erase", cmdDel},
+		extraCmd{"dir", cmdDir},
 		extraCmd{"mkdir", cmdMkdir},
 		extraCmd{"touch", cmdTouch},
 		extraCmd{"chmod", cmdChmod},
@@ -47,6 +52,8 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs.BoolVar(noClobber, "no-clobber", false, "")
 	noDeref := fs.Bool("P", false, "")
 	fs.BoolVar(noDeref, "no-dereference", false, "")
+	preserve := fs.Bool("p", false, "")
+	fs.BoolVar(preserve, "preserve", false, "")
 	fs.Bool("d", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -86,7 +93,7 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 				continue
 			}
 		}
-		if err := copyOne(src, target, *rec, *force, *noDeref); err != nil {
+		if err := copyOne(src, target, *rec, *force, *noDeref, *preserve); err != nil {
 			fmt.Fprintf(hc.Stderr, "cp: %v\n", err)
 			code = 1
 			continue
@@ -101,7 +108,7 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func copyOne(src, dst string, rec, force, noDeref bool) error {
+func copyOne(src, dst string, rec, force, noDeref, preserve bool) error {
 	fi, err := os.Lstat(src)
 	if err != nil {
 		return err
@@ -110,7 +117,7 @@ func copyOne(src, dst string, rec, force, noDeref bool) error {
 		if !rec {
 			return fmt.Errorf("%s is a directory (use -r)", src)
 		}
-		return copyDir(src, dst, force)
+		return copyDir(src, dst, force, preserve)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 && noDeref {
 		link, err := os.Readlink(src)
@@ -126,10 +133,22 @@ func copyOne(src, dst string, rec, force, noDeref bool) error {
 	if st, err := os.Stat(src); err == nil {
 		fi = st
 	}
-	return copyFile(src, dst, fi.Mode(), force)
+	return copyFile(src, dst, fi.Mode(), force, preserve)
 }
 
-func copyFile(src, dst string, mode os.FileMode, force bool) error {
+// preserveAttrs implements cp -p: copy mode and timestamps best-effort
+// (Windows cannot represent full POSIX modes; failures are non-fatal).
+func preserveAttrs(src, dst string) {
+	fi, err := os.Stat(src)
+	if err != nil {
+		return
+	}
+	_ = os.Chmod(dst, fi.Mode().Perm())
+	mt := fi.ModTime()
+	_ = os.Chtimes(dst, mt, mt)
+}
+
+func copyFile(src, dst string, mode os.FileMode, force, preserve bool) error {
 	in, err := os.Open(src)
 	if err != nil {
 		return err
@@ -144,13 +163,16 @@ func copyFile(src, dst string, mode os.FileMode, force bool) error {
 	}
 	_, err = io.Copy(out, in)
 	cerr := out.Close()
+	if preserve {
+		preserveAttrs(src, dst)
+	}
 	if err != nil {
 		return err
 	}
 	return cerr
 }
 
-func copyDir(src, dst string, force bool) error {
+func copyDir(src, dst string, force, preserve bool) error {
 	fi, err := os.Stat(src)
 	if err != nil {
 		return err
@@ -166,7 +188,7 @@ func copyDir(src, dst string, force bool) error {
 		s := filepath.Join(src, e.Name())
 		d := filepath.Join(dst, e.Name())
 		if e.IsDir() {
-			if err := copyDir(s, d, force); err != nil {
+			if err := copyDir(s, d, force, preserve); err != nil {
 				return err
 			}
 			continue
@@ -175,9 +197,12 @@ func copyDir(src, dst string, force bool) error {
 		if err != nil {
 			return err
 		}
-		if err := copyFile(s, d, fi.Mode(), force); err != nil {
+		if err := copyFile(s, d, fi.Mode(), force, preserve); err != nil {
 			return err
 		}
+	}
+	if preserve {
+		preserveAttrs(src, dst)
 	}
 	return nil
 }
@@ -243,14 +268,14 @@ func cmdMv(_ context.Context, hc interp.HandlerContext, args []string) error {
 				continue
 			}
 			if fi.IsDir() {
-				if err := copyDir(src, target, true); err != nil {
+				if err := copyDir(src, target, true, true); err != nil {
 					fmt.Fprintf(hc.Stderr, "mv: %v\n", err)
 					code = 1
 					continue
 				}
 				os.RemoveAll(src)
 			} else {
-				if err := copyFile(src, target, fi.Mode(), true); err != nil {
+				if err := copyFile(src, target, fi.Mode(), true, true); err != nil {
 					fmt.Fprintf(hc.Stderr, "mv: %v\n", err)
 					code = 1
 					continue
@@ -347,6 +372,88 @@ func cmdRm(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{code}
 	}
 	return nil
+}
+
+// cmdDel implements the cmd.exe DEL/ERASE command for AX parity on
+// Windows (agents coming from cmd habitually type `del file`).
+// Mapping: /S -> -r (recurse), /Q /F -> -f (quiet/force), /P -> noop
+// (rm never prompts non-interactively anyway). /A (attribute filter)
+// changes WHICH files are deleted, so it is refused loudly instead of
+// silently deleting the wrong set. Long GNU flags (-r -f) are accepted
+// too. Everything else delegates to cmdRm, including dot/root guards.
+func cmdDel(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	norm := make([]string, 0, len(args))
+	norm = append(norm, "rm")
+	for _, a := range args[1:] {
+		if len(a) == 2 && (a[0] == '/' || a[0] == '\\') {
+			switch a[1] {
+			case 'S', 's':
+				norm = append(norm, "-r")
+				continue
+			case 'Q', 'q', 'F', 'f':
+				norm = append(norm, "-f")
+				continue
+			case 'P', 'p':
+				continue // no prompt in non-interactive shells
+			case 'A', 'a':
+				fmt.Fprintln(hc.Stderr, "del: /A (attribute filter) is not supported; use rm with explicit paths")
+				return exitError{1}
+			}
+		}
+		if strings.HasPrefix(a, "/A:") || strings.HasPrefix(a, "/a:") {
+			fmt.Fprintln(hc.Stderr, "del: /A (attribute filter) is not supported; use rm with explicit paths")
+			return exitError{1}
+		}
+		norm = append(norm, a)
+	}
+	return cmdRm(ctx, hc, norm)
+}
+
+// cmdDir implements the cmd.exe DIR command for AX parity on Windows
+// (bare `dir` / `dir /b` / `dir /s` from cmd-habituated agents).
+// Mapping: /B -> -1 (bare names), /S -> -R (recurse), /A -> -a (all),
+// /W -> -C (wide/columns). Display-only switches (/O, /L, /P, /Q, /T,
+// /D, /N, /X, /R, /C, /4 and their :args forms) are accepted and
+// ignored: same file set, only layout differs. Delegates to cmdLs.
+func cmdDir(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	norm := make([]string, 0, len(args))
+	norm = append(norm, "ls")
+	for _, a := range args[1:] {
+		up := strings.ToUpper(a)
+		if len(a) >= 2 && (a[0] == '/' || a[0] == '\\') {
+			letter := up[1]
+			rest := ""
+			if idx := strings.IndexByte(a, ':'); idx >= 0 {
+				rest = a[idx:]
+			}
+			switch letter {
+			case 'B':
+				norm = append(norm, "-1")
+				continue
+			case 'S':
+				norm = append(norm, "-R")
+				continue
+			case 'A':
+				if rest != "" {
+					// /A:attrs (e.g. /A:D, /A:-H): attribute filter,
+					// same rationale as del /A: refuse loudly.
+					fmt.Fprintln(hc.Stderr, "dir: /A:attrs (attribute filter) is not supported")
+					return exitError{1}
+				}
+				norm = append(norm, "-a")
+				continue
+			case 'W':
+				norm = append(norm, "-C")
+				continue
+			case 'O', 'L', 'P', 'Q', 'T', 'D', 'N', 'X', 'R', 'C':
+				continue // display-only: same file set
+			case '4':
+				continue // /4 (four-digit year): noop
+			}
+		}
+		norm = append(norm, a)
+	}
+	return cmdLs(ctx, hc, norm)
 }
 
 func cmdMkdir(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -643,10 +750,14 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			return nil
 		}
 		if err := runSubcommand(ctx, hc, rest); err != nil {
-			if es, ok := err.(exitError); ok && es.code == 127 {
-				return err
+			if isExecNotFound(err) {
+				fmt.Fprintf(hc.Stderr, "xargs: %s: No such file or directory\n", rest[0])
+				return exitError{127}
 			}
-			return exitError{1}
+			if es, ok := err.(exitError); ok && es.code == 255 {
+				return exitError{124}
+			}
+			return exitError{123}
 		}
 		return nil
 	}
@@ -677,10 +788,16 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			fmt.Fprintf(hc.Stderr, "+ %s\n", strings.Join(cmdArgs, " "))
 		}
 		if err := runSubcommand(ctx, hc, cmdArgs); err != nil {
-			if es, ok := err.(exitError); ok && es.code == 127 {
-				return err
+			es, ok := err.(exitError)
+			if isExecNotFound(err) {
+				fmt.Fprintf(hc.Stderr, "xargs: %s: No such file or directory\n", cmdArgs[0])
+				return exitError{127}
 			}
-			code = 1
+			if ok && es.code == 255 {
+				// GNU xargs aborts when a command exits 255.
+				return exitError{124}
+			}
+			code = 123
 		}
 	}
 	if code != 0 {
@@ -689,12 +806,29 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	return nil
 }
 
+// isExecNotFound reports whether err is the "executable not found"
+// failure (from os/exec or our own pre-check).
+func isExecNotFound(err error) bool {
+	if errors.Is(err, errExecNotFound) || errors.Is(err, exec.ErrNotFound) {
+		return true
+	}
+	var ee *exec.Error
+	return errors.As(err, &ee) && ee.Err == exec.ErrNotFound
+}
+
+// errExecNotFound marks "command could not be found" failures so
+// callers can map them to GNU's exit codes/messages.
+var errExecNotFound = errors.New("executable file not found in $PATH")
+
 func runSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) error {
 	if len(cmdArgs) == 0 {
 		return nil
 	}
 	if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
 		return cmd.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
+	}
+	if _, err := interp.LookPathDir(hc.Dir, hc.Env, cmdArgs[0]); err != nil {
+		return errExecNotFound
 	}
 	return interp.DefaultExecHandler(2)(ctx, cmdArgs)
 }
@@ -742,7 +876,8 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 	}
 	enc := base64.StdEncoding.EncodeToString(data)
 	if *wrap <= 0 {
-		fmt.Fprintln(hc.Stdout, enc)
+		// GNU -w0: one single line, no trailing newline.
+		fmt.Fprint(hc.Stdout, enc)
 		return nil
 	}
 	for len(enc) > *wrap {

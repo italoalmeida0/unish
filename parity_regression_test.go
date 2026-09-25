@@ -1009,6 +1009,95 @@ func TestParityNewFlags(t *testing.T) {
 	}
 }
 
+func TestParityPipeEarlyAbort(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.MkdirAll(dir+"/big", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2000; i++ {
+		mustWrite(t, dir+"/big/f.txt", "x\n")
+		break
+	}
+	// 2000 files via loop would be slow in-test; use seq-fed find target:
+	// find must abort on closed pipe (head -5) instead of walking all.
+	out, _, _ := runParityScript(t, dir, "seq 1 200000 | head -c 20")
+	if out == "" {
+		t.Errorf("seq | head -c = empty")
+	}
+	// head -c must not surface a pipe error (GNU: silent rc 0).
+	_, errOut, _ := runParityScript(t, dir, "seq 1 200000 | head -c 20")
+	if strings.Contains(errOut, "pipe") {
+		t.Errorf("seq | head -c stderr = %q, want silent", errOut)
+	}
+	// find | head: first lines must arrive (abort keeps them).
+	out, _, _ = runParityScript(t, dir, "find . | head -5")
+	if !strings.Contains(out, ".") {
+		t.Errorf("find | head = %q", out)
+	}
+}
+
+func TestParityCmdDelDir(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, dir+"/a.txt", "x\n")
+	out, _, _ := runParityScript(t, dir, "del a.txt; echo RC=$?")
+	if !strings.Contains(out, "RC=0") {
+		t.Errorf("del = %q", out)
+	}
+	mustWrite(t, dir+"/b.txt", "y\n")
+	out, _, _ = runParityScript(t, dir, "erase b.txt; echo RC=$?")
+	if !strings.Contains(out, "RC=0") {
+		t.Errorf("erase = %q", out)
+	}
+	out, _, _ = runParityScript(t, dir, "del nonexist.txt; echo RC=$?")
+	if !strings.Contains(out, "RC=1") {
+		t.Errorf("del missing = %q", out)
+	}
+	if err := os.MkdirAll(dir+"/sub", 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mustWrite(t, dir+"/sub/c.txt", "z\n")
+	out, _, _ = runParityScript(t, dir, "del /S sub; echo RC=$?")
+	if !strings.Contains(out, "RC=0") {
+		t.Errorf("del /S = %q", out)
+	}
+	mustWrite(t, dir+"/d.txt", "w\n")
+	out, _, _ = runParityScript(t, dir, "dir /b")
+	if !strings.Contains(out, "d.txt") {
+		t.Errorf("dir /b = %q", out)
+	}
+	out, _, _ = runParityScript(t, dir, "dir")
+	if !strings.Contains(out, "d.txt") {
+		t.Errorf("dir = %q", out)
+	}
+	out, _, _ = runParityScript(t, dir, "dir /A:D 2>&1; echo RC=$?")
+	if !strings.Contains(out, "not supported") {
+		t.Errorf("dir /A:D must refuse loudly, got %q", out)
+	}
+}
+
+func TestParityLsTimeStyle(t *testing.T) {
+	dir := t.TempDir()
+	mustWrite(t, dir+"/f.txt", "hi\n")
+	out, _, _ := runParityScript(t, dir, "ls -la --full-time f.txt")
+	f := strings.Fields(out)
+	if len(f) < 8 || strings.Count(f[5], "-") != 2 || !strings.Contains(out, ":") {
+		t.Errorf("ls --full-time = %q, want full-iso timestamp", out)
+	}
+	out, _, _ = runParityScript(t, dir, "ls -la --time-style=long-iso f.txt")
+	f = strings.Fields(out)
+	if len(f) < 7 || strings.Count(f[5], "-") != 2 {
+		t.Errorf("ls --time-style=long-iso = %q", out)
+	}
+	out, _, _ = runParityScript(t, dir, "ls -la --time-style=+%H:%M:%S f.txt")
+	if strings.Count(out, ":") < 2 {
+		t.Errorf("ls --time-style=+HMS = %q", out)
+	}
+	out, _, _ = runParityScript(t, dir, "ls -la f.txt")
+	if !strings.Contains(out, "Sep") && !strings.Contains(out, "Jan") && !strings.Contains(out, "Oct") && !strings.Contains(out, "202") {
+		t.Errorf("ls default time = %q", out)
+	}
+}
+
 func TestParityChildUTF8Env(t *testing.T) {
 	// Windows charmap papercut: children must inherit a UTF-8 default
 	// (PYTHONIOENCODING/PYTHONUTF8) unless the user overrode them, and

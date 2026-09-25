@@ -605,7 +605,11 @@ func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
 			for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
 				rs[i], rs[j] = rs[j], rs[i]
 			}
-			fmt.Fprintln(hc.Stdout, string(rs))
+			nl := "\n"
+			if !sc.EndedWithNewline() {
+				nl = ""
+			}
+			fmt.Fprint(hc.Stdout, string(rs)+nl)
 		}
 		if err := sc.Err(); err != nil {
 			fmt.Fprintln(hc.Stderr, "rev:", err)
@@ -615,7 +619,38 @@ func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
+// foldOldStyle rewrites GNU fold's old-style width flags (-3, -b3,
+// -sb6) into -w N so Go's flag parser can handle them.
+func foldOldStyle(args []string) []string {
+	out := make([]string, 0, len(args))
+	for _, a := range args {
+		if len(a) > 1 && a[0] == '-' && a[1] != '-' {
+			i := len(a) - 1
+			for i >= 1 && a[i] >= '0' && a[i] <= '9' {
+				i--
+			}
+			if i < len(a)-1 {
+				digits := a[i+1:]
+				prefix := a[:i+1]
+				if prefix == "-" {
+					out = append(out, "-w", digits)
+				} else if strings.HasSuffix(prefix, "w") {
+					// plain attached value like -w5: leave it alone
+					out = append(out, a)
+				} else {
+					out = append(out, prefix, "-w", digits)
+				}
+				continue
+			}
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
 func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
+	// GNU fold accepts old-style widths: -3, -b3, -sb6 …
+	args = foldOldStyle(args)
 	fs := newFlagSet("fold", hc.Stderr)
 	width := fs.Uint64("w", 80, "")
 	fs.Uint64Var(width, "width", 80, "")
