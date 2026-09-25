@@ -47,7 +47,7 @@ CASES = [
     # The pattern must not appear in this script's own cmdline (PID 1 runs
     # `sh -c <script>`, and -f would match it). Build it at run time.
     ("pgrep no match exits 1",
-     r"P=no-such-$(echo victim)-xyz; /tmp/unish -c \"pgrep -f '$P'; echo rc=$?\"",
+     "/tmp/unish -c 'pgrep -f zzq; echo rc=$?'",
      "rc=1\n", 0),
 
     # --- pkill: unish's builtin, killing only the container's victim ---
@@ -72,7 +72,7 @@ CASES = [
      "sleep 30 & V=$!; sleep 0.3; /tmp/unish -c \"pkill --signal TERM -f 'sleep 30'\"; sleep 0.3; kill -0 $V 2>/dev/null; echo rc=$?",
      "rc=1\n", 0),
     ("FINDING pkill no match exits 1",
-     r"P=no-such-$(echo victim)-xyz; /tmp/unish -c \"pkill -f '$P'; echo rc=$?\"",
+     "/tmp/unish -c 'pkill -f zzq; echo rc=$?'",
      "rc=1\n", 0),
 
     # --- ss: unish's builtin, looking at a socket the container opened ---
