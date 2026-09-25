@@ -33,9 +33,7 @@ CASES = [
     ("pgrep -l lists the name",
      "sleep 30 & sleep 0.3; /tmp/unish -c \"pgrep -l -f 'sleep 30' | grep -c sleep\"",
      "1\n", 0),
-    # FINDING: pgrep -x compares ^name$ against the full cmdline's base
-    # ('sleep 30'), so it never matches a process started with arguments.
-    ("FINDING pgrep -x exact matches the command name",
+    ("pgrep -x exact matches the command name",
      "sleep 30 & sleep 0.3; /tmp/unish -c \"pgrep -x sleep | grep -cE '^[0-9]+$'\"",
      "1\n", 0),
     ("pgrep -i case-insensitive",

@@ -159,6 +159,25 @@ func matchProcs(pattern string, full, ignoreCase, exact bool) ([]procInfo, error
 		if !full {
 			target = filepath.Base(p.cmd)
 		}
+		if exact {
+			// -x matches the command NAME exactly, so compare the first
+			// word of the command line ("sleep 30" -> "sleep"). Comparing
+			// ^name$ against the whole line never matched a process
+			// started with arguments.
+			name := target
+			if i := strings.IndexAny(name, " \t"); i >= 0 {
+				name = name[:i]
+			}
+			name = filepath.Base(name)
+			if ignoreCase {
+				if strings.EqualFold(name, pattern) {
+					matched = append(matched, p)
+				}
+			} else if name == pattern {
+				matched = append(matched, p)
+			}
+			continue
+		}
 		if re.MatchString(target) {
 			matched = append(matched, p)
 		}
