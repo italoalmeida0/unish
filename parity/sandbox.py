@@ -73,10 +73,10 @@ CASES = [
     ("pkill -s chooses the signal",
      "sleep 30 & V=$!; sleep 0.3; /tmp/unish -c \"pkill -s TERM -f 'sleep 30'\"; sleep 0.3; kill -0 $V 2>/dev/null; echo rc=$?",
      "rc=1\n", 0),
-    ("FINDING pkill --signal long form",
+    ("pkill --signal long form",
      "sleep 30 & V=$!; sleep 0.3; /tmp/unish -c \"pkill --signal TERM -f 'sleep 30'\"; sleep 0.3; kill -0 $V 2>/dev/null; echo rc=$?",
      "rc=1\n", 0),
-    ("FINDING pkill no match exits 1",
+    ("pkill no match exits 1",
      "/tmp/unish -c 'pkill -f zzq; echo rc=$?'",
      "rc=1\n", 0),
 
