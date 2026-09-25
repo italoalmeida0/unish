@@ -266,6 +266,11 @@ FLAG_VALUES = {
     "--record-size": "1", "--suffix": ".bak",
     "--from": "1", "--to": "2", "--step": "1",
     "--split": "1", "--width2": "1",
+    # more value flags surfaced by the coverage pass
+    "-s": "1", "--signal": "TERM", "--radix": "x", "--text": "", "-b": "1",
+    "-t": "x1", "-o": "1", "-e": "1", "-n": "1", "-g": "1", "-l": "1",
+    "--processes": "", "-p": "1", "-u": "1", "-q": "", "-v": "",
+    "-a": "1", "-f": "", "--binary": "", "--count": "",
 }
 
 

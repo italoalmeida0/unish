@@ -94,4 +94,37 @@ CASES = [
     ("FINDING pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("FINDING pgrep -x exact no match", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("FINDING pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+
+    # --- pgrep/pkill flags, still sandboxed (unique pattern, no victims) ---
+    ("pgrep -c counts zero", "pgrep -c -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
+    ("pgrep -l lists nothing", "pgrep -l -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pgrep -x exact form", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pgrep -i case-insensitive", "pgrep -i -f 'UNISH-NO-SUCH-PROC-XYZ'; echo rc=$?", "rc=1\n", 0),
+    ("pgrep --count long form", "pgrep --count -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
+    ("pkill -e echo no match", "pkill -e -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pkill -x exact no match", "pkill -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("pkill -i case-insensitive", "pkill -i -f 'UNISH-NO-SUCH-PROC-XYZ'; echo rc=$?", "rc=1\n", 0),
+    # FINDING: pkill -s (session) is not implemented.
+    ("FINDING pkill -s session", "pkill -s 0 -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+
+    # --- ss flags: shape only, no live sockets assumed ---
+    ("ss -t tcp table", "ss -t | head -1 | grep -c State", "1\n", 0),
+    ("ss -a all table", "ss -a | head -1 | grep -c Netid", "1\n", 0),
+    ("ss -l listening", "ss -l | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("ss -n numeric", "ss -n | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("ss -u udp", "ss -u | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("ss --tcp long form", "ss --tcp | head -1 | grep -c State", "1\n", 0),
+    ("ss --all long form", "ss --all | head -1 | grep -c Netid", "1\n", 0),
+    ("ss --listening long form", "ss --listening | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("ss --numeric long form", "ss --numeric | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("ss --udp long form", "ss --udp | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+
+    # --- nc/netcat flags: usage/shape only, no outbound connection ---
+    ("nc --udp usage", "nc --udp --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("nc -v verbose usage", "nc -v --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("nc -z zero usage", "nc -z --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("nc -w timeout usage", "nc -w 1 --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("netcat --udp usage", "netcat --udp --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("netcat -z zero usage", "netcat -z --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("netcat -w timeout usage", "netcat -w 1 --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
 ]
