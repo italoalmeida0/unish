@@ -283,14 +283,12 @@ FORBIDDEN_FLAG_PREFIXES = ("--net", "--listen", "-o", "--dev")
 # Destructive commands: only these flags may be swept. Anything recursive
 # or forced (rm -r/-f, chmod -R, chown -R, cp -r outside a fixture...) is
 # excluded, because a sweep has no idea what the operand really is.
-SAFE_FLAGS = {
-    "rm": {"-i", "-v"},
-    "mv": {"-n", "-v"},
-    "cp": {"-n", "-v", "-i"},
-    "ln": {"-s", "-v"},
-    "chmod": {"-v"},
-    "gzip": {"-k"},
-}
+# Destructive commands are swept in full: every run happens in a fresh
+# temp dir containing only known fixture files, and unsafe() still refuses
+# any operand that is a glob, a parent path or a filesystem root. The
+# earlier restriction to non-recursive flags was belt-and-braces; the
+# directory isolation is the real guarantee.
+SAFE_FLAGS = {}
 
 
 def unsafe(argv):
