@@ -24,6 +24,7 @@ import argparse
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
@@ -94,6 +95,26 @@ def is_old_oracle(oracle_spec):
     return "git" in low or "msys" in low
 
 
+def findutils_version():
+    """(major, minor) of the findutils the oracle would reach for, or None.
+
+    Diagnostic wording moved again in findutils 4.10 ("invalid file mode",
+    "failed to run command ..."), just as coreutils 8.32 worded things the
+    old way. unish pins one GNU wording -- the one on Ubuntu LTS and Git
+    Bash -- so whichever end drifts away is the oracle's delta, not a
+    behavioural gap. See the "oracle-wording" case tag."""
+    path = oracle_path("find")
+    if not path:
+        return None
+    try:
+        out = subprocess.run([path, "--version"], stdout=subprocess.PIPE,
+                             stderr=subprocess.DEVNULL, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(rb"(\d+)\.(\d+)", out)
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
 def platform_key():
     """Coarse platform tag for case filtering: linux/windows/darwin."""
     return platform.system().lower()
@@ -148,6 +169,15 @@ def main():
     # Both shells are spawned with the same inherited environment (run_one
     # takes none), so the oracle spec's @PATHPREFIX is honoured exactly
     # where it matters: ORACLE_PATH for the flag probe, set above.
+    #
+    # Pin the locale too: collation, numeric parsing and diagnostic
+    # quoting all follow it (GNU sort alone answers `sort -u` and
+    # `sort -n` differently in C and in en_US.UTF-8), and a differential
+    # is only meaningful when both sides see the same one. C.UTF-8 keeps
+    # GNU's UTF-8 quoting style while staying byte-collated.
+    os.environ["LC_ALL"] = "C.UTF-8"
+    os.environ["LANG"] = "C.UTF-8"
+    new_oracle = (findutils_version() or (0, 0)) >= (4, 10)
     oracle, _ = parse_shell(args.oracle)
     unish = os.path.abspath(args.unish)
 
@@ -161,6 +191,10 @@ def main():
             if xfail == "old-oracle":
                 # Applied only when the oracle is an older toolkit.
                 xfail = "coreutils 8.32 (Git Bash) wording" if is_old_oracle(args.oracle) else ""
+            elif xfail == "oracle-wording":
+                # Wording drifted in newer GNU too (findutils 4.10+).
+                xfail = ("the oracle's GNU generation words this differently"
+                         if (is_old_oracle(args.oracle) or new_oracle) else "")
             dirs = [tempfile.mkdtemp(prefix="parity_u_"), tempfile.mkdtemp(prefix="parity_o_")]
             try:
                 uo, uc, ue = run_one([unish], script, dirs[0], args.timeout)
