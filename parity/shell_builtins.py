@@ -27,8 +27,8 @@ CASES = [
     # --- parameters ---
     ("shift drops an argument", "set -- a b c; shift; echo $#", "2\n", 0),
     ("shift by two", "set -- a b c; shift 2; echo $#", "1\n", 0),
-    # FINDING: shift past the end exits 0; bash exits 1.
-    ("FINDING shift past the end fails", "set -- a; shift 5; echo rc=$?", "rc=1\n", 0),
+    # shift past the end fails with status 1, like bash (fixed).
+    ("shift past the end fails", "set -- a; shift 5; echo rc=$?", "rc=1\n", 0),
     ("positional params", "set -- x y; echo $1 $2", "x y\n", 0),
     ("$# counts arguments", "set -- a b c; echo $#", "3\n", 0),
     ("$@ expands to all", 'set -- a b; for p in "$@"; do echo $p; done', "a\nb\n", 0),

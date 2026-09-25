@@ -208,7 +208,15 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 		default:
 			return failf(2, "usage: shift [n]\n")
 		}
-		if n >= len(r.Params) {
+		if n < 0 {
+			return failf(2, "shift: %s: shift count out of range\n", args[0])
+		}
+		// bash errors when the count exceeds the number of positional
+		// parameters; it does not silently clear them.
+		if n > len(r.Params) {
+			return failf(1, "shift: %d: shift count out of range\n", n)
+		}
+		if n == len(r.Params) {
 			r.Params = nil
 		} else {
 			r.Params = r.Params[n:]
