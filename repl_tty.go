@@ -54,6 +54,9 @@ func runInteractive() int {
 	if d, err := os.Getwd(); err == nil {
 		r.Dir = d
 	}
+	// First interactive run: offer a starter ~/.unishrc when the user
+	// has none, like a distro's default bashrc.
+	rp.ensureRCFile()
 	rp.rcFile()
 	// History file.
 	histFile := rp.getenv("HISTFILE")

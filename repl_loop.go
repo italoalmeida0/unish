@@ -425,6 +425,40 @@ func incomplete(src string) bool {
 	return false
 }
 
+// defaultRC is the starter ~/.unishrc written on the first interactive
+// run (like a distro's default bashrc). Bash leans on /etc/bash.bashrc,
+// but no system template can be guaranteed to exist — especially on
+// Windows — so the shell ships its own.
+const defaultRC = `# ~/.unishrc — sourced by unish at interactive startup (like ~/.bashrc).
+# Created automatically on the first run; edit it freely.
+# It has no effect on scripts or "unish -c".
+
+# Handy aliases
+alias ll='ls -l'
+alias la='ls -la'
+alias l='ls'
+
+# Suggestions (uncomment to taste)
+# alias grep='grep --color=auto'
+# alias ..='cd ..'
+# export EDITOR=vim
+# export PAGER=less
+`
+
+// ensureRCFile writes the starter ~/.unishrc on the first interactive
+// run; it never overwrites an existing file and is best-effort.
+func (rp *repl) ensureRCFile() {
+	h, err := os.UserHomeDir()
+	if err != nil {
+		return
+	}
+	p := filepath.Join(h, ".unishrc")
+	if _, err := os.Stat(p); err == nil {
+		return
+	}
+	_ = os.WriteFile(p, []byte(defaultRC), 0o644)
+}
+
 // rcFile sources ~/.unishrc when present (non-fatal).
 func (rp *repl) rcFile() {
 	h, err := os.UserHomeDir()
