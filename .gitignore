@@ -29,3 +29,6 @@ comandos.json
 # Python
 __pycache__/
 *.pyc
+
+# split output from tests
+xa[a-z]
