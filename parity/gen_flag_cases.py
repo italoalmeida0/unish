@@ -77,14 +77,15 @@ def main():
                 with open(os.path.join(work, name), "w") as fh:
                     fh.write(content)
             # Capture the oracle's exact result: this IS the expectation.
-            o_rc, o_out, _ = fa.run(oracle(cmd), argv, work)  # GNU: direct argv
+            feed = b"abc xyz\n" if fx.get("stdin") else b""
+            o_rc, o_out, _ = fa.run(oracle(cmd), argv, work, stdin=feed)  # GNU: direct argv
             # Git Bash's coreutils emit CRLF; normalise so the captured
             # expectation is about semantics, not the terminal.
             o_out = o_out.replace(b"\r\n", b"\n")
             if o_rc != 0 or not o_out:
                 skipped.append((cmd + " " + fl, "oracle produced no output"))
                 continue
-            _, u_out, _ = fa.run(unish, argv, work, shell=True)  # unish: builtin via -c
+            _, u_out, _ = fa.run(unish, argv, work, stdin=feed, shell=True)  # unish: builtin via -c
             u_out = u_out.replace(b"\r\n", b"\n")
             same = u_out == o_out
             note = "" if same else "DIFFERS: unish=%r" % u_out[:60]

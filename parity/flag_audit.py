@@ -122,6 +122,28 @@ FIXTURES = {
     "false": {"base": ""},
     "yes": {"base": ""},
     "seq2": {"base": ""},
+
+    # --- commands whose flags need a real fixture to mean anything ---
+    "tee":     {"files": {"a.txt": "data\n"}, "base": "a.txt", "stdin": True},
+    "tr":      {"base": "'abc' 'xyz'", "stdin": True},
+    "diff":    {"files": {"a.txt": "1\n2\n", "b.txt": "1\n3\n"}, "base": "a.txt b.txt"},
+    "cmp":     {"files": {"a.txt": "same\n", "b.txt": "same\n"}, "base": "a.txt b.txt"},
+    "touch":   {"files": {"a.txt": "a"}, "base": "a.txt"},
+    "ln":      {"files": {"a.txt": "a"}, "base": "a.txt link.txt"},
+    "gzip":    {"files": {"a.txt": "hello\n"}, "base": "a.txt"},
+    "gunzip":  {"files": {"a.txt.gz": ""}, "base": "a.txt.gz"},
+    "tar":     {"files": {"a.txt": "a", "b.txt": "b"}, "base": "a.txt b.txt"},
+    "xargs":   {"base": "echo", "stdin": True},
+    "timeout": {"base": "1 true"},
+    "nice":    {"base": "true"},
+    "env":     {"base": ""},
+    "shasum":  {"files": {"a.txt": "hello\n"}, "base": "a.txt"},
+    "hexdump": {"files": {"a.txt": "abc\n"}, "base": "a.txt"},
+    "strings": {"files": {"a.txt": "hello world\n"}, "base": "a.txt"},
+    "expand":  {"files": {"a.txt": "a\tb\n"}, "base": "a.txt"},
+    "free":    {"base": ""},
+    "ps":      {"base": ""},
+    "ss":      {"base": ""},
 }
 
 # Flags that need something this harness cannot fake (documented, not
