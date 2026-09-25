@@ -37,6 +37,7 @@ from cases.flag_cases import FLAG_CASES
 from cases.gap_cases import ORACLE_CASES, FIXED_CASES
 from e2e import CASES as E2E_CASES
 from edge_cases import CASES as EDGE_CASES
+from flag_audit import oracle_path
 
 CASE_GROUPS = [
     ("sort", sort_cases.CASES),
@@ -137,7 +138,7 @@ def main():
         return 1 if run_e2e(unish_abs, args.timeout, args.verbose) else 0
     if args.only_flags:
         unish_abs = os.path.abspath(args.unish)
-        return 1 if run_flag_cases(unish_abs, args.timeout, args.verbose) else 0
+        return 1 if run_flag_cases(unish_abs, args.oracle, args.timeout, args.verbose) else 0
 
     oracle, env = parse_shell(args.oracle)
     unish = os.path.abspath(args.unish)
@@ -202,7 +203,7 @@ def main():
     print("=== %d cases: %d failures, %d known deltas (xfail), %d xpass" %
           (total, failed, xfailed, xpassed))
     fn_failed = run_functional(unish, args.timeout, args.verbose)
-    fl_failed = run_flag_cases(unish, args.timeout, args.verbose)
+    fl_failed = run_flag_cases(unish, args.oracle, args.timeout, args.verbose)
     gp_failed = run_gap_cases(unish, args.oracle, args.timeout, args.verbose)
     e2_failed = run_e2e(unish, args.timeout, args.verbose)
     ed_failed = run_edge(unish, args.timeout, args.verbose)
@@ -247,26 +248,26 @@ def run_go_tests(unish_dir, verbose):
     return failed
 
 
-def run_flag_cases(unish, timeout, verbose):
-    """Run generated flag cases: exact argv in, exact expected stdout out.
+def run_flag_cases(unish, oracle_spec, timeout, verbose):
+    """Fase 2: flag cases, diffed against the oracle AT RUN TIME.
 
-    The expectation was captured from GNU by parity/gen_flag_cases.py, so
-    this checks real behavior rather than "it ran without crashing".
+    The expectation is not a frozen string: it is whatever the platform's
+    GNU tool prints for the same argv right now. A captured string would
+    carry the capture machine's line endings and fail everywhere else —
+    exactly what the first cross-platform CI run exposed.
     """
+    oracle, _ = parse_shell(oracle_spec)
     total = failed = xfail = 0
     work = tempfile.mkdtemp(prefix="flags_")
     try:
-        for argv, expect, xf, files in FLAG_CASES:
+        for argv, xf, files in FLAG_CASES:
             total += 1
-            # each case gets a clean fixture dir
             for name in os.listdir(work):
                 p_ = os.path.join(work, name)
                 if os.path.isdir(p_):
                     shutil.rmtree(p_, ignore_errors=True)
                 else:
                     os.remove(p_)
-            # Recreate the exact fixtures the expectation was captured
-            # with; generic content would invalidate the expectation.
             for name, content in files.items():
                 with open(os.path.join(work, name), "w") as fh:
                     fh.write(content)
@@ -278,8 +279,20 @@ def run_flag_cases(unish, timeout, verbose):
                 failed += 1
                 print("FAIL  [flag] %s (timeout)" % cmdline)
                 continue
-            got = norm(p.stdout).decode("utf-8", "replace")
-            if got == expect:
+            got = norm(p.stdout)
+            # the oracle for this command, run with the same argv
+            o = oracle_path(argv[0])
+            if not o:
+                if verbose:
+                    print("skip  [flag] %s (no oracle)" % cmdline)
+                continue
+            try:
+                op = subprocess.run([o] + argv[1:], cwd=work, input=b"",
+                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout)
+            except subprocess.TimeoutExpired:
+                continue
+            want = norm(op.stdout)
+            if got == want:
                 if verbose:
                     print("ok    [flag] %s" % cmdline)
             elif xf:
@@ -289,7 +302,7 @@ def run_flag_cases(unish, timeout, verbose):
             else:
                 failed += 1
                 print("FAIL  [flag] %s" % cmdline)
-                print("      want %r" % expect[:120])
+                print("      want %r" % want[:120])
                 print("      got  %r" % got[:120])
     finally:
         shutil.rmtree(work, ignore_errors=True)
