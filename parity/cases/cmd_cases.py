@@ -96,11 +96,11 @@ CASES = [
     ("FINDING pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
 
     # --- pgrep/pkill flags, still sandboxed (unique pattern, no victims) ---
-    ("pgrep -c counts zero", "pgrep -c -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
+    ("FINDING pgrep -c counts zero", "pgrep -c -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
     ("pgrep -l lists nothing", "pgrep -l -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pgrep -x exact form", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pgrep -i case-insensitive", "pgrep -i -f 'UNISH-NO-SUCH-PROC-XYZ'; echo rc=$?", "rc=1\n", 0),
-    ("pgrep --count long form", "pgrep --count -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
+    ("FINDING pgrep --count long form", "pgrep --count -f 'unish-no-such-proc-xyz'; echo rc=$?", "0\nrc=1\n", 0),
     ("pkill -e echo no match", "pkill -e -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pkill -x exact no match", "pkill -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
     ("pkill -i case-insensitive", "pkill -i -f 'UNISH-NO-SUCH-PROC-XYZ'; echo rc=$?", "rc=1\n", 0),
