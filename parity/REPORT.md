@@ -9,9 +9,9 @@ rediscover any of it.
 | Group | Cases | Result |
 |---|---|---|
 | Output parity (GNU oracle) | 372 | 0 failures, 9 documented wording deltas |
-| Flag cases (oracle at run time) | 404 | 0 failures, 60 known differences |
-| Per-command fixture cases | 77 | 0 failures, 3 known gaps |
-| Sandbox (docker: pgrep/pkill/ss/nc) | 29 | 0 failures, 3 known gaps |
+| Flag cases (oracle at run time) | 410 | 0 failures, 60 known differences |
+| Per-command fixture cases | 114 | 0 failures, 17 known gaps |
+| Sandbox (docker: pgrep/pkill/ss/nc) | 35 | 0 failures, 7 known gaps |
 | Functional (does it DO it) | 21 | 0 failures, 5 known gaps |
 | Gaps: the 15 uncovered commands | 37 | 0 failures, 1 known gap |
 | End-to-end (real processes) | 38 | 0 failures |
@@ -21,14 +21,17 @@ rediscover any of it.
 CI runs all of it on Linux, macOS and Windows, plus a docker sandbox
 job (10 jobs, all green).
 
-## Flag coverage: 431 of 503 (86%), every command covered
+## Flag coverage: 502 of 503 (100%)
 
-All 90 embedded commands have at least one flag case; 431 of 503 flags
-are exercised (a long alias counts when its short form is).
+Every declared flag of every embedded command has a case. The single
+remainder, `od -n`, is not a GNU flag at all — it is an artefact of the
+extractor reading `-N`.
 
-The remaining 72 need live state a test cannot invent safely: process
-matching and sockets (covered instead in the docker sandbox), plus a
-handful of platform-specific flags.
+Where a flag needs state a test cannot invent safely (a process to
+signal, a socket), the case lives in the docker sandbox instead of being
+skipped. Where the flag does not exist in GNU (`strings -a`, `od -u`,
+`cat -S`, `md5sum -q/-s`), the case is tagged FINDING and reported as a
+known gap rather than hidden.
 
 ## Real findings in unish
 
