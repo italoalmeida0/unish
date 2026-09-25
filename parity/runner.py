@@ -34,6 +34,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from cases import misc_cases, printf_cases, sed_cases, shell_cases, sort_cases
 from functional import CASES as FUNCTIONAL_CASES
 from cases.flag_cases import FLAG_CASES
+from cases.gap_cases import ORACLE_CASES, FIXED_CASES
 
 CASE_GROUPS = [
     ("sort", sort_cases.CASES),
@@ -190,7 +191,8 @@ def main():
           (total, failed, xfailed, xpassed))
     fn_failed = run_functional(unish, args.timeout, args.verbose)
     fl_failed = run_flag_cases(unish, args.timeout, args.verbose)
-    return 1 if (failed or fn_failed or fl_failed) else 0
+    gp_failed = run_gap_cases(unish, args.oracle, args.timeout, args.verbose)
+    return 1 if (failed or fn_failed or fl_failed or gp_failed) else 0
 
 
 def run_go_tests(unish_dir, verbose):
@@ -278,6 +280,60 @@ def run_flag_cases(unish, timeout, verbose):
     finally:
         shutil.rmtree(work, ignore_errors=True)
     print("=== flags: %d cases, %d failures, %d known differences" % (total, failed, xfail))
+    return failed
+
+
+def run_gap_cases(unish, oracle_spec, timeout, verbose):
+    """Fase 3: the 15 commands that had no coverage.
+
+    FIXED_CASES carry a frozen expected value (hash of a known input,
+    literal output). ORACLE_CASES are machine-dependent, so they are
+    diffed against GNU with the same script — the only honest expectation
+    for `df` sizes, `uptime` minutes or `hostname`.
+    """
+    total = failed = 0
+    oracle, _ = parse_shell(oracle_spec)
+    for name, script, expect in FIXED_CASES:
+        total += 1
+        d = tempfile.mkdtemp(prefix="gap_")
+        try:
+            got, rc, _ = run_one([unish], script, d, timeout)
+            got_s = norm(got).decode("utf-8", "replace")
+            if got_s == expect:
+                if verbose:
+                    print("ok    [gap] %s" % name)
+            elif name.startswith("FINDING"):
+                # A documented gap: GNU does X, unish does not yet. Kept
+                # visible (not skipped) so it shows up in every run.
+                print("KNOWN GAP [gap] %s" % name)
+                if verbose:
+                    print("      want %r  got %r" % (expect, got_s))
+            else:
+                failed += 1
+                print("FAIL  [gap] %s" % name)
+                print("      script: %r" % script)
+                print("      want %r" % expect)
+                print("      got  %r" % got_s)
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    for name, script in ORACLE_CASES:
+        total += 1
+        du, do = tempfile.mkdtemp(prefix="gapu_"), tempfile.mkdtemp(prefix="gapo_")
+        try:
+            uo, urc, _ = run_one([unish], script, du, timeout)
+            oo, orc, _ = run_one(oracle, script, do, timeout)
+            if norm(uo) == norm(oo) and urc == orc:
+                if verbose:
+                    print("ok    [gap] %s" % name)
+            else:
+                failed += 1
+                print("FAIL  [gap] %s" % name)
+                print("      script: %r" % script)
+                print("      unish %r/%d  oracle %r/%d" % (norm(uo)[:80], urc, norm(oo)[:80], orc))
+        finally:
+            shutil.rmtree(du, ignore_errors=True)
+            shutil.rmtree(do, ignore_errors=True)
+    print("=== gaps: %d cases, %d failures" % (total, failed))
     return failed
 
 
