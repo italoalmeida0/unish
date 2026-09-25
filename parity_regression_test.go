@@ -769,15 +769,11 @@ func TestParityMisc(t *testing.T) {
 	if exitCode(err) != 1 || strings.TrimSpace(out) != "not a tty" {
 		t.Errorf("tty = %q code %d", out, exitCode(err))
 	}
-	// logname parity: it fails (exit 1) without a login session, but CI
-	// and desktop sessions provide one — follow the system tool.
-	want := 1
-	if out, err := exec.Command("logname").Output(); err == nil && strings.TrimSpace(string(out)) != "" {
-		want = 0
-	}
+	// logname fails without a login session (no tty under tests/CI),
+	// even when LOGNAME is in the environment, like GNU logname.
 	_, _, err = runParityScript(t, dir, "logname")
-	if exitCode(err) != want {
-		t.Errorf("logname code = %d; want %d", exitCode(err), want)
+	if exitCode(err) != 1 {
+		t.Errorf("logname code = %d; want 1", exitCode(err))
 	}
 	// clear emits home+erase+erase-scrollback.
 	out, _, _ = runParityScript(t, dir, "clear | od -An -tx1")

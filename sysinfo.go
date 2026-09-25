@@ -15,6 +15,8 @@ import (
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
+
+	"golang.org/x/term"
 )
 
 func init() {
@@ -621,12 +623,10 @@ func cmdLogname(_ context.Context, hc interp.HandlerContext, args []string) erro
 	// GNU logname prints the utmp login name and fails when there is no
 	// login session (e.g. non-interactive containers), even if $USER or
 	// $LOGNAME is set. unish has no utmp access, so it succeeds only when
-	// LOGNAME is explicitly present AND stdin is a terminal (closest
-	// observable proxy for an interactive login session).
-	loginTTY := false
-	if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
-		loginTTY = true
-	}
+	// LOGNAME is explicitly present AND stdin is a real terminal (closest
+	// observable proxy for an interactive login session; /dev/null is a
+	// character device but never a terminal).
+	loginTTY := term.IsTerminal(int(os.Stdin.Fd()))
 	if v := shellGetenv(hc, "LOGNAME"); v != "" && loginTTY {
 		if i := strings.LastIndexAny(v, `\/`); i >= 0 {
 			v = v[i+1:]
