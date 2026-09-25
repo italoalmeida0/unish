@@ -57,6 +57,8 @@ FIXED_CASES = [
      "f572d396fae9206628714fb2ce00f72e94f2258f  f\n"),
     # tee with no file operand is the portable form; /dev/null is POSIX-only.
     ("tee passes through", "printf 'hi\\n' | tee", "hi\n"),
+    # tee /dev/null works on Windows too now (NUL mapping).
+    ("tee to /dev/null", "printf 'hi\\n' | tee /dev/null", "hi\n"),
     ("tee writes file", "printf 'hi\\n' | tee out >/dev/null; cat out", "hi\n"),
     ("tee -a appends", "printf 'a\\n' > out; printf 'b\\n' | tee -a out >/dev/null; cat out", "a\nb\n"),
     ("nice passes argv", "nice echo ok", "ok\n"),

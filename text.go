@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -2960,7 +2961,16 @@ func cmdTee(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		} else {
 			fl |= os.O_TRUNC
 		}
-		fh, err := os.OpenFile(resolve(hc.Dir, f), fl, 0644)
+		// /dev/null is a POSIX device that does not exist on Windows:
+		// resolve() would turn it into a relative path. Map it to NUL
+		// (and drop O_TRUNC, which NUL rejects), like the shell's own
+		// open handler does for redirections.
+		path := resolve(hc.Dir, f)
+		if runtime.GOOS == "windows" && (f == "/dev/null" || path == "/dev/null") {
+			path = "NUL"
+			fl &^= os.O_TRUNC
+		}
+		fh, err := os.OpenFile(path, fl, 0644)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "tee:", err)
 			return exitError{1}
