@@ -97,16 +97,6 @@ def is_old_oracle(oracle_spec):
 def platform_key():
     """Coarse platform tag for case filtering: linux/windows/darwin."""
     return platform.system().lower()
-    """name=CMD[+ARGS][@PATHPREFIX] like the bench harness."""
-    if "@" in spec:
-        cmd, path_prefix = spec.rsplit("@", 1)
-    else:
-        cmd, path_prefix = spec, ""
-    env = None
-    if path_prefix:
-        env = dict(os.environ)
-        env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
-    return cmd.split("+"), env
 
 
 def main():
@@ -116,8 +106,6 @@ def main():
     ap.add_argument("--filter", default="", help="only run cases whose script contains this")
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--verbose", action="store_true")
-    ap.add_argument("--skip-platform", action="store_true",
-                    help="skip cases that need GNU/busybox tooling absent here")
     ap.add_argument("--only-builtins", action="store_true",
                     help="run only the shell builtin cases")
     ap.add_argument("--only-cmd", action="store_true",
@@ -157,15 +145,11 @@ def main():
     if args.only_flags:
         unish_abs = os.path.abspath(args.unish)
         return 1 if run_flag_cases(unish_abs, args.oracle, args.timeout, args.verbose) else 0
-    oracle, env = parse_shell(args.oracle)
+    # Both shells are spawned with the same inherited environment (run_one
+    # takes none), so the oracle spec's @PATHPREFIX is honoured exactly
+    # where it matters: ORACLE_PATH for the flag probe, set above.
+    oracle, _ = parse_shell(args.oracle)
     unish = os.path.abspath(args.unish)
-    base_env = dict(os.environ)
-    base_env["LC_ALL"] = "C.UTF-8"
-    base_env["LANG"] = "C.UTF-8"
-    if env:
-        env = dict(env)
-        env["LC_ALL"] = "C.UTF-8"
-        env["LANG"] = "C.UTF-8"
 
     total = failed = xfailed = xpassed = 0
     for group, cases in CASE_GROUPS:
