@@ -2,6 +2,7 @@
 unish
 unish.exe
 unish-*
+!assets/
 *.exe
 
 # Go build cache / test artifacts
