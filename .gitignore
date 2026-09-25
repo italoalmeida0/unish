@@ -32,3 +32,8 @@ __pycache__/
 
 # split output from tests
 xa[a-z]
+
+# test artifacts
+sum
+out.txt
+f3
