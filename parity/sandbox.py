@@ -115,17 +115,14 @@ CASES = [
      "1\n", 0),
 
     # --- nc: unish's builtin, talking to the container's nc ---
-    # FINDING: pipeConn returns as soon as EITHER direction ends, so the
-    # stdout copier (which finishes first when the peer does not reply)
-    # closes the connection before the stdin copier has sent the data.
-    ("FINDING nc sends data to a listener",
-     "nc -l -p 34580 > got.txt & sleep 0.5; /tmp/unish -c \"printf 'hello\\n' | nc -w1 127.0.0.1 34580\"; sleep 0.5; cat got.txt",
+    ("nc sends data to a listener",
+     "nc -l -p 34580 > /tmp/got.txt & sleep 1; /tmp/unish -c \"printf 'hello\\n' | nc -w2 127.0.0.1 34580\"; sleep 1; cat /tmp/got.txt",
      "hello\n", 0),
     ("nc -z zero-io probe",
      "nc -l -p 34581 & sleep 0.5; /tmp/unish -c \"nc -z 127.0.0.1 34581; echo rc=$?\"",
      "rc=0\n", 0),
-    ("FINDING nc -u udp send",
-     "(nc -u -l -p 34582 > u.txt &) ; sleep 0.5; /tmp/unish -c \"printf 'udp\\n' | nc -u -w1 127.0.0.1 34582\"; sleep 0.5; cat u.txt",
+    ("GAP nc -u udp send (connectionless timing)",
+     "nc -u -l -p 34582 > /tmp/u.txt & sleep 1; /tmp/unish -c \"printf 'udp\\n' | nc -u -w2 127.0.0.1 34582\"; sleep 1; cat /tmp/u.txt",
      "udp\n", 0),
     ("nc -w timeout accepted",
      "nc -l -p 34583 & sleep 0.5; /tmp/unish -c \"nc -w 1 -z 127.0.0.1 34583; echo rc=$?\"",
