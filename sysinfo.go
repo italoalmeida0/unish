@@ -124,19 +124,77 @@ func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("ps", hc.Stderr)
 	bsd := false
 	full := false
-	for _, a := range args[1:] {
+	var oformat string
+	var pids []int
+	for i := 0; i < len(args[1:]); i++ {
+		a := args[1:][i]
 		if a == "aux" {
 			bsd = true
 			continue
 		}
 		t := strings.TrimPrefix(a, "-")
 		if a != t {
-			if strings.Contains(t, "f") || strings.Contains(t, "u") || strings.Contains(t, "l") {
-				full = true
+			if strings.HasPrefix(t, "-format=") {
+				oformat = strings.TrimPrefix(t, "-format=")
+				continue
+			}
+			// Walk cluster chars; -o/-p take a value from the rest of
+			// the cluster or the next argument (GNU getopt behavior).
+			for j := 0; j < len(t); j++ {
+				c := t[j]
+				switch c {
+				case 'o':
+					if j == len(t)-1 {
+						if i+1 < len(args[1:]) {
+							i++
+							oformat = args[1:][i]
+						}
+					} else {
+						oformat = t[j+1:]
+					}
+					j = len(t)
+				case 'p':
+					if j == len(t)-1 {
+						if i+1 < len(args[1:]) {
+							i++
+							pids = append(pids, psParsePids(args[1:][i])...)
+						}
+					} else {
+						pids = append(pids, psParsePids(t[j+1:])...)
+					}
+					j = len(t)
+				default:
+					if c == 'f' || c == 'u' || c == 'l' {
+						full = true
+					}
+				}
 			}
 		}
 	}
 	_ = fs
+	if oformat != "" {
+		// GNU: -o overrides every other output mode.
+		procs, err := listProcs()
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "ps:", err)
+			return exitError{1}
+		}
+		sort.Slice(procs, func(i, j int) bool { return procs[i].pid < procs[j].pid })
+		if len(pids) > 0 {
+			want := map[int]bool{}
+			for _, p := range pids {
+				want[p] = true
+			}
+			kept := procs[:0]
+			for _, p := range procs {
+				if want[p.pid] {
+					kept = append(kept, p)
+				}
+			}
+			procs = kept
+		}
+		return psPrintFormat(procs, oformat)
+	}
 	if bsd && !full {
 		full = false
 	}
@@ -176,6 +234,112 @@ func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintf(hc.Stdout, "%-12s %5d %4s %4s %6s %5s %-8s %-4s %-7s %8s %s\n",
 			p.user, p.pid, pctStr(p.cpu), pctStr(p.memPct),
 			kbStr(p.vszKB), kbStr(p.rssKB), p.tty, p.stat, p.start, p.time, p.cmd)
+	}
+	return nil
+}
+
+// psParsePids splits a GNU PID list ("1,2 3") into integers.
+func psParsePids(s string) []int {
+	var out []int
+	for _, part := range strings.FieldsFunc(s, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	}) {
+		if n, err := strconv.Atoi(part); err == nil {
+			out = append(out, n)
+		}
+	}
+	return out
+}
+
+// psPrintFormat prints the GNU ps -o column selection: comma or space
+// separated field names, with the familiar headers and widths.
+func psPrintFormat(procs []procInfo, oformat string) error {
+	type col struct {
+		head  string
+		get   func(procInfo) string
+		right bool
+		wide  int
+	}
+	fields := map[string]col{
+		"pid":  {"PID", func(p procInfo) string { return strconv.Itoa(p.pid) }, true, 7},
+		"ppid": {"PPID", func(p procInfo) string { return strconv.Itoa(p.ppid) }, true, 7},
+		"user": {"USER", func(p procInfo) string { return p.user }, false, 8},
+		"uid":  {"USER", func(p procInfo) string { return p.user }, false, 8},
+		"comm": {"COMMAND", func(p procInfo) string {
+			c := p.cmd
+			if i := strings.IndexByte(c, ' '); i >= 0 {
+				c = c[:i]
+			}
+			if i := strings.LastIndexAny(c, `/\`); i >= 0 {
+				c = c[i+1:]
+			}
+			return c
+		}, false, 0},
+		"args":    {"COMMAND", func(p procInfo) string { return p.cmd }, false, 0},
+		"cmd":     {"COMMAND", func(p procInfo) string { return p.cmd }, false, 0},
+		"command": {"COMMAND", func(p procInfo) string { return p.cmd }, false, 0},
+		"time":    {"TIME", func(p procInfo) string { return p.time }, true, 8},
+		"cputime": {"TIME", func(p procInfo) string { return p.time }, true, 8},
+		"stat":    {"STAT", func(p procInfo) string { return p.stat }, false, 4},
+		"state": {"S", func(p procInfo) string {
+			if p.stat != "" {
+				return p.stat[:1]
+			}
+			return "?"
+		}, false, 1},
+		"tty":   {"TT", func(p procInfo) string { return p.tty }, false, 8},
+		"%cpu":  {"%CPU", func(p procInfo) string { return pctStr(p.cpu) }, true, 5},
+		"pcpu":  {"%CPU", func(p procInfo) string { return pctStr(p.cpu) }, true, 5},
+		"%mem":  {"%MEM", func(p procInfo) string { return pctStr(p.memPct) }, true, 5},
+		"pmem":  {"%MEM", func(p procInfo) string { return pctStr(p.memPct) }, true, 5},
+		"vsz":   {"VSZ", func(p procInfo) string { return kbStr(p.vszKB) }, true, 7},
+		"rss":   {"RSS", func(p procInfo) string { return kbStr(p.rssKB) }, true, 7},
+		"start": {"STARTED", func(p procInfo) string { return p.start }, false, 7},
+	}
+	var sel []col
+	for _, name := range strings.FieldsFunc(oformat, func(r rune) bool {
+		return r == ',' || r == ' ' || r == '\t'
+	}) {
+		c, ok := fields[strings.ToLower(name)]
+		if !ok {
+			fmt.Fprintf(os.Stderr, "ps: unknown field name: %s\n", name)
+			return exitError{1}
+		}
+		sel = append(sel, c)
+	}
+	if len(sel) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	for i, c := range sel {
+		if i > 0 {
+			sb.WriteByte(' ')
+		}
+		if c.right {
+			fmt.Fprintf(&sb, "%*s", c.wide, c.head)
+		} else if c.wide > 0 {
+			sb.WriteString(fmt.Sprintf("%-*s", c.wide, c.head))
+		} else {
+			sb.WriteString(c.head)
+		}
+	}
+	fmt.Fprintln(os.Stdout, sb.String())
+	for _, p := range procs {
+		sb.Reset()
+		for i, c := range sel {
+			if i > 0 {
+				sb.WriteByte(' ')
+			}
+			v := c.get(p)
+			if c.right {
+				fmt.Fprintf(&sb, "%*s", c.wide, v)
+			} else if c.wide > 0 {
+				sb.WriteString(fmt.Sprintf("%-*s", c.wide, v))
+			} else {
+				sb.WriteString(v)
+			}
+		}
+		fmt.Fprintln(os.Stdout, sb.String())
 	}
 	return nil
 }

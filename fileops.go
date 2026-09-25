@@ -52,11 +52,18 @@ func cmdCp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs.BoolVar(noClobber, "no-clobber", false, "")
 	noDeref := fs.Bool("P", false, "")
 	fs.BoolVar(noDeref, "no-dereference", false, "")
+	archive := fs.Bool("a", false, "")
+	fs.BoolVar(archive, "archive", false, "")
 	preserve := fs.Bool("p", false, "")
 	fs.BoolVar(preserve, "preserve", false, "")
 	fs.Bool("d", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
+	}
+	// GNU cp -a (archive) is -dR --preserve=all: recursive, keeping
+	// symlinks and preserving mode/timestamps.
+	if *archive {
+		*rec, *preserve, *noDeref = true, true, true
 	}
 	rest := fs.Args()
 	if len(rest) < 2 {
