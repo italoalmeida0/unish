@@ -37,8 +37,16 @@ DLLs and no installation.
   the outlier) and GNU coreutils/findutils/sed/grep/tar on Alpine
   (busybox output differs from GNU by design). Both setups assert the
   tools really report GNU before comparing anything.
-- `parity/runner.py` lost its no-op `--skip-platform` flag and some dead
-  env/locale plumbing. Neither ever affected a run.
+- The comparison environment is now pinned: both shells run under
+  `LC_ALL=C.UTF-8`, so a run no longer follows the machine's language
+  (GNU sort alone answers `sort -u` and `sort -n` differently in C and
+  in en_US.UTF-8 — behind every macOS differential failure). The runner
+  also lost its no-op `--skip-platform` flag and env plumbing that never
+  reached a child process.
+- New `oracle-wording` case tag, symmetric with the existing
+  `old-oracle`: where GNU generations word a diagnostic differently
+  (findutils 4.10 changed two), the delta is recorded as the oracle's.
+  unish pins the wording of Ubuntu LTS + Git Bash.
 
 ## 0.1.0 – 0.9.3
 
