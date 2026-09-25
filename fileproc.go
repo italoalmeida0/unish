@@ -421,6 +421,21 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 	}
 	code := 0
 	for _, p := range pids {
+		// Killing ourselves must run the trap, not terminate the process:
+		// bash defers the signal to the next statement boundary. Enqueue it
+		// instead of signalling the OS, otherwise `kill -TERM $$` would end
+		// the shell before its own trap could run.
+		if selfPID(p) {
+			if !queueSelfSignal(sig) {
+				// No trap registered: behave like bash, which dies.
+				if p2, err := os.FindProcess(os.Getpid()); err == nil {
+					if err := killProc(p2, sig); err != nil {
+						code = 1
+					}
+				}
+			}
+			continue
+		}
 		// Job table first: fake $! ids ("g1"), real tracked pids,
 		// and jobspecs (%1, %%/\%+, \%-, \%name, \%?substr).
 		if j := globalJobs.resolveJobSpec(p); j != nil && j.proc != nil {
@@ -1517,6 +1532,11 @@ func validSignalNumber(n string) bool {
 	v, err := strconv.Atoi(n)
 	if err != nil {
 		return false
+	}
+	// 0 is valid: it checks whether the process exists without signalling
+	// it (kill -0 PID).
+	if v == 0 {
+		return true
 	}
 	if v >= 1 && v <= 31 {
 		return true

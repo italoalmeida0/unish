@@ -292,6 +292,7 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 		return
 	}
 	r.deliverSignals(ctx)
+	r.pipeStatusCodes = nil
 	r.exit = exitStatus{}
 	if st.Background || st.Disown {
 		r2 := r.subshell(true)
@@ -302,10 +303,11 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 		// A plain command call may amount to starting exactly one external
 		// program, in which case $! expands to its real PID like in other
 		// shells, which fork background statements as child processes.
-		// Only the default exec handler reports a started program; custom
-		// call or exec handlers may run commands in arbitrary ways.
-		if ce, ok := st.Cmd.(*syntax.CallExpr); ok && len(ce.Args) > 0 &&
-			r.execHandlerIsDefault && r.callHandler == nil {
+		// The default exec handler reports the pid itself; a custom handler
+		// can report it too via HandlerContext.ReportBgStart, so the channel
+		// is always wired for a plain call. A handler that never reports
+		// sends zero, which keeps the fake id (no regression).
+		if ce, ok := st.Cmd.(*syntax.CallExpr); ok && len(ce.Args) > 0 {
 			bg.started = make(chan int, 1)
 			r2.bgStarted = bg.started
 		}
@@ -433,6 +435,16 @@ func (r *Runner) TrapRegistered(sig os.Signal) bool {
 	r.sigMu.Lock()
 	defer r.sigMu.Unlock()
 	return r.sigCallbacks[sig] != ""
+}
+
+// QueueSignalByName queues a signal given by name (TERM, INT, HUP, ...),
+// so a builtin like `kill` can deliver a signal to the shell's own trap
+// without knowing the platform's os.Signal values.
+func (r *Runner) QueueSignalByName(name string) bool {
+	if sig, ok := signalByName(name); ok {
+		return r.QueueSignal(sig)
+	}
+	return false
 }
 
 // QueueSignal schedules sig to run its trap handler at the next statement
@@ -686,7 +698,18 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			pr.Close()
 			wg.Wait()
 			r.stdin = oldIn
-			r.setPipeStatus(int(r2.exit.code), int(r.exit.code))
+			// A pipeline parses left-associatively: `a | b | c` is
+			// `(a | b) | c`. The inner subshell already recorded the
+			// left-hand stages in its own pipeStatusCodes, so append this
+			// stage's status instead of overwriting (bash keeps them all).
+			var codes []int
+			if len(r2.pipeStatusCodes) > 0 {
+				codes = append(append([]int(nil), r2.pipeStatusCodes...), int(r.exit.code))
+			} else {
+				codes = []int{int(r2.exit.code), int(r.exit.code)}
+			}
+			r.setPipeStatus(codes...)
+			r.pipeStatusCodes = codes
 			if r.opts[optPipeFail] && !r2.exit.ok() && r.exit.ok() {
 				r.exit = r2.exit
 			}

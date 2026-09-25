@@ -27,6 +27,23 @@ import (
 // HandlerCtx returns the [HandlerContext] value stored in ctx,
 // which is used when calling handler functions.
 // It panics if ctx has no HandlerContext stored.
+// ReportBgStart tells the parent shell the real pid of the single external
+// program this background statement started, so $! expands to it. A custom
+// exec handler that starts a process should call this with the pid; calling
+// it with zero (or not calling it) keeps the fake id.
+// InBackground reports whether this handler is running as a background
+// subshell (a statement followed by &). A custom exec handler can use it to
+// fork a real process instead of running in-process, so $! is a real pid.
+func (hc HandlerContext) InBackground() bool {
+	return hc.runner != nil && hc.runner.bgStarted != nil
+}
+
+func (hc HandlerContext) ReportBgStart(pid int) {
+	if hc.runner != nil {
+		hc.runner.reportBgStart(pid)
+	}
+}
+
 func HandlerCtx(ctx context.Context) HandlerContext {
 	hc, ok := ctx.Value(handlerCtxKey{}).(HandlerContext)
 	if !ok {

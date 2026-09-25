@@ -104,6 +104,16 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		// Job-control builtins with real-pid semantics live here so
 		// they bypass mvdan/sh's fake-id-only implementations.
 		// (trackExec also routes them; this covers direct chains.)
+		hc0 := interp.HandlerCtx(ctx)
+		// In a background statement bash forks a real process for every one
+		// of these (they are external programs there), so $! is a real pid
+		// and kill/wait/jobs work. Running them in-process would leave the
+		// job table empty and $! a fake id.
+		if hc0.InBackground() {
+			if err, handled := runSelfTracked(ctx, args); handled {
+				return err
+			}
+		}
 		cmd := lookupExtra(args[0])
 		if cmd == nil {
 			// Not one of ours: run as an external with job tracking
@@ -171,7 +181,7 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	}
 	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
 	if err != nil {
-		return nil, false
+			return nil, false
 	}
 	cmd := exec.CommandContext(ctx, path, args[1:]...)
 	cmd.Dir = hc.Dir
@@ -183,6 +193,10 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	if err := cmd.Start(); err != nil {
 		return nil, false
 	}
+	// Tell the parent shell the real pid so $! expands to it (and kill/wait
+	// on $! work). Must happen before any blocking work, per the mvdan
+	// contract for reportBgStart.
+	hc.ReportBgStart(cmd.Process.Pid)
 	j := globalJobs.track(cmd, args)
 	hashRecord(args[0], path)
 	// Wait synchronously (foreground). Background statements run this
@@ -352,6 +366,14 @@ func callOverride(ctx context.Context, args []string) ([]string, error) {
 		// statuses surface via `wait $!; echo $?` == 0/1 only.
 		// Full-fidelity codes need `wait` as an ExecHandler — see
 		// cmdWaitTracked note.
+		// Bare `wait`: wait for our tracked jobs, then fall through to
+		// mvdan/sh's builtin so it also waits for its own background
+		// goroutines. Returning ["true"] here would return immediately and
+		// skip that wait (the `cmd & wait` race).
+		if len(args) == 1 {
+			cmdWaitTracked(ctx, args)
+			return args, nil
+		}
 		if code, handled := cmdWaitTracked(ctx, args); handled {
 			if code != 0 {
 				return []string{"false"}, nil
@@ -1847,4 +1869,47 @@ func isPipeClosed(err error) bool {
 // probeLog is a temporary debugging aid for job-tracking diagnosis.
 var probeLog = func(format string, a ...any) {
 	os.Stderr.WriteString("PROBE: " + fmt.Sprintf(format, a...) + "\n")
+}
+
+
+// runSelfTracked runs a command as a REAL child process by re-executing the
+// unish binary with -c. Used for background statements: our embedded tools
+// are external programs in bash, so bash forks them; doing the same gives
+// $! a real pid and makes kill/wait/jobs work. Foreground calls keep the
+// in-process fast path.
+func runSelfTracked(ctx context.Context, args []string) (error, bool) {
+	hc := interp.HandlerCtx(ctx)
+	self, err := os.Executable()
+	if err != nil {
+		return nil, false
+	}
+	cmdline := shellQuoteArgs(args)
+	cmd := exec.CommandContext(ctx, self, "-c", cmdline)
+	cmd.Dir = hc.Dir
+	cmd.Stdin = hc.Stdin
+	cmd.Stdout = hc.Stdout
+	cmd.Stderr = hc.Stderr
+	cmd.Env = shellExecEnv(hc)
+	if err := cmd.Start(); err != nil {
+		return nil, false
+	}
+	hc.ReportBgStart(cmd.Process.Pid)
+	j := globalJobs.track(cmd, args)
+	<-j.done
+	if j.err != nil {
+		if ee, ok := j.err.(*exec.ExitError); ok {
+			return interp.NewExitStatus(uint8(ee.ExitCode())), true
+		}
+		return j.err, true
+	}
+	return nil, true
+}
+
+// shellQuoteArgs renders argv as a single-quoted shell command line.
+func shellQuoteArgs(args []string) string {
+	parts := make([]string, len(args))
+	for i, a := range args {
+		parts[i] = "'" + strings.ReplaceAll(a, "'", `'\''`) + "'"
+	}
+	return strings.Join(parts, " ")
 }

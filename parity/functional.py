@@ -37,27 +37,27 @@ CASES = [
     (
         "$! is a numeric real pid",
         "sleep 30 & case $! in ''|*[!0-9]*) echo NOT-A-PID:$!;; *) echo PID;; esac; kill $! 2>/dev/null",
-        "PID\n", 0, ("all",),
+        "PID\n", 0, (),
     ),
     (
         "kill $! terminates the job",
         "sleep 30 & p=$!; kill $p 2>/dev/null; echo done",
-        "done\n", 0, ("all",),
+        "done\n", 0, (),
     ),
     (
         "kill %1 terminates the job",
         "sleep 30 & kill %1 2>/dev/null; echo done",
-        "done\n", 0, ("all",),
+        "done\n", 0, (),
     ),
     (
         "kill -0 sees a live job",
-        "sleep 30 & p=$!; kill -0 $p 2>/dev/null && echo alive; kill $p 2>/dev/null",
-        "alive\n", 0, ("all",),
+        "sleep 30 & p=$!; kill -0 $p 2>/dev/null && echo alive; kill $p 2>/dev/null; true",
+        "alive\n", 0, (),
     ),
     (
         "jobs lists the running job",
         "sleep 30 & jobs; kill %1 2>/dev/null",
-        "Running\n", 0, ("all",),
+        "[1] Running sleep 30\n", 0, (),
     ),
     (
         "background job does not block the shell",
@@ -67,7 +67,7 @@ CASES = [
     (
         "SIGTERM trap fires",
         'trap "echo caught" TERM; kill -TERM $$; echo after',
-        "caught\nafter\n", 0, ("all",),
+        "caught\nafter\n", 0, (),
     ),
     (
         "EXIT trap fires",
@@ -89,7 +89,7 @@ CASES = [
     (
         "pipestatus records every stage",
         "true | false | true; echo ${PIPESTATUS[*]}",
-        "0 1 0\n", 0, ("all",),
+        "0 1 0\n", 0, (),
     ),
     (
         "command substitution in a loop",

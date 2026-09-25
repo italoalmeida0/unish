@@ -90,10 +90,10 @@ CASES = [
     ("command subst large", "x=$(seq 1 1000); echo ${#x}", "3892\n", 0),
 
     # --- KNOWN GAPS: background jobs (same root cause as $!/jobs) ---
-    ("GAP wait waits for a subshell job",
+    ("wait waits for a subshell job",
      "echo start; (sleep 0.3; echo bg) & wait; echo end",
      "start\nbg\nend\n", 0),
-    ("GAP wait waits for a command job",
+    ("wait waits for a command job",
      "echo start; sleep 0.3 & wait; echo end",
      "start\nend\n", 0),
 ]

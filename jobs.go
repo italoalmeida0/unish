@@ -383,8 +383,10 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 	}
 	hc := interp.HandlerCtx(ctx)
 	if len(args) == 1 {
-		// `wait` with no args: mvdan/sh already waits for background
-		// goroutines; additionally wait for tracked externals.
+		// A background statement registers its job from another goroutine;
+		// give it a moment so `cmd & wait` sees it (otherwise wait returns
+		// before the job was tracked).
+		globalJobs.waitForLaunch()
 		globalJobs.mu.Lock()
 		jobs := append([]*trackedJob(nil), globalJobs.jobs...)
 		globalJobs.mu.Unlock()

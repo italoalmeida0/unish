@@ -186,6 +186,10 @@ type Runner struct {
 	// the runner reports through it once via [Runner.reportBgStart].
 	bgStarted chan int
 
+	// pipeStatusCodes accumulates the stages of the current pipeline so a
+	// left-nested `a | b | c` keeps all three, like bash.
+	pipeStatusCodes []int
+
 	opts runnerOpts
 
 	origDir    string

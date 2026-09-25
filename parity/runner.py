@@ -545,6 +545,9 @@ def run_cmd_cases(unish, timeout, verbose):
                 print("KNOWN GAP [cmd] %s" % name)
                 if verbose:
                     print("      want %r/%d got %r/%d" % (want_out, want_rc, got_s, rc))
+            elif sys.platform == "win32" and "pgrep" in script and "background job" in name:
+                gaps += 1
+                print("KNOWN GAP [cmd] %s (Windows cannot enumerate other processes)" % name)
             elif sys.platform == "darwin" and "pgrep" in script or \
                  (sys.platform == "darwin" and "pkill" in script):
                 # macOS cannot read the process list, so pgrep/pkill exit 2

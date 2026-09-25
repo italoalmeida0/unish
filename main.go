@@ -126,10 +126,16 @@ func main() {
 		os.Exit(1)
 	}
 
+	// Let  enqueue signals for this runner's own traps.
+	setActiveRunner(r)
+
 	// Ctrl-C: run the script's INT trap when it has one (bash semantics),
 	// otherwise interrupt the shell like before.
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, os.Interrupt)
+	// Catch the signals a script can trap, not just Ctrl-C: bash runs the
+	// INT/TERM/HUP/QUIT trap when the shell receives one. Without Notify the
+	// default action kills the process before any trap can run.
+	signal.Notify(sigCh, trapSignals()...)
 	defer signal.Stop(sigCh)
 	go func() {
 		for sig := range sigCh {
