@@ -257,6 +257,23 @@ def run_flag_cases(unish, oracle_spec, timeout, verbose):
     exactly what the first cross-platform CI run exposed.
     """
     oracle, _ = parse_shell(oracle_spec)
+    # Is the oracle actually GNU? `cat --number` exists only in GNU; BSD
+    # (macOS) rejects it. If not GNU, GNU-flag parity is not meaningful
+    # there and the whole group is reported as skipped rather than failed.
+    probe = tempfile.mkdtemp(prefix="gnuprobe_")
+    with open(os.path.join(probe, "p.txt"), "w") as fh:
+        fh.write("x\n")
+    try:
+        pp = subprocess.run(oracle + ["--number", "p.txt"], cwd=probe,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        is_gnu = pp.returncode == 0
+    except Exception:  # noqa: BLE001
+        is_gnu = False
+    shutil.rmtree(probe, ignore_errors=True)
+    if not is_gnu:
+        print("=== flags: skipped (oracle is BSD, not GNU: GNU flag "
+              "formatting differs by design)")
+        return 0
     total = failed = xfail = gaps = 0
     work = tempfile.mkdtemp(prefix="flags_")
     try:
