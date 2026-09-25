@@ -36,6 +36,7 @@ from functional import CASES as FUNCTIONAL_CASES
 from cases.flag_cases import FLAG_CASES
 from cases.gap_cases import ORACLE_CASES, FIXED_CASES
 from e2e import CASES as E2E_CASES
+from edge_cases import CASES as EDGE_CASES
 
 CASE_GROUPS = [
     ("sort", sort_cases.CASES),
@@ -114,6 +115,8 @@ def main():
     ap.add_argument("--verbose", action="store_true")
     ap.add_argument("--skip-platform", action="store_true",
                     help="skip cases that need GNU/busybox tooling absent here")
+    ap.add_argument("--only-edge", action="store_true",
+                    help="run only the boundary/robustness cases")
     ap.add_argument("--only-e2e", action="store_true",
                     help="run only the end-to-end process cases")
     ap.add_argument("--only-flags", action="store_true",
@@ -126,6 +129,9 @@ def main():
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return run_go_tests(repo, args.verbose)
 
+    if args.only_edge:
+        unish_abs = os.path.abspath(args.unish)
+        return 1 if run_edge(unish_abs, args.timeout, args.verbose) else 0
     if args.only_e2e:
         unish_abs = os.path.abspath(args.unish)
         return 1 if run_e2e(unish_abs, args.timeout, args.verbose) else 0
@@ -199,7 +205,8 @@ def main():
     fl_failed = run_flag_cases(unish, args.timeout, args.verbose)
     gp_failed = run_gap_cases(unish, args.oracle, args.timeout, args.verbose)
     e2_failed = run_e2e(unish, args.timeout, args.verbose)
-    return 1 if (failed or fn_failed or fl_failed or gp_failed or e2_failed) else 0
+    ed_failed = run_edge(unish, args.timeout, args.verbose)
+    return 1 if (failed or fn_failed or fl_failed or gp_failed or e2_failed or ed_failed) else 0
 
 
 def run_go_tests(unish_dir, verbose):
@@ -415,6 +422,35 @@ def run_e2e(unish, timeout, verbose):
         finally:
             shutil.rmtree(d, ignore_errors=True)
     print("=== e2e: %d cases, %d failures" % (total, failed))
+    return failed
+
+
+def run_edge(unish, timeout, verbose):
+    """Fase 5: boundary/robustness cases. "GAP " names are known gaps."""
+    total = failed = gaps = 0
+    for name, script, want_out, want_rc in EDGE_CASES:
+        total += 1
+        d = tempfile.mkdtemp(prefix="edge_")
+        try:
+            got, rc, _ = run_one([unish], script, d, timeout)
+            got_s = norm(got).decode("utf-8", "replace")
+            if got_s == want_out and rc == want_rc:
+                if verbose:
+                    print("ok    [edge] %s" % name)
+            elif name.startswith("GAP "):
+                gaps += 1
+                print("KNOWN GAP [edge] %s" % name)
+                if verbose:
+                    print("      want %r/%d got %r/%d" % (want_out, want_rc, got_s, rc))
+            else:
+                failed += 1
+                print("FAIL  [edge] %s" % name)
+                print("      script: %r" % script)
+                print("      want %r exit %d" % (want_out, want_rc))
+                print("      got  %r exit %d" % (got_s, rc))
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+    print("=== edge: %d cases, %d failures, %d known gaps" % (total, failed, gaps))
     return failed
 
 
