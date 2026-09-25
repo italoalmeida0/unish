@@ -433,16 +433,19 @@ const defaultRC = `# ~/.unishrc — sourced by unish at interactive startup (lik
 # Created automatically on the first run; edit it freely.
 # It has no effect on scripts or "unish -c".
 
-# Handy aliases
-alias ll='ls -l'
-alias la='ls -la'
-alias l='ls'
+# Handy aliases (colors on when writing to a terminal)
+alias ll='ls -l --color=auto'
+alias la='ls -la --color=auto'
+alias l='ls --color=auto'
+alias ls='ls --color=auto'
+alias grep='grep --color=auto'
 
 # Suggestions (uncomment to taste)
-# alias grep='grep --color=auto'
 # alias ..='cd ..'
+# alias g='git'
 # export EDITOR=vim
 # export PAGER=less
+# PS1 supports colors too: export PS1='\[\e[1;32m\]\u@\h\[\e[0m\] \w$ '
 `
 
 // ensureRCFile writes the starter ~/.unishrc on the first interactive

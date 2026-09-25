@@ -10,6 +10,8 @@ import (
 	"time"
 
 	"mvdan.cc/sh/v3/interp"
+
+	"golang.org/x/term"
 )
 
 func cmdLs(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -270,8 +272,14 @@ func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo
 	if classify && fi != nil {
 		name += lsIndicator(fi)
 	}
+	wrap := func(s string) string {
+		if code := lsColorCode(fi, display); lsColorWanted() && code != "" {
+			return "\x1b[" + code + "m" + s + "\x1b[0m"
+		}
+		return s
+	}
 	if !long || fi == nil {
-		fmt.Fprintln(hc.Stdout, name)
+		fmt.Fprintln(hc.Stdout, wrap(name))
 		return
 	}
 	// GNU `ls -l` renders symlinks as "name -> target".
@@ -282,7 +290,7 @@ func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo
 	}
 	fmt.Fprintf(hc.Stdout, "%s %d %s %s %s %s %s\n",
 		lsPerm(fi), 1, lsUser(), lsGroup(), lsSize(fi, human),
-		lsTimeFormat(fi.ModTime(), timeStyle), name)
+		lsTimeFormat(fi.ModTime(), timeStyle), wrap(name))
 }
 
 func lsIndicator(fi os.FileInfo) string {
@@ -351,6 +359,41 @@ func lsSize(fi os.FileInfo, human bool) string {
 	return fmt.Sprintf("%d", fi.Size())
 }
 
+// lsColorWanted reports whether ANSI colors should be emitted.
+func lsColorWanted() bool {
+	switch lsColorMode {
+	case "always":
+		return true
+	case "auto":
+		return term.IsTerminal(1)
+	}
+	return false
+}
+
+// lsColorCode is the GNU ls color for an entry (dir blue, symlink cyan,
+// executable green, fifo/socket/device yellow, archives red).
+func lsColorCode(fi os.FileInfo, name string) string {
+	if fi == nil {
+		return ""
+	}
+	mode := fi.Mode()
+	switch {
+	case mode&os.ModeSymlink != 0:
+		return "36"
+	case mode.IsDir():
+		return "34"
+	case mode&os.ModeNamedPipe != 0, mode&os.ModeSocket != 0, mode&os.ModeDevice != 0:
+		return "33"
+	case mode&0o111 != 0:
+		return "32"
+	}
+	switch strings.ToLower(filepath.Ext(name)) {
+	case ".tar", ".gz", ".tgz", ".zip", ".bz2", ".xz", ".7z", ".rar":
+		return "31"
+	}
+	return ""
+}
+
 func lsDisplayName(display, full string, fi os.FileInfo, classify, quoted bool) string {
 	name := display
 	if quoted {
@@ -358,6 +401,9 @@ func lsDisplayName(display, full string, fi os.FileInfo, classify, quoted bool) 
 	}
 	if classify && fi != nil {
 		name += lsIndicator(fi)
+	}
+	if code := lsColorCode(fi, display); lsColorWanted() && code != "" {
+		return "\x1b[" + code + "m" + name + "\x1b[0m"
 	}
 	return name
 }

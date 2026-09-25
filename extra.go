@@ -245,11 +245,20 @@ func shellExecEnv(hc interp.HandlerContext) []string {
 	return list
 }
 
+var lsColorMode = "never" // --color[=WHEN]: never/always/auto
+
 func filterLsArgs(args []string) []string {
 	out := args[:1:1]
 	for _, a := range args[1:] {
-		if a == "--color" || strings.HasPrefix(a, "--color=") ||
-			a == "--hyperlink" || strings.HasPrefix(a, "--hyperlink=") ||
+		if a == "--color" {
+			lsColorMode = "always" // GNU: WHEN omitted means always
+			continue
+		}
+		if strings.HasPrefix(a, "--color=") {
+			lsColorMode = strings.TrimPrefix(a, "--color=")
+			continue
+		}
+		if a == "--hyperlink" || strings.HasPrefix(a, "--hyperlink=") ||
 			a == "--group-directories-first" || a == "--indicator-style=classify" ||
 			a == "--exclude" || strings.HasPrefix(a, "--exclude=") {
 			continue
