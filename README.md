@@ -1,5 +1,7 @@
 # unish — one standalone bash, everywhere
 
+<p align="center"><img src="assets/unish-icon-500x500.png" width="180" alt="unish logo"></p>
+
 A single dependency-free binary that runs bash commands **the same on
 Windows, Linux and macOS**. Built to be called from another program
 (like an AI agent) as a regular bash:
