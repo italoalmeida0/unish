@@ -132,6 +132,12 @@ def main():
                     help="also run go test -json and report platform skips")
     args = ap.parse_args()
 
+    # The oracle spec's @PREFIX is also where its GNU tools live; set
+    # ORACLE_PATH from it so the flag probe finds them without a separate
+    # environment variable (easy to forget locally).
+    if "@" in args.oracle and not os.environ.get("ORACLE_PATH"):
+        os.environ["ORACLE_PATH"] = args.oracle.rsplit("@", 1)[1]
+
     if args.go_tests:
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         return run_go_tests(repo, args.verbose)
@@ -151,7 +157,6 @@ def main():
     if args.only_flags:
         unish_abs = os.path.abspath(args.unish)
         return 1 if run_flag_cases(unish_abs, args.oracle, args.timeout, args.verbose) else 0
-
     oracle, env = parse_shell(args.oracle)
     unish = os.path.abspath(args.unish)
     base_env = dict(os.environ)
