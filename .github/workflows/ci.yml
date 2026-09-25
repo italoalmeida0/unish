@@ -49,10 +49,13 @@ jobs:
       - name: build (native)
         run: go build -mod=vendor -trimpath -ldflags="-s -w" -o unish${{ startsWith(matrix.os, 'windows') && '.exe' || '' }} .
 
-  # The whole behavioural suite (parity, functional, flags, gaps, e2e,
-  # edge, builtins) on EVERY native target unish ships for. The oracle is
-  # chosen per platform: GNU bash on Linux, Git Bash on Windows, the system
-  # bash on macOS (BSD userland, so the GNU-flag group self-skips).
+  # The whole behavioural suite (differential parity + functional, flags,
+  # gaps, e2e, edge, cmd, builtins) on EVERY native target unish ships for.
+  # The differential groups compare unish against a GNU reference, so the
+  # oracle has to be GNU everywhere: bash + coreutils on Linux, Git Bash on
+  # Windows, Homebrew's GNU tools + bash on macOS (the system there is bash
+  # 3.2 over a BSD userland, which would make the ORACLE the thing that
+  # differs -- unish targets GNU).
   suite:
     name: Suite (${{ matrix.name }})
     runs-on: ${{ matrix.os }}
@@ -95,13 +98,28 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.12"
+      - name: GNU reference tools for the oracle (macOS ships BSD + bash 3.2)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          brew install bash coreutils gnu-sed findutils grep gawk gnu-tar
+          P="$(brew --prefix)"
+          GNUPATH="$P/opt/coreutils/libexec/gnubin:$P/opt/gnu-sed/libexec/gnubin:$P/opt/findutils/libexec/gnubin:$P/opt/grep/libexec/gnubin:$P/opt/gawk/libexec/gnubin:$P/opt/gnu-tar/libexec/gnubin"
+          echo "GNU_PATH=$GNUPATH" >> "$GITHUB_ENV"
+          echo "ORACLE_SHELL=$P/bin/bash" >> "$GITHUB_ENV"
+          echo "$GNUPATH" | tr ':' '\n' >> "$GITHUB_PATH"
+          for t in sort sed grep find tar xargs od uniq tr cut wc date; do
+            PATH="$GNUPATH:$PATH" "$t" --version 2>/dev/null | head -1 | grep -q GNU \
+              || { echo "!! $t is not a GNU tool"; exit 1; }
+          done
       - name: build
         run: go build -mod=vendor -trimpath -ldflags="-s -w" -o unish${{ matrix.exe }} .
       - name: behaviour suite
         shell: bash
-        env:
-          ORACLE_PATH: ${{ startsWith(matrix.os, 'windows') && 'C:/Program Files/Git/usr/bin' || '/usr/bin' }}
-        run: python parity/runner.py --unish ./unish${{ matrix.exe }} --oracle "${{ matrix.oracle }}" --filter "__none__"
+        run: |
+          export ORACLE_PATH="${ORACLE_PATH:-${{ startsWith(matrix.os, 'windows') && 'C:/Program Files/Git/usr/bin' || '/usr/bin' }}}"
+          ORACLE="${ORACLE_SHELL:-${{ matrix.oracle }}}"
+          python parity/runner.py --unish ./unish${{ matrix.exe }} --oracle "$ORACLE"
 
   # Process/network tools (pgrep, pkill, ss, nc) can only be tested in a
   # sandbox: their job is to look at or signal OTHER processes, so running
@@ -126,8 +144,12 @@ jobs:
 
   # glibc-free proof: the Linux artifacts must run on a bare musl userland.
   # A glibc-linked binary cannot even exec on Alpine, so this is a real
-  # assertion, not a formality. It also runs the whole suite against musl
-  # libc + busybox, which is a different userland from the glibc runners.
+  # assertion, not a formality. It also runs the whole suite on musl libc,
+  # a different base from the glibc runners. The differential groups need
+  # a GNU reference (unish targets GNU -- busybox output differs by design,
+  # and "works" matters more than "prints the same as busybox"), so the
+  # Alpine container installs GNU coreutils/findutils/sed/grep/tar and the
+  # run asserts they really are GNU before comparing anything.
   musl:
     name: musl userland + glibc-free proof
     runs-on: ubuntu-latest
@@ -169,6 +191,9 @@ jobs:
       - name: parity suite on a musl userland
         run: |
           docker run --rm -v "$PWD:/src" -w /src alpine:3.22 sh -euxc '
-            apk add --no-cache python3 bash coreutils >/dev/null
-            python3 parity/runner.py --unish ./dist/unish-linux-amd64 --oracle /bin/bash || true
+            apk add --no-cache python3 bash coreutils findutils grep sed tar >/dev/null
+            for t in sort sed grep find tar xargs od uniq tr cut wc date; do
+              "$t" --version 2>/dev/null | head -1 | grep -q GNU || { echo "!! $t is not a GNU tool"; exit 1; }
+            done
+            python3 parity/runner.py --unish ./dist/unish-linux-amd64 --oracle /bin/bash
           '

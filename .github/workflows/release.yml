@@ -80,8 +80,10 @@ jobs:
           if-no-files-found: error
 
   # Functional parity on the release build: the differential suite runs
-  # against real GNU (Linux) and Git Bash (Windows), so a release can't
-  # ship a behavior regression.
+  # against a real GNU reference (Linux, Homebrew GNU on macOS) and Git
+  # Bash (Windows), so a release can't ship a behavior regression. On
+  # macOS the system bash is 3.2 over BSD tools, which would make the
+  # oracle the outlier, so the job installs GNU tools + bash first.
   parity:
     needs: build
     strategy:
@@ -92,6 +94,8 @@ jobs:
             oracle: /bin/bash
           - os: windows-latest
             oracle: "C:/Program Files/Git/bin/bash.exe@C:/Program Files/Git/usr/bin"
+          - os: macos-latest
+            oracle: /bin/bash
     runs-on: ${{ matrix.os }}
     env:
       CGO_ENABLED: "0"
@@ -103,11 +107,28 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.x"
+      - name: GNU reference tools for the oracle (macOS ships BSD + bash 3.2)
+        if: startsWith(matrix.os, 'macos')
+        shell: bash
+        run: |
+          brew install bash coreutils gnu-sed findutils grep gawk gnu-tar
+          P="$(brew --prefix)"
+          GNUPATH="$P/opt/coreutils/libexec/gnubin:$P/opt/gnu-sed/libexec/gnubin:$P/opt/findutils/libexec/gnubin:$P/opt/grep/libexec/gnubin:$P/opt/gawk/libexec/gnubin:$P/opt/gnu-tar/libexec/gnubin"
+          echo "GNU_PATH=$GNUPATH" >> "$GITHUB_ENV"
+          echo "ORACLE_SHELL=$P/bin/bash" >> "$GITHUB_ENV"
+          echo "$GNUPATH" | tr ':' '\n' >> "$GITHUB_PATH"
+          for t in sort sed grep find tar xargs od uniq tr cut wc date; do
+            PATH="$GNUPATH:$PATH" "$t" --version 2>/dev/null | head -1 | grep -q GNU \
+              || { echo "!! $t is not a GNU tool"; exit 1; }
+          done
       - name: build
         run: go build -trimpath -ldflags="-s -w -X main.version=${{ github.ref_type == 'tag' && github.ref_name || 'dev' }}" -o unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} .
       - name: parity suite
         shell: bash
-        run: python parity/runner.py --unish ./unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} --oracle "${{ matrix.oracle }}"
+        run: |
+          export ORACLE_PATH="${ORACLE_PATH:-${{ startsWith(matrix.os, 'windows') && 'C:/Program Files/Git/usr/bin' || '/usr/bin' }}}"
+          ORACLE="${ORACLE_SHELL:-${{ matrix.oracle }}}"
+          python parity/runner.py --unish ./unish${{ matrix.os == 'windows-latest' && '.exe' || '' }} --oracle "$ORACLE"
 
   release:
     needs: [build, parity]
