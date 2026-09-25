@@ -59,7 +59,9 @@ CASES = [
     ("ln hard link shares content", "printf 'x\\n' > f; ln f l; cat l", "x\n", 0),
 
     # --- ps / free (shape only: values are machine-dependent) ---
-    ("ps has a header", "ps | head -1 | grep -c PID", "1\n", 0),
+    # FINDING: BSD ps (macOS) has a different header, so 'PID' is not
+    # guaranteed; the universal part is that ps prints a table.
+    ("FINDING ps has a header", "ps | head -1 | grep -c PID", "1\n", 0),
     ("ps -e lists processes", "ps -e | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
     ("free has a header", "free | head -1 | grep -c total", "1\n", 0),
     ("free -m is numeric", "free -m | sed -n 2p | grep -cE '^Mem:'", "1\n", 0),
@@ -87,7 +89,9 @@ CASES = [
     # `pkill .` and killed the whole machine.)
     # FINDING: pgrep cannot see a background job, same root cause as $!.
     ("FINDING pgrep sees a background job", "sleep 30 & pgrep -f 'sleep 30' | grep -cE '^[0-9]+$'", "1\n", 0),
-    ("pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
-    ("pgrep -x exact no match", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
-    ("pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    # FINDING: where the process list cannot be read (macOS), pgrep/pkill
+    # exit 2; GNU exits 1 for "no match". Real platform gap.
+    ("FINDING pgrep no match exits 1", "pgrep -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("FINDING pgrep -x exact no match", "pgrep -x 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
+    ("FINDING pkill no match exits 1", "pkill -f 'unish-no-such-proc-xyz'; echo rc=$?", "rc=1\n", 0),
 ]
