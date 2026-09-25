@@ -145,8 +145,10 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 	}
 	code := 0
 	// Identity lookups read /etc/passwd+group; do them once per run,
-	// not once per archived file.
+	// not once per archived file. Same for the copy buffer: io.Copy
+	// would allocate 32KiB per file.
 	_, uname, _, gname := identity()
+	copyBuf := make([]byte, 256*1024)
 	closeAll := func() {
 		tw.Close()
 		if gz != nil {
@@ -191,7 +193,7 @@ func tarCreate(hc interp.HandlerContext, archive, base string, paths []string, z
 				if err != nil {
 					return err
 				}
-				_, err = io.Copy(tw, fh)
+				_, err = io.CopyBuffer(tw, fh, copyBuf)
 				fh.Close()
 				if err != nil {
 					return err

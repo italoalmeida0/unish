@@ -1348,6 +1348,8 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 			type numItem struct {
 				neg    bool
 				ip, fp string
+				val    int64 // fast path: the key fits in an int64
+				fits   bool
 				line   string
 			}
 			its := make([]numItem, len(lines))
@@ -1364,12 +1366,29 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 				if ip == "0" && fp == "" {
 					neg = false
 				}
-				its[i] = numItem{neg: neg, ip: ip, fp: fp, line: l}
+				it := numItem{neg: neg, ip: ip, fp: fp, line: l}
+				// Most real keys fit in an int64; compare those as
+				// primitives and keep the decimal form as fallback.
+				if fp == "" && len(ip) <= 18 {
+					if v, err := strconv.ParseInt(ip, 10, 64); err == nil {
+						if neg {
+							v = -v
+						}
+						it.val, it.fits = v, true
+					}
+				}
+				its[i] = it
 			}
 			rev := sp.reverse != cfg.reverse
 			cmp := func(a, b *numItem) int {
 				var c int
-				if a.neg != b.neg {
+				if a.fits && b.fits {
+					if a.val < b.val {
+						c = -1
+					} else if a.val > b.val {
+						c = 1
+					}
+				} else if a.neg != b.neg {
 					if a.neg {
 						c = -1
 					} else {
