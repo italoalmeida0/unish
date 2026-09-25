@@ -25,3 +25,7 @@ shell.js
 comandos.json
 *.usage.json
 
+
+# Python
+__pycache__/
+*.pyc

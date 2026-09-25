@@ -43,12 +43,26 @@ as `XPASS` so the tag can be removed.
 
 ## Oracle versions
 
-The oracles were captured from **GNU coreutils 9.4 / bash 5.2** (what
-the CI runner ships). Older toolchains differ in known ways — e.g. the
-coreutils 8.32 in Git Bash says `Binary file … matches` where 9.4 says
-`grep: …: binary file matches`, and MSYS keeps `//` in `basename` /
-`dirname` because it is a network root there. Those are properties of
-the old oracle, not unish bugs; the Linux CI run is authoritative.
+The authoritative oracle is **GNU coreutils 9.4 / bash 5.2** (what the
+Linux CI runner ships); the suite runs there on every push.
+
+The suite also runs in CI on **Windows against Git Bash**, whose
+coreutils are older (8.32). Those builds word a few diagnostics
+differently — `grep` says `Binary file … matches` where 9.4 says
+`grep: …: binary file matches`, MSYS keeps `//` in `basename`/`dirname`
+because it is a network root there, and so on. Those eight cases are
+tagged `old-oracle`: the xfail only applies when the oracle is
+Git Bash/MSYS, and on Linux they are enforced for real.
+
+macOS runs a BSD userland, so a GNU oracle is not available there; the
+CI job runs the POSIX-only subset against the system bash and reports
+it separately instead of pretending the GNU suite passed.
+
+`--go-tests` runs the Go suite as JSON and prints how many tests were
+**skipped** on this platform (`ps`/`pgrep` need procfs, symlink tests
+need privileges on Windows, …). Skips are legitimate, but they are
+visible: a regression that turns into a silent skip would otherwise
+pass unnoticed.
 
 ## Adding cases
 

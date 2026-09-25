@@ -37,7 +37,7 @@ CASES = [
     "printf 'a 2\\nA 1\\n' | sort -k2,2n -k1,1r",
     "printf 'a\\tb\\na\\tz\\n' | sort",
     "printf 'a\\n' | sort -k5",
-    "printf 'a::1\\nb::2\\n' | sort -t:: -k2 2>&1; echo rc=$?",
+    ("printf 'a::1\\nb::2\\n' | sort -t:: -k2 2>&1; echo rc=$?", "old-oracle"),
     "printf ' y,2\\nz\\n1\\n2\\n' | sort -k1,1",
     "printf 'a  2\\na   1\\n' | sort -k2,2",
     "printf 'a 2\\na  2\\n' | sort -k2,2",

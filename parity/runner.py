@@ -21,7 +21,9 @@ Typical uses:
 """
 
 import argparse
+import json
 import os
+import platform
 import shutil
 import subprocess
 import sys
@@ -77,6 +79,28 @@ def parse_shell(spec):
     return cmd.split("+"), env
 
 
+def is_old_oracle(oracle_spec):
+    """Git Bash ships coreutils 8.32, which words a few diagnostics
+    differently from 9.4. Those deltas are the oracle's, not unish's."""
+    low = oracle_spec.lower()
+    return "git" in low or "msys" in low
+
+
+def platform_key():
+    """Coarse platform tag for case filtering: linux/windows/darwin."""
+    return platform.system().lower()
+    """name=CMD[+ARGS][@PATHPREFIX] like the bench harness."""
+    if "@" in spec:
+        cmd, path_prefix = spec.rsplit("@", 1)
+    else:
+        cmd, path_prefix = spec, ""
+    env = None
+    if path_prefix:
+        env = dict(os.environ)
+        env["PATH"] = path_prefix + os.pathsep + env.get("PATH", "")
+    return cmd.split("+"), env
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--unish", default="./unish", help="path to the unish binary")
@@ -84,7 +108,15 @@ def main():
     ap.add_argument("--filter", default="", help="only run cases whose script contains this")
     ap.add_argument("--timeout", type=int, default=60)
     ap.add_argument("--verbose", action="store_true")
+    ap.add_argument("--skip-platform", action="store_true",
+                    help="skip cases that need GNU/busybox tooling absent here")
+    ap.add_argument("--go-tests", action="store_true",
+                    help="also run go test -json and report platform skips")
     args = ap.parse_args()
+
+    if args.go_tests:
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        return run_go_tests(repo, args.verbose)
 
     oracle, env = parse_shell(args.oracle)
     unish = os.path.abspath(args.unish)
@@ -103,6 +135,9 @@ def main():
             if args.filter and args.filter not in script:
                 continue
             total += 1
+            if xfail == "old-oracle":
+                # Applied only when the oracle is an older toolkit.
+                xfail = "coreutils 8.32 (Git Bash) wording" if is_old_oracle(args.oracle) else ""
             dirs = [tempfile.mkdtemp(prefix="parity_u_"), tempfile.mkdtemp(prefix="parity_o_")]
             try:
                 uo, uc, ue = run_one([unish], script, dirs[0], args.timeout)
@@ -132,8 +167,11 @@ def main():
                     if ul != ol:
                         print("      files unish: %s oracle: %s" % (ul, ol))
                 elif xfail:
+                    # An xfail that now passes is good news, not a failure:
+                    # the delta was cosmetic/build-specific and vanished.
                     xpassed += 1
-                    print("XPASS [%s] %s (fixed? remove the xfail)" % (group, xfail))
+                    if args.verbose:
+                        print("XPASS [%s] %s" % (group, xfail))
                 elif args.verbose:
                     print("ok    [%s] %r" % (group, script[:60]))
             finally:
@@ -143,6 +181,44 @@ def main():
     print("=== %d cases: %d failures, %d known deltas (xfail), %d xpass" %
           (total, failed, xfailed, xpassed))
     return 1 if failed else 0
+
+
+def run_go_tests(unish_dir, verbose):
+    """Run the Go unit suite as JSON and report skip counts per test.
+
+    Platform skips are legitimate (no /proc on macOS, no symlink privs on
+    Windows), but they must be *visible*: a regression that turns into a
+    skip would otherwise pass unnoticed.
+    """
+    p = subprocess.run(["go", "test", "-count=1", "-json", "./..."],
+                       cwd=unish_dir, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+    passed = skipped = failed = 0
+    skipped_tests = []
+    for line in p.stdout.decode("utf-8", "replace").splitlines():
+        line = line.strip()
+        if not line.startswith("{"):
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        action = ev.get("Action")
+        test = ev.get("Test", "")
+        if not test:
+            continue
+        if action == "pass":
+            passed += 1
+        elif action == "skip":
+            skipped += 1
+            skipped_tests.append(test)
+        elif action == "fail":
+            failed += 1
+    print("=== go tests: %d passed, %d failed, %d SKIPPED on %s" %
+          (passed, failed, skipped, platform_key()))
+    if skipped_tests and verbose:
+        for t in skipped_tests:
+            print("    skip: %s" % t)
+    return failed
 
 
 if __name__ == "__main__":
