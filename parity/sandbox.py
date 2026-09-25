@@ -65,6 +65,13 @@ CASES = [
     ("pkill -i case-insensitive",
      "sleep 30 & V=$!; sleep 0.3; /tmp/unish -c \"pkill -i -f 'SLEEP 30'\"; sleep 0.3; kill -0 $V 2>/dev/null; echo rc=$?",
      "rc=1\n", 0),
+    # --- remaining pkill/ss flags, still sandboxed ---
+    ("FINDING pkill -a lists ancestors form", "sleep 30 & sleep 0.3; /tmp/unish -c \"pkill -a -f 'sleep 30'\"; echo rc=$?", "rc=0\n", 0),
+    ("FINDING pkill -g process group", "sleep 30 & sleep 0.3; /tmp/unish -c \"pkill -g 0 -f 'sleep 30'\"; echo rc=$?", "rc=0\n", 0),
+    ("FINDING pkill -l lists signal names", "/tmp/unish -c \"pkill -l\" | grep -c TERM", "1\n", 0),
+    ("FINDING pkill -n newest only", "sleep 30 & sleep 0.3; /tmp/unish -c \"pkill -n -f 'sleep 30'\"; echo rc=$?", "rc=0\n", 0),
+    ("ss -p processes column", "nc -l -p 34590 & sleep 0.5; /tmp/unish -c \"ss -tlp\" | head -1 | grep -c State", "1\n", 0),
+    ("ss --processes long form", "nc -l -p 34591 & sleep 0.5; /tmp/unish -c \"ss --tcp --listening --processes\" | head -1 | grep -c State", "1\n", 0),
     ("FINDING pkill -s chooses the signal",
      "sleep 30 & V=$!; sleep 0.3; /tmp/unish -c \"pkill -s TERM -f 'sleep 30'\"; sleep 0.3; kill -0 $V 2>/dev/null; echo rc=$?",
      "rc=1\n", 0),

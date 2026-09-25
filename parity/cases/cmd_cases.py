@@ -127,4 +127,64 @@ CASES = [
     ("netcat --udp usage", "netcat --udp --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
     ("netcat -z zero usage", "netcat -z --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
     ("netcat -w timeout usage", "netcat -w 1 --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("netcat -p source port usage", "netcat -p 1 --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("netcat -u udp usage", "netcat -u --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("nc -p source port usage", "nc -p 1 --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+    ("nc -u udp usage", "nc -u --help 2>&1 | wc -l | grep -cE '^[0-9]+$'", "1\n", 0),
+
+    # --- strings ---
+    ("strings finds text", "printf '\x01hello\x02world\n' | strings", "hello\nworld\n", 0),
+    ("strings -n length filter", "printf 'ab\x01longer\n' | strings -n 3", "longer\n", 0),
+    # FINDING: strings -a is not implemented (GNU: scan whole file).
+    ("FINDING strings -a scans whole file", "printf '\x01hi\n' | strings -a", "hi\n", 0),
+    # FINDING: strings -t/-o (offset prefix) produce nothing.
+    ("FINDING strings -t offset prefix", "printf 'abc\n' | strings -t x | grep -cE '^ *[0-9a-f]+ abc'", "1\n", 0),
+    ("FINDING strings -o offset prefix", "printf 'abc\n' | strings -o | grep -cE '^ *[0-9]+ abc'", "1\n", 0),
+    ("FINDING strings --radix offset prefix", "printf 'abc\n' | strings --radix x | grep -cE '^ *[0-9a-f]+ abc'", "1\n", 0),
+
+    # --- hexdump ---
+    ("hexdump -C canonical", "printf 'abc\n' | hexdump -C | head -1 | cut -c1-10", "00000000  \n", 0),
+    ("hexdump -v no squeeze", "printf 'abc\n' | hexdump -v | head -1 | cut -c1-7", "0000000\n", 0),
+    # FINDING: hexdump -s on a pipe fails (Illegal seek); GNU handles it.
+    ("FINDING hexdump -s skip on a pipe", "printf 'abcdef\n' | hexdump -s 2 | head -1 | cut -c1-7", "0000002\n", 0),
+    ("FINDING hexdump -e format string", "printf 'abc\n' | hexdump -e '16/1 \"%c\"' | head -c 3", "abc", 0),
+
+    # --- free ---
+    ("free has a header", "free | head -1 | grep -c total", "1\n", 0),
+    ("free -m header", "free -m | head -1 | grep -c total", "1\n", 0),
+    ("free -g header", "free -g | head -1 | grep -c total", "1\n", 0),
+    ("free -h header", "free -h | head -1 | grep -c total", "1\n", 0),
+
+    # --- checksum -q/-s (quiet/status) ---
+    ("FINDING md5sum -q quiet", "printf 'x\n' > f; md5sum -q f | cut -d' ' -f1", "9dd4e461268c8034f5c8564e155c67a6", 0),
+    ("FINDING md5sum -s status", "printf 'x\n' > f; md5sum -s f; echo rc=$?", "rc=0\n", 0),
+    ("FINDING sha1sum -q quiet", "printf 'x\n' > f; sha1sum -q f | cut -d' ' -f1 | tr -d '\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
+    ("FINDING sha1sum -s status", "printf 'x\n' > f; sha1sum -s f; echo rc=$?", "rc=0\n", 0),
+    ("FINDING sha256sum -q quiet", "printf 'x\n' > f; sha256sum -q f | cut -d' ' -f1 | tr -d '\\n'", "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac", 0),
+    ("FINDING sha256sum -s status", "printf 'x\n' > f; sha256sum -s f; echo rc=$?", "rc=0\n", 0),
+
+    # --- shasum ---
+    ("shasum default sha1", "printf 'x\n' | shasum | cut -d' ' -f1 | tr -d '\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
+    ("shasum -a 256", "printf 'x\n' | shasum -a 256 | cut -d' ' -f1 | tr -d '\\n'", "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac", 0),
+    ("shasum -b binary", "printf 'x\n' > f; shasum -b f | cut -d' ' -f1 | tr -d '\\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
+    ("shasum -t text", "printf 'x\n' > f; shasum -t f | cut -d' ' -f1 | tr -d '\\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
+    ("shasum --algorithm 256", "printf 'x\n' | shasum --algorithm 256 | cut -d' ' -f1 | tr -d '\\n'", "73cb3858a687a8494ca3323053016282f3dad39d42cf62ca4e79dda2aac7d9ac", 0),
+    ("shasum --binary", "printf 'x\n' > f; shasum --binary f | cut -d' ' -f1 | tr -d '\\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
+    ("shasum --text", "printf 'x\n' > f; shasum --text f | cut -d' ' -f1 | tr -d '\\n'", "6fcf9dfbd479ed82697fee719b9f8c610a11ff2a", 0),
+
+    # --- od ---
+    ("od -N limits bytes", "printf 'abcdef\n' | od -N 2 -c | head -1", "0000000   a   b\n", 0),
+    ("FINDING od -u unsigned", "printf 'A\n' | od -u | head -1", "0000000    65\n", 0),
+
+    # --- uniq -g (grouped, GNU 9.0+) ---
+    ("uniq -g group", "printf 'a\na\nb\n' | uniq -g", "a\na\n\nb\n", 0),
+
+    # --- split -v, timeout -p, cat -S ---
+    ("split -v verbose creates files", "printf 'a\nb\nc\nd\n' > f; split -v -l 2 f 2>/dev/null; ls xa* | wc -l", "2\n", 0),
+    ("timeout -p preserve status", "timeout -p 5 true; echo rc=$?", "rc=0\n", 0),
+    # FINDING: cat -S (squeeze blank lines) is not implemented.
+    ("FINDING cat -S squeezes blanks", "printf 'a\n\n\nb\n' | cat -S", "a\n\nb\n", 0),
+
+    # --- tail -f / --follow: needs a live file; documented, not run ---
+    # (a blocking test is not a test; covered by the sandbox for ss/nc)
 ]

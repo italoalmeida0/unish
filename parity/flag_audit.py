@@ -151,7 +151,7 @@ FIXTURES = {
     "rm":      {"files": {"a.txt": "a"}, "base": "a.txt"},
     "ln":      {"files": {"a.txt": "a"}, "base": "a.txt link.txt"},
     "mkdir":   {"base": "newdir"},
-    "sort":    {"files": {"a.txt": "3 c\n1 a\n2 b\n"}, "base": "a.txt"},
+    "sort":    {"files": {"a.txt": "3 c\n1 a\n2 b\n", "out.txt": ""}, "base": "a.txt"},
     "ls":      {"files": {"a.txt": "a", "b.txt": "b"}, "base": "."},
     "strings": {"files": {"a.txt": "hello world\n"}, "base": "a.txt"},
     "shasum":  {"files": {"a.txt": "hello\n"}, "base": "a.txt"},
@@ -271,19 +271,23 @@ FLAG_VALUES = {
     "-t": "x1", "-o": "1", "-e": "1", "-n": "1", "-g": "1", "-l": "1",
     "--processes": "", "-p": "1", "-u": "1", "-q": "", "-v": "",
     "-a": "1", "-f": "", "--binary": "", "--count": "",
+    # last batch: value flags and forms surfaced by the 92% pass
+    "--radix": "x", "--text": "", "-b": "1", "-t": "x1", "-o": "1",
+    "-e": "1", "-n": "1", "-g": "1", "-l": "1", "-s": "1", "-q": "",
+    "--binary": "", "--text2": "", "-u2": "1", "-a2": "1",
 }
 
 
 # Commands that can affect the machine (processes, devices, the filesystem
 # outside our temp dir). The audit must never invoke these.
 FORBIDDEN_COMMANDS = {
-    "pkill", "kill", "killall", "pgrep", "ps", "reboot", "shutdown",
+    "pkill", "kill", "killall", "pgrep", "reboot", "shutdown",
     "dd", "mkfs", "fdisk", "mount", "umount", "shred",
 }
 
 # Flags whose operand is not a path but a pattern/host/etc; running them
 # blind is meaningless or dangerous.
-FORBIDDEN_FLAG_PREFIXES = ("--net", "--listen", "-o", "--dev")
+FORBIDDEN_FLAG_PREFIXES = ("--net", "--listen", "--dev", "--output-file")
 
 # Destructive commands: only these flags may be swept. Anything recursive
 # or forced (rm -r/-f, chmod -R, chown -R, cp -r outside a fixture...) is
