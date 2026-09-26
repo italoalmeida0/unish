@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -117,4 +118,40 @@ func TestGrepNonHanging(t *testing.T) {
 	if err == nil {
 		t.Errorf("expected grep to return exit code 1 when no files match, got nil error")
 	}
+}
+
+// TestListProcsParentLinkage locks the ppid column of the process table on
+// EVERY platform. The macOS reader previously parsed e_ppid at a hand-rolled
+// offset that was actually the start of eproc, so every row reported ppid 0
+// — invisible to ps(1)'s default columns and to pgrep/pkill, which is why
+// the existing suite (which skips pgrep on darwin) never caught it.
+func TestListProcsParentLinkage(t *testing.T) {
+	procs, err := listProcs()
+	if err != nil {
+		t.Fatalf("listProcs: %v", err)
+	}
+	self := os.Getpid()
+	parent := os.Getppid()
+	var found bool
+	for _, p := range procs {
+		if p.pid == self {
+			found = true
+			if p.ppid != parent {
+				t.Errorf("self ppid = %d, want %d (the process table must link parentage)", p.ppid, parent)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("process table does not contain the calling process (pid %d)", self)
+	}
+	// The parent (the test runner) must be present and have a live pid.
+	for _, p := range procs {
+		if p.pid == parent {
+			if p.ppid < 0 {
+				t.Errorf("parent row has negative ppid: %+v", p)
+			}
+			return
+		}
+	}
+	t.Errorf("process table does not contain the parent (pid %d)", parent)
 }

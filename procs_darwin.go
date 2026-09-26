@@ -8,6 +8,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 // listProcs on macOS/BSD: there is no /proc, but the kernel exposes the
@@ -15,47 +17,33 @@ import (
 // itself reads. This makes pgrep/pkill/ps work on macOS instead of
 // reporting "unsupported".
 //
-// kinfo_proc is a fixed 648-byte struct on 64-bit Darwin: an extern_proc
-// (struct proc) followed by an eproc. Only a few offsets are needed and
-// they are stable ABI (defined in <sys/sysctl.h> / <sys/proc.h>).
-const kinfoProcSize = 648
-
-// Offsets within one kinfo_proc record (64-bit Darwin).
-const (
-	offPFlag  = 32  // extern_proc.p_flag (int32)
-	offPStat  = 36  // extern_proc.p_stat (char)
-	offPPid   = 40  // extern_proc.p_pid (pid_t)
-	offComm   = 243 // extern_proc.p_comm (char[17])
-	offEproc  = 296 // start of eproc
-	offEPpid  = 296 // eproc.e_ppid (pid_t)
-	offELogin = 344 // eproc.e_login (char[12])
-)
-
+// Parsing goes through x/sys/unix's typed KinfoProc (SysctlKinfoProcSlice):
+// the struct layout is maintained by the Go team, so it cannot drift the
+// way a hand-rolled offset table can. (The previous hand-rolled table read
+// e_ppid at offset 296 — the START of eproc — so every row reported ppid 0;
+// ps(1)'s default columns hide ppid and pgrep/pkill never needed it, so the
+// bug went unnoticed.)
 func listProcs() ([]procInfo, error) {
-	raw, err := syscall.Sysctl("kern.proc.all")
+	kinfos, err := unix.SysctlKinfoProcSlice("kern.proc.all")
 	if err != nil {
 		return nil, err
 	}
-	buf := []byte(raw)
-	var out []procInfo
-	for off := 0; off+kinfoProcSize <= len(buf); off += kinfoProcSize {
-		kp := buf[off : off+kinfoProcSize]
-		pid := int(int32(binary.LittleEndian.Uint32(kp[offPPid : offPPid+4])))
+	out := make([]procInfo, 0, len(kinfos))
+	for i := range kinfos {
+		kp := &kinfos[i]
+		pid := int(kp.Proc.P_pid)
 		if pid <= 0 {
 			continue
 		}
-		ppid := int(int32(binary.LittleEndian.Uint32(kp[offEPpid : offEPpid+4])))
-		stat := kp[offPStat]
-		comm := cstr(kp[offComm : offComm+17])
 		out = append(out, procInfo{
 			pid:    pid,
-			ppid:   ppid,
-			user:   cstr(kp[offELogin : offELogin+12]),
+			ppid:   int(kp.Eproc.Ppid),
+			user:   cstr(kp.Eproc.Login[:]),
 			tty:    "?",
-			stat:   darwinStat(stat),
+			stat:   darwinStat(kp.Proc.P_stat),
 			start:  "?",
 			time:   "00:00:00",
-			cmd:    comm,
+			cmd:    cstr(kp.Proc.P_comm[:]),
 			cpu:    -1,
 			memPct: -1,
 			vszKB:  -1,
@@ -88,7 +76,7 @@ func cstr(b []byte) string {
 }
 
 // darwinStat maps the BSD process state byte to the ps letter.
-func darwinStat(s byte) string {
+func darwinStat(s int8) string {
 	switch s {
 	case 1:
 		return "I" // idle

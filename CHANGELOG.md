@@ -1,5 +1,21 @@
 # Changelog
 
+## 1.0.1 — 2026-09-26
+
+### Fixed
+
+- **macOS `ps`/`pgrep`/`pkill` reported ppid 0 for every process.** The
+  darwin process-table reader parsed `e_ppid` at a hand-rolled offset
+  (296) that is actually the START of `eproc`; the real field sits much
+  deeper (after `e_paddr`/`e_sess`/`e_pcred`/`e_ucred`/`e_vm`). Nothing
+  surfaced it because `ps(1)`'s default columns do not show ppid and
+  `pgrep`/`pkill` only need pid+comm — and the Go suite skipped `pgrep`
+  on darwin entirely. The reader now uses `x/sys/unix`'s typed
+  `KinfoProc` (`SysctlKinfoProcSlice`), so the layout is maintained by
+  the Go team and cannot drift again.
+- Added `TestListProcsParentLinkage`, which asserts the ppid column on
+  every platform (the coverage that would have caught the bug).
+
 ## 1.0.0 — 2026-09-25
 
 First stable release. unish is one self-contained, bash-compatible shell
