@@ -4,7 +4,7 @@
 package expand
 
 import (
-	"cmp"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -19,6 +19,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"unicode/utf8"
 
@@ -26,6 +27,14 @@ import (
 	"mvdan.cc/sh/v3/pattern"
 	"mvdan.cc/sh/v3/syntax"
 )
+
+// RunnerCallbacks allows an interpreter to wire CmdSubst, ProcSubst, and
+// ReadDir without allocating 3 closure values per Runner / subshell.
+type RunnerCallbacks interface {
+	ExpandCmdSubst(io.Writer, *syntax.CmdSubst) error
+	ExpandProcSubst(*syntax.ProcSubst) (string, error)
+	ExpandReadDir(string) ([]fs.DirEntry, error)
+}
 
 // A Config specifies details about how shell expansion should be performed. The
 // zero value is a valid configuration.
@@ -96,6 +105,10 @@ type Config struct {
 	// pattern matching features when performing pathname expansion (globbing).
 	ExtGlob bool
 
+	// Callbacks provides allocation-free method dispatch for Runner-owned configs.
+	Callbacks      RunnerCallbacks
+	ReadDirEnabled bool
+
 	bufferAlloc strings.Builder
 	fieldAlloc  [4]fieldPart
 	fieldsAlloc [4][]fieldPart
@@ -116,14 +129,21 @@ func (u UnexpectedCommandError) Error() string {
 	return fmt.Sprintf("unexpected command substitution at %s", u.Node.Pos())
 }
 
-var zeroConfig = &Config{}
+var (
+	zeroConfig   = &Config{}
+	emptyEnviron = FuncEnviron(func(string) string { return "" })
+)
 
 // TODO: note that prepareConfig is modifying the user's config in place,
 // which doesn't feel right - we should make a copy.
 
 func prepareConfig(cfg *Config) *Config {
-	cfg = cmp.Or(cfg, zeroConfig)
-	cfg.Env = cmp.Or(cfg.Env, FuncEnviron(func(string) string { return "" }))
+	if cfg == nil {
+		cfg = zeroConfig
+	}
+	if cfg.Env == nil {
+		cfg.Env = emptyEnviron
+	}
 
 	cfg.ifs = " \t\n"
 	if vr := cfg.Env.Get("IFS"); vr.IsSet() {
@@ -183,6 +203,88 @@ func (cfg *Config) envSet(name, value string) error {
 	return wenv.Set(name, Variable{Set: true, Kind: String, Str: value})
 }
 
+func (cfg *Config) hasReadDir() bool {
+	return cfg.ReadDir2 != nil || (cfg.Callbacks != nil && cfg.ReadDirEnabled)
+}
+
+func (cfg *Config) callReadDir(s string) ([]fs.DirEntry, error) {
+	if cfg.ReadDir2 != nil {
+		return cfg.ReadDir2(s)
+	}
+	return cfg.Callbacks.ExpandReadDir(s)
+}
+
+func (cfg *Config) callProcSubst(ps *syntax.ProcSubst) (string, error) {
+	if cfg.ProcSubst != nil {
+		return cfg.ProcSubst(ps)
+	}
+	if cfg.Callbacks != nil {
+		return cfg.Callbacks.ExpandProcSubst(ps)
+	}
+	return "", fmt.Errorf("unexpected process substitution")
+}
+
+func isPlainWordLit(s string) bool {
+	if s == "" || s[0] == '~' {
+		return false
+	}
+	if s == "[" {
+		return true
+	}
+	openBracket := false
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '\\', '*', '?', '{', 0:
+			return false
+		case '[':
+			openBracket = true
+		case ']':
+			if openBracket {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func (cfg *Config) fastSimpleParam(pe *syntax.ParamExp) (string, bool) {
+	if pe == nil || pe.Param == nil || pe.Excl || pe.Length || pe.Width || pe.IsSet ||
+		pe.Index != nil || pe.Slice != nil || pe.Repl != nil || pe.Exp != nil {
+		return "", false
+	}
+	name := pe.Param.Value
+	switch name {
+	case "", "@", "*", "LINENO":
+		return "", false
+	}
+	if cfg.Env == nil {
+		if cfg.NoUnset {
+			return "", false
+		}
+		return "", true
+	}
+	vr := cfg.Env.Get(name)
+	if vr.Kind == NameRef {
+		_, vr = vr.Resolve(cfg.Env)
+	}
+	if cfg.NoUnset && !vr.IsSet() {
+		return "", false
+	}
+	switch vr.Kind {
+	case Unknown:
+		return "", true
+	case String:
+		return vr.Str, true
+	case Indexed:
+		s, _ := vr.indexedVal(0)
+		return s, true
+	case Associative:
+		return vr.Map["0"], true
+	default:
+		return "", false
+	}
+}
+
 // Literal expands a single shell word. It is similar to [Fields], but the result
 // is a single string. This is the behavior when a word is used as the value in
 // a shell variable assignment, for example.
@@ -192,6 +294,60 @@ func (cfg *Config) envSet(name, value string) error {
 func Literal(cfg *Config, word *syntax.Word) (string, error) {
 	if word == nil {
 		return "", nil
+	}
+	if len(word.Parts) == 1 {
+		switch wp := word.Parts[0].(type) {
+		case *syntax.Lit:
+			s := wp.Value
+			if s == "" || (s[0] != '~' && strings.IndexByte(s, 0) < 0) {
+				return s, nil
+			}
+		case *syntax.SglQuoted:
+			if !wp.Dollar {
+				return wp.Value, nil
+			}
+		case *syntax.ArithmExp:
+			n, err := Arithm(cfg, wp.X)
+			if err != nil {
+				return "", err
+			}
+			return FormatIntFast(n), nil
+		case *syntax.ParamExp:
+			cfg = prepareConfig(cfg)
+			if val, ok := cfg.fastSimpleParam(wp); ok {
+				return val, nil
+			}
+			return cfg.paramExp(wp)
+		case *syntax.CmdSubst:
+			cfg = prepareConfig(cfg)
+			return cfg.cmdSubst(wp)
+		case *syntax.DblQuoted:
+			if len(wp.Parts) == 0 {
+				return "", nil
+			}
+			if len(wp.Parts) == 1 {
+				switch inner := wp.Parts[0].(type) {
+				case *syntax.Lit:
+					if strings.IndexByte(inner.Value, '\\') < 0 && strings.IndexByte(inner.Value, 0) < 0 {
+						return inner.Value, nil
+					}
+				case *syntax.ParamExp:
+					cfg = prepareConfig(cfg)
+					if val, ok := cfg.fastSimpleParam(inner); ok {
+						return val, nil
+					}
+				}
+			} else if len(wp.Parts) == 2 {
+				if lit, ok0 := wp.Parts[0].(*syntax.Lit); ok0 && strings.IndexByte(lit.Value, '\\') < 0 && strings.IndexByte(lit.Value, 0) < 0 {
+					if pe, ok1 := wp.Parts[1].(*syntax.ParamExp); ok1 {
+						cfg = prepareConfig(cfg)
+						if val, ok := cfg.fastSimpleParam(pe); ok {
+							return lit.Value + val, nil
+						}
+					}
+				}
+			}
+		}
 	}
 	cfg = prepareConfig(cfg)
 	field, err := cfg.wordField(word.Parts, quoteNone)
@@ -228,6 +384,14 @@ func Document(cfg *Config, word *syntax.Word) (string, error) {
 func Pattern(cfg *Config, word *syntax.Word) (string, error) {
 	if word == nil {
 		return "", nil
+	}
+	if len(word.Parts) == 1 {
+		if lit, ok := word.Parts[0].(*syntax.Lit); ok {
+			s := lit.Value
+			if s == "" || (s[0] != '~' && strings.IndexByte(s, 0) < 0) {
+				return s, nil
+			}
+		}
 	}
 	cfg = prepareConfig(cfg)
 	field, err := cfg.wordField(word.Parts, quoteNone)
@@ -462,14 +626,176 @@ func (cfg *Config) escapedGlobField(parts []fieldPart) (escaped string, glob boo
 	return "", false
 }
 
-// Fields is a pre-iterators API which now wraps [FieldsSeq].
-func Fields(cfg *Config, words ...*syntax.Word) ([]string, error) {
-	var fields []string
-	for s, err := range FieldsSeq(cfg, words...) {
+func hasNoIFSOrGlob(s, ifs string, defaultIFS bool) bool {
+	if defaultIFS {
+		for i := 0; i < len(s); i++ {
+			switch s[i] {
+			case ' ', '\t', '\n', '*', '?', '[':
+				return false
+			}
+		}
+		return true
+	}
+	for _, r := range s {
+		switch r {
+		case '*', '?', '[':
+			return false
+		}
+		if strings.ContainsRune(ifs, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func (cfg *Config) expandWordInto(dst []string, w *syntax.Word, dir string, loadedDir bool) ([]string, string, bool, error) {
+	wfields, err := cfg.wordFields(w.Parts)
+	if err != nil {
+		return nil, dir, loadedDir, err
+	}
+	for _, field := range wfields {
+		path, doGlob := cfg.escapedGlobField(field)
+		if doGlob && cfg.hasReadDir() {
+			if !loadedDir {
+				dir = cfg.envGet("PWD")
+				loadedDir = true
+			}
+			matches, err := cfg.glob(dir, path)
+			if err != nil {
+				if _, ok := err.(*pattern.SyntaxError); !ok {
+					return nil, dir, loadedDir, err
+				}
+			} else if len(matches) > 0 || cfg.NullGlob {
+				dst = append(dst, matches...)
+				continue
+			}
+		}
+		dst = append(dst, cfg.fieldJoin(field))
+	}
+	return dst, dir, loadedDir, nil
+}
+
+func (cfg *Config) expandWordSlow(dst []string, word *syntax.Word, dir string, loadedDir bool) ([]string, string, bool, error) {
+	wcopy := *word
+	if !syntax.SplitBraces(&wcopy) {
+		return cfg.expandWordInto(dst, &wcopy, dir, loadedDir)
+	}
+	var err error
+	for bw, berr := range BracesSeq(cfg, &wcopy) {
+		if berr != nil {
+			return nil, dir, loadedDir, berr
+		}
+		dst, dir, loadedDir, err = cfg.expandWordInto(dst, bw, dir, loadedDir)
+		if err != nil {
+			return nil, dir, loadedDir, err
+		}
+	}
+	return dst, dir, loadedDir, nil
+}
+
+// FieldsInto expands words like [Fields], appending into dst so callers with a
+// stack/runner-local buffer avoid allocating a slice per command call.
+func FieldsInto(dst []string, cfg *Config, words ...*syntax.Word) ([]string, error) {
+	if len(words) == 0 {
+		return dst, nil
+	}
+	var prepared bool
+	var defaultIFS bool
+	var dir string
+	loadedDir := false
+
+	for _, word := range words {
+		if len(word.Parts) == 1 {
+			switch wp := word.Parts[0].(type) {
+			case *syntax.Lit:
+				if isPlainWordLit(wp.Value) {
+					dst = append(dst, wp.Value)
+					continue
+				}
+			case *syntax.SglQuoted:
+				if !wp.Dollar {
+					dst = append(dst, wp.Value)
+					continue
+				}
+			case *syntax.DblQuoted:
+				if len(wp.Parts) == 0 {
+					dst = append(dst, "")
+					continue
+				}
+				if len(wp.Parts) == 1 {
+					switch inner := wp.Parts[0].(type) {
+					case *syntax.Lit:
+						if strings.IndexByte(inner.Value, '\\') < 0 && strings.IndexByte(inner.Value, 0) < 0 {
+							dst = append(dst, inner.Value)
+							continue
+						}
+					case *syntax.ParamExp:
+						if cfg != nil && cfg.Env != nil {
+							if val, ok := cfg.fastSimpleParam(inner); ok {
+								dst = append(dst, val)
+								continue
+							}
+						}
+					}
+				}
+			case *syntax.ParamExp:
+				if !prepared {
+					cfg = prepareConfig(cfg)
+					defaultIFS = cfg.ifs == " \t\n"
+					prepared = true
+				}
+				if val, ok := cfg.fastSimpleParam(wp); ok {
+					if val == "" {
+						continue
+					}
+					if hasNoIFSOrGlob(val, cfg.ifs, defaultIFS) {
+						dst = append(dst, val)
+						continue
+					}
+				}
+			case *syntax.ArithmExp:
+				if !prepared {
+					cfg = prepareConfig(cfg)
+					defaultIFS = cfg.ifs == " \t\n"
+					prepared = true
+				}
+				n, err := Arithm(cfg, wp.X)
+				if err != nil {
+					return nil, err
+				}
+				val := FormatIntFast(n)
+				if defaultIFS || hasNoIFSOrGlob(val, cfg.ifs, false) {
+					dst = append(dst, val)
+					continue
+				}
+			}
+		}
+
+		if !prepared {
+			cfg = prepareConfig(cfg)
+			defaultIFS = cfg.ifs == " \t\n"
+			prepared = true
+		}
+		var err error
+		dst, dir, loadedDir, err = cfg.expandWordSlow(dst, word, dir, loadedDir)
 		if err != nil {
 			return nil, err
 		}
-		fields = append(fields, s)
+	}
+	return dst, nil
+}
+
+// Fields expands a number of words as if they were arguments in a shell command.
+func Fields(cfg *Config, words ...*syntax.Word) ([]string, error) {
+	if len(words) == 0 {
+		return nil, nil
+	}
+	fields, err := FieldsInto(make([]string, 0, len(words)), cfg, words...)
+	if err != nil {
+		return nil, err
+	}
+	if len(fields) == 0 {
+		return nil, nil
 	}
 	return fields, nil
 }
@@ -479,7 +805,8 @@ func Fields(cfg *Config, words ...*syntax.Word) ([]string, error) {
 // command substitution, arithmetic expansion, quote removal, and globbing.
 func FieldsSeq(cfg *Config, words ...*syntax.Word) iter.Seq2[string, error] {
 	cfg = prepareConfig(cfg)
-	dir := cfg.envGet("PWD")
+	var dir string
+	loadedDir := false
 	return func(yield func(string, error) bool) {
 		expandWord := func(w *syntax.Word) (stop bool) {
 			wfields, err := cfg.wordFields(w.Parts)
@@ -489,7 +816,11 @@ func FieldsSeq(cfg *Config, words ...*syntax.Word) iter.Seq2[string, error] {
 			}
 			for _, field := range wfields {
 				path, doGlob := cfg.escapedGlobField(field)
-				if doGlob && cfg.ReadDir2 != nil {
+				if doGlob && cfg.hasReadDir() {
+					if !loadedDir {
+						dir = cfg.envGet("PWD")
+						loadedDir = true
+					}
 					// Note that globbing requires keeping a slice state, so it doesn't
 					// really benefit from using an iterator.
 					matches, err := cfg.glob(dir, path)
@@ -618,9 +949,9 @@ func (cfg *Config) wordField(wps []syntax.WordPart, ql quoteLevel) ([]fieldPart,
 			if err != nil {
 				return nil, err
 			}
-			field = append(field, fieldPart{val: strconv.Itoa(n)})
+			field = append(field, fieldPart{val: FormatIntFast(n)})
 		case *syntax.ProcSubst:
-			path, err := cfg.ProcSubst(wp)
+			path, err := cfg.callProcSubst(wp)
 			if err != nil {
 				return nil, err
 			}
@@ -637,17 +968,52 @@ func (cfg *Config) wordField(wps []syntax.WordPart, ql quoteLevel) ([]fieldPart,
 	return field, nil
 }
 
+var cmdSubstBufPool = sync.Pool{
+	New: func() any {
+		return bytes.NewBuffer(make([]byte, 0, 128))
+	},
+}
+
 func (cfg *Config) cmdSubst(cs *syntax.CmdSubst) (string, error) {
-	if cfg.CmdSubst == nil {
+	if cfg.CmdSubst == nil && cfg.Callbacks == nil {
 		return "", UnexpectedCommandError{Node: cs}
 	}
-	sb := cfg.strBuilder()
-	if err := cfg.CmdSubst(sb, cs); err != nil {
+	buf := cmdSubstBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	var err error
+	if cfg.CmdSubst != nil {
+		err = cfg.CmdSubst(buf, cs)
+	} else {
+		err = cfg.Callbacks.ExpandCmdSubst(buf, cs)
+	}
+	if err != nil {
+		if buf.Cap() <= 64*1024 {
+			cmdSubstBufPool.Put(buf)
+		}
 		return "", err
 	}
-	out := sb.String()
-	out = strings.ReplaceAll(out, "\x00", "")
-	return strings.TrimRight(out, "\n"), nil
+	b := buf.Bytes()
+	if bytes.IndexByte(b, 0) >= 0 {
+		w := 0
+		for _, c := range b {
+			if c != 0 {
+				b[w] = c
+				w++
+			}
+		}
+		b = b[:w]
+	}
+	for len(b) > 0 && b[len(b)-1] == '\n' {
+		b = b[:len(b)-1]
+	}
+	var out string
+	if len(b) > 0 {
+		out = string(b)
+	}
+	if buf.Cap() <= 64*1024 {
+		cmdSubstBufPool.Put(buf)
+	}
+	return out, nil
 }
 
 func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
@@ -773,9 +1139,9 @@ func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
 			if err != nil {
 				return nil, err
 			}
-			curField = append(curField, fieldPart{val: strconv.Itoa(n)})
+			curField = append(curField, fieldPart{val: FormatIntFast(n)})
 		case *syntax.ProcSubst:
-			path, err := cfg.ProcSubst(wp)
+			path, err := cfg.callProcSubst(wp)
 			if err != nil {
 				return nil, err
 			}
@@ -985,11 +1351,10 @@ func (cfg *Config) expandUser(field string, moreFields bool) (prefix, rest strin
 }
 
 func findAllIndex(pat, name string, n int) [][]int {
-	expr, err := pattern.Regexp(pat, 0)
-	if err != nil {
+	rx, ok := cachedFindRegexp(pat)
+	if !ok {
 		return nil
 	}
-	rx := regexp.MustCompile(expr)
 	return rx.FindAllStringIndex(name, n)
 }
 
@@ -1063,7 +1428,7 @@ func (cfg *Config) glob(base, pat string) ([]string, error) {
 				// Our only option is to [Config.ReadDir2] on the directory entry itself,
 				// which can be wasteful if we only want to see if it exists,
 				// but at least it's correct in all scenarios.
-				if _, err := cfg.ReadDir2(match); err != nil {
+				if _, err := cfg.callReadDir(match); err != nil {
 					if errors.Is(err, syscall.ENOTDIR) {
 						// Reading a regular file as a directory.
 						// Note that on Windows this error also satisfies
@@ -1149,7 +1514,7 @@ func (cfg *Config) globDir(base, dir string, matcher func(string) bool, wantDir 
 	if !filepath.IsAbs(dir) {
 		fullDir = filepath.Join(base, dir)
 	}
-	infos, err := cfg.ReadDir2(fullDir)
+	infos, err := cfg.callReadDir(fullDir)
 	if err != nil {
 		// We still want to return matches, for the sake of reusing slices.
 		return matches, err
@@ -1164,7 +1529,7 @@ func (cfg *Config) globDir(base, dir string, matcher func(string) bool, wantDir 
 			// does not follow symlinks for each of the directory entries.
 			// ReadDir is somewhat wasteful here, as we only want its error result,
 			// but we could try to reuse its result as per the TODO in [Config.glob].
-			if _, err := cfg.ReadDir2(filepath.Join(fullDir, info.Name())); err != nil {
+			if _, err := cfg.callReadDir(filepath.Join(fullDir, info.Name())); err != nil {
 				continue
 			}
 		} else if !mode.IsDir() {

@@ -15,11 +15,23 @@ import (
 
 const patCacheMax = 2048
 
+type removePatKey struct {
+	pat      string
+	fromEnd  bool
+	shortest bool
+}
+
 var (
 	patMu    sync.Mutex
 	patCache = map[string]string{}
 	reMu     sync.Mutex
 	reCache  = map[string]*regexp.Regexp{}
+
+	remReMu    sync.RWMutex
+	remReCache = map[removePatKey]*regexp.Regexp{}
+
+	findReMu    sync.RWMutex
+	findReCache = map[string]*regexp.Regexp{}
 )
 
 // cachedPattern memoizes pattern.Regexp (shell pattern -> regex source).
@@ -60,4 +72,62 @@ func cachedRegexp(re string) *regexp.Regexp {
 	reCache[re] = rx
 	reMu.Unlock()
 	return rx
+}
+
+// cachedRemoveRegexp memoizes the anchored *regexp.Regexp for ${var#pat},
+// ${var##pat}, ${var%pat}, and ${var%%pat} in a single read-locked lookup.
+func cachedRemoveRegexp(pat string, fromEnd, shortest bool) (*regexp.Regexp, bool) {
+	key := removePatKey{pat: pat, fromEnd: fromEnd, shortest: shortest}
+	remReMu.RLock()
+	rx, ok := remReCache[key]
+	remReMu.RUnlock()
+	if ok {
+		return rx, rx != nil
+	}
+	var mode pattern.Mode
+	if shortest {
+		mode |= pattern.Shortest
+	}
+	expr, err := pattern.Regexp(pat, mode)
+	if err != nil {
+		return nil, false
+	}
+	switch {
+	case fromEnd && shortest:
+		expr = ".*(" + expr + ")$"
+	case fromEnd:
+		expr = "(" + expr + ")$"
+	default:
+		expr = "^(" + expr + ")"
+	}
+	rx = regexp.MustCompile(expr)
+	remReMu.Lock()
+	if len(remReCache) >= patCacheMax {
+		remReCache = map[removePatKey]*regexp.Regexp{}
+	}
+	remReCache[key] = rx
+	remReMu.Unlock()
+	return rx, true
+}
+
+// cachedFindRegexp memoizes the compiled *regexp.Regexp for ${var/pat/rep}.
+func cachedFindRegexp(pat string) (*regexp.Regexp, bool) {
+	findReMu.RLock()
+	rx, ok := findReCache[pat]
+	findReMu.RUnlock()
+	if ok {
+		return rx, rx != nil
+	}
+	expr, err := pattern.Regexp(pat, 0)
+	if err != nil {
+		return nil, false
+	}
+	rx = regexp.MustCompile(expr)
+	findReMu.Lock()
+	if len(findReCache) >= patCacheMax {
+		findReCache = map[string]*regexp.Regexp{}
+	}
+	findReCache[pat] = rx
+	findReMu.Unlock()
+	return rx, true
 }

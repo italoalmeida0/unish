@@ -14,7 +14,6 @@ import (
 	"unicode/utf8"
 
 	"mvdan.cc/sh/v3/internal"
-	"mvdan.cc/sh/v3/pattern"
 	"mvdan.cc/sh/v3/syntax"
 )
 
@@ -141,8 +140,10 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 			return "", err
 		}
 	}
+	var singleElem [1]string
 	if !indexAllElements {
-		elems = []string{str}
+		singleElem[0] = str
+		elems = singleElem[:]
 	}
 
 	switch {
@@ -153,7 +154,7 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 		default:
 			n = utf8.RuneCountInString(str)
 		}
-		str = strconv.Itoa(n)
+		str = FormatIntFast(n)
 	case pe.Excl:
 		var strs []string
 		switch {
@@ -202,6 +203,14 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 			str = string(rs)
 		} // else, elems are already sliced
 	case pe.Repl != nil:
+		if !indexAllElements {
+			var err error
+			str, err = cfg.replaceScalar(pe.Repl, str)
+			if err != nil {
+				return "", err
+			}
+			break
+		}
 		elems, err := cfg.replaceElems(pe.Repl, elems)
 		if err != nil {
 			return "", err
@@ -257,6 +266,12 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 			}
 		case syntax.RemSmallPrefix, syntax.RemLargePrefix,
 			syntax.RemSmallSuffix, syntax.RemLargeSuffix:
+			if !indexAllElements {
+				suffix := op == syntax.RemSmallSuffix || op == syntax.RemLargeSuffix
+				small := op == syntax.RemSmallPrefix || op == syntax.RemSmallSuffix
+				str = removePattern(str, arg, suffix, small)
+				break
+			}
 			str = join(cfg.removePatternElems(op, arg, elems))
 		case syntax.UpperFirst, syntax.UpperAll,
 			syntax.LowerFirst, syntax.LowerAll, syntax.ToggleFirst:
@@ -317,28 +332,81 @@ func (cfg *Config) paramExp(pe *syntax.ParamExp) (string, error) {
 	return str, nil
 }
 
-func removePattern(str, pat string, fromEnd, shortest bool) string {
-	var mode pattern.Mode
-	if shortest {
-		mode |= pattern.Shortest
+func isPlainPatternLiteral(s string) bool {
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case '*', '?', '[', '\\':
+			return false
+		}
 	}
-	expr, err := cachedPattern(pat, mode)
-	if err != nil {
+	return true
+}
+
+func removePattern(str, pat string, fromEnd, shortest bool) string {
+	if pat == "" || str == "" {
 		return str
 	}
-	switch {
-	case fromEnd && shortest:
-		// use .* to get the right-most shortest match
-		expr = ".*(" + expr + ")$"
-	case fromEnd:
-		// simple suffix
-		expr = "(" + expr + ")$"
-	default:
-		// simple prefix
-		expr = "^(" + expr + ")"
+	if pat == "*" {
+		if shortest {
+			return str
+		}
+		return ""
 	}
-	// no need to check error as Translate returns one
-	rx := cachedRegexp(expr)
+	if isPlainPatternLiteral(pat) {
+		if fromEnd {
+			return strings.TrimSuffix(str, pat)
+		}
+		return strings.TrimPrefix(str, pat)
+	}
+	if pat[0] == '*' && isPlainPatternLiteral(pat[1:]) {
+		lit := pat[1:]
+		if !fromEnd {
+			if shortest {
+				if idx := strings.Index(str, lit); idx >= 0 {
+					return str[idx+len(lit):]
+				}
+				return str
+			}
+			if idx := strings.LastIndex(str, lit); idx >= 0 {
+				return str[idx+len(lit):]
+			}
+			return str
+		}
+		if strings.HasSuffix(str, lit) {
+			if shortest {
+				return str[:len(str)-len(lit)]
+			}
+			return ""
+		}
+		return str
+	}
+	if pat[len(pat)-1] == '*' && isPlainPatternLiteral(pat[:len(pat)-1]) {
+		lit := pat[:len(pat)-1]
+		if fromEnd {
+			if shortest {
+				if idx := strings.LastIndex(str, lit); idx >= 0 {
+					return str[:idx]
+				}
+				return str
+			}
+			if idx := strings.Index(str, lit); idx >= 0 {
+				return str[:idx]
+			}
+			return str
+		}
+		if strings.HasPrefix(str, lit) {
+			if shortest {
+				return str[len(lit):]
+			}
+			return ""
+		}
+		return str
+	}
+
+	rx, ok := cachedRemoveRegexp(pat, fromEnd, shortest)
+	if !ok {
+		return str
+	}
 	if loc := rx.FindStringSubmatchIndex(str); loc != nil {
 		// remove the original pattern (the submatch)
 		str = str[:loc[2]] + str[loc[3]:]
@@ -372,68 +440,112 @@ func (cfg *Config) perElemOps(pe *syntax.ParamExp, elems []string) ([]string, er
 	return elems, nil
 }
 
-// replaceElems applies a ${var/pattern/repl} replacement to each element.
-func (cfg *Config) replaceElems(repl *syntax.Replace, elems []string) ([]string, error) {
-	orig, err := Pattern(cfg, repl.Orig)
+func (cfg *Config) parseReplaceSpec(repl *syntax.Replace) (orig, with string, anchor byte, plainOrig, plainWith, noop bool, err error) {
+	orig, err = Pattern(cfg, repl.Orig)
 	if err != nil {
-		return nil, err
+		return "", "", 0, false, false, false, err
 	}
 	if orig == "" {
-		return elems, nil // nothing to replace
+		return "", "", 0, false, false, true, nil
 	}
 	// bash/GNU anchors: ${var/#pat/rep} only matches at the start of the
 	// value, ${var/%pat/rep} only at the end. Only an unquoted, unescaped
 	// leading '#' or '%' acts as an anchor; "${var/"#"/rep}" and
 	// "${var/\#/rep}" match literal '#' characters.
-	var anchor byte
 	if repl.Orig != nil && len(repl.Orig.Parts) > 0 {
 		if lit, ok := repl.Orig.Parts[0].(*syntax.Lit); ok && len(lit.Value) > 0 && (lit.Value[0] == '#' || lit.Value[0] == '%') {
 			anchor = orig[0]
 			orig = orig[1:]
 			if orig == "" {
-				return elems, nil
+				return "", "", 0, false, false, true, nil
 			}
 		}
 	}
-	with, err := literalReplace(cfg, repl.With)
+	with, err = literalReplace(cfg, repl.With)
 	if err != nil {
-		return nil, err
+		return "", "", 0, false, false, false, err
+	}
+	plainOrig = isPlainPatternLiteral(orig)
+	plainWith = strings.IndexByte(with, '&') < 0 && strings.IndexByte(with, '\x01') < 0
+	return orig, with, anchor, plainOrig, plainWith, false, nil
+}
+
+func (cfg *Config) replaceOneElem(orig, with string, anchor byte, all, plainOrig, plainWith bool, elem string) string {
+	if plainOrig && plainWith {
+		switch anchor {
+		case '#':
+			if strings.HasPrefix(elem, orig) {
+				return with + elem[len(orig):]
+			}
+			return elem
+		case '%':
+			if strings.HasSuffix(elem, orig) {
+				return elem[:len(elem)-len(orig)] + with
+			}
+			return elem
+		default:
+			if all {
+				return strings.ReplaceAll(elem, orig, with)
+			}
+			return strings.Replace(elem, orig, with, 1)
+		}
 	}
 	n := 1
-	if repl.All {
+	if all || anchor == '%' {
 		n = -1
 	}
-	if anchor == '%' && !repl.All {
-		n = -1 // scan every match so the one at the end can win
+	locs := findAllIndex(orig, elem, n)
+	if anchor != 0 {
+		filtered := locs[:0]
+		for _, loc := range locs {
+			if (anchor == '#' && loc[0] == 0) || (anchor == '%' && loc[1] == len(elem)) {
+				filtered = append(filtered, loc)
+			}
+		}
+		locs = filtered
+		if anchor == '%' && !all && len(locs) > 1 {
+			locs = locs[len(locs)-1:]
+		}
+		if anchor == '#' && !all && len(locs) > 1 {
+			locs = locs[:1]
+		}
+	}
+	if len(locs) == 0 {
+		return elem
+	}
+	sb := cfg.strBuilder()
+	last := 0
+	for _, loc := range locs {
+		sb.WriteString(elem[last:loc[0]])
+		if plainWith {
+			sb.WriteString(with)
+		} else {
+			// bash: & is the matched text; \& is a literal &.
+			sb.WriteString(strings.ReplaceAll(strings.ReplaceAll(with, "&", elem[loc[0]:loc[1]]), replaceEscAmp, "&"))
+		}
+		last = loc[1]
+	}
+	sb.WriteString(elem[last:])
+	return sb.String()
+}
+
+func (cfg *Config) replaceScalar(repl *syntax.Replace, str string) (string, error) {
+	orig, with, anchor, plainOrig, plainWith, noop, err := cfg.parseReplaceSpec(repl)
+	if err != nil || noop {
+		return str, err
+	}
+	return cfg.replaceOneElem(orig, with, anchor, repl.All, plainOrig, plainWith, str), nil
+}
+
+// replaceElems applies a ${var/pattern/repl} replacement to each element.
+func (cfg *Config) replaceElems(repl *syntax.Replace, elems []string) ([]string, error) {
+	orig, with, anchor, plainOrig, plainWith, noop, err := cfg.parseReplaceSpec(repl)
+	if err != nil || noop {
+		return elems, err
 	}
 	out := make([]string, len(elems))
 	for i, elem := range elems {
-		locs := findAllIndex(orig, elem, n)
-		if anchor != 0 {
-			filtered := locs[:0]
-			for _, loc := range locs {
-				if (anchor == '#' && loc[0] == 0) || (anchor == '%' && loc[1] == len(elem)) {
-					filtered = append(filtered, loc)
-				}
-			}
-			locs = filtered
-			if anchor == '%' && !repl.All && len(locs) > 1 {
-				locs = locs[len(locs)-1:]
-			}
-			if anchor == '#' && !repl.All && len(locs) > 1 {
-				locs = locs[:1]
-			}
-		}
-		sb := cfg.strBuilder()
-		last := 0
-		for _, loc := range locs {
-			sb.WriteString(elem[last:loc[0]])
-			// bash: & is the matched text; \& is a literal &.
-			sb.WriteString(strings.ReplaceAll(strings.ReplaceAll(with, "&", elem[loc[0]:loc[1]]), replaceEscAmp, "&"))
-			last = loc[1]
-		}
-		sb.WriteString(elem[last:])
-		out[i] = sb.String()
+		out[i] = cfg.replaceOneElem(orig, with, anchor, repl.All, plainOrig, plainWith, elem)
 	}
 	return out, nil
 }
@@ -447,6 +559,19 @@ const replaceEscAmp = "\x01"
 func literalReplace(cfg *Config, w *syntax.Word) (string, error) {
 	if w == nil {
 		return "", nil
+	}
+	if len(w.Parts) == 1 {
+		switch pt := w.Parts[0].(type) {
+		case *syntax.Lit:
+			s := pt.Value
+			if s == "" || (s[0] != '~' && strings.IndexByte(s, '\\') < 0 && strings.IndexByte(s, 0) < 0) {
+				return s, nil
+			}
+		case *syntax.SglQuoted:
+			if !pt.Dollar && strings.IndexByte(pt.Value, '&') < 0 {
+				return pt.Value, nil
+			}
+		}
 	}
 	cloned := *w
 	cloned.Parts = escapeReplaceParts(cfg, w.Parts, false)

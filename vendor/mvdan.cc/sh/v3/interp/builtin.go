@@ -141,10 +141,25 @@ func atoi(s string) int64 {
 
 type errBuiltinExitStatus exitStatus
 
+var preboxedExitStatus [256]error
+
+func init() {
+	for i := range preboxedExitStatus {
+		preboxedExitStatus[i] = errBuiltinExitStatus(exitStatus{code: uint8(i)})
+	}
+}
+
+// CallHandled signals to [Runner.call] that a [CallHandlerFunc] has already
+// executed the command in-place with the given exit status (including 0),
+// skipping any second builtin/exec dispatch with zero allocations.
+func CallHandled(code uint8) error {
+	return preboxedExitStatus[code]
+}
+
 // BuiltinExit returns an error carrying a non-fatal exit status, for
 // builtins implemented outside this package via a [CallHandlerFunc].
 func BuiltinExit(code uint8) error {
-	return errBuiltinExitStatus(exitStatus{code: code})
+	return preboxedExitStatus[code]
 }
 
 func (e errBuiltinExitStatus) Error() string {

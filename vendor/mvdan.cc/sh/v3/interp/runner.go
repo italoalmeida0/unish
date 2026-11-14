@@ -16,6 +16,7 @@ import (
 	"math"
 	"os"
 	"os/signal"
+	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -43,109 +44,128 @@ const (
 
 func (r *Runner) fillExpandConfig(ctx context.Context) {
 	r.ectx = ctx
-	r.ecfg = &expand.Config{
-		Env: expandEnv{r},
-		CmdSubst: func(w io.Writer, cs *syntax.CmdSubst) error {
-			r.reportBgStart(0) // runs arbitrary shell code
-			switch len(cs.Stmts) {
-			case 0: // nothing to do
-				return nil
-			case 1: // $(<file)
-				word := catShortcutArg(cs.Stmts[0])
-				if word == nil {
-					break
-				}
-				path := r.literal(word)
-				f, err := r.open(ctx, path, os.O_RDONLY, 0, true)
-				if err != nil {
-					return err
-				}
-				_, err = io.Copy(w, f)
-				f.Close()
-				return err
-			}
-			r2 := r.subshell(false)
-			r2.stdout = w
-			r2.stmts(ctx, cs.Stmts)
-			r2.finishSubshell(ctx)
-			r.lastExpandExit = r2.exit
-			if r2.exit.fatalExit {
-				return r2.exit.err // surface fatal errors immediately
-			}
-			return nil
-		},
-		ProcSubst: func(ps *syntax.ProcSubst) (string, error) {
-			if ps.Op == syntax.CmdInTemp { // zsh's =(...)
-				return "", fmt.Errorf("unsupported")
-			}
-			if len(ps.Stmts) == 0 { // nothing to do
-				return os.DevNull, nil
-			}
-
-			psf, err := r.procSubstHandler(r.handlerCtx(ctx, handlerKindProcSubst, ps.OpPos), ps.Op)
-			if err != nil {
-				return "", err
-			}
-			r.procSubsts.add(psf)
-			r.stmtProcSubsts = append(r.stmtProcSubsts, psf)
-
-			r2 := r.subshell(true)
-			stdout := r.origStdout
-			// TODO: note that `man bash` mentions that `wait` only waits for the last
-			// process substitution as long as it is $!; the logic here would mean we wait for all of them.
-			bg := r.newBgProc()
-			r.bgProcs = append(r.bgProcs, bg)
-			go func() {
-				defer func() {
-					r2.resetSignals()
-					r2.closeOwnedExtraFds()
-					*bg.exit = r2.exit
-					close(bg.done)
-				}()
-				defer func() {
-					r.procSubsts.release(psf)
-					if psf.Cleanup == nil {
-						return
-					}
-					if err := psf.Cleanup(); err != nil {
-						r.errf("cleaning up process substitution: %v\n", err)
-					}
-				}()
-				f, err := psf.OpenSubshell(ctx)
-				if err != nil {
-					r.errf("cannot open process substitution: %v\n", err)
-					return
-				}
-				defer func() {
-					if err := f.Close(); err != nil {
-						r.errf("closing process substitution: %v\n", err)
-					}
-				}()
-				switch ps.Op {
-				case syntax.CmdIn:
-					r2.stdout = f
-				case syntax.CmdOut:
-					stdin, err := newStdinFile(f)
-					if err != nil {
-						r.errf("cannot use process substitution as stdin: %v\n", err)
-						return
-					}
-					r2.stdin = stdin
-					r2.stdout = stdout
-				default:
-					// Should only happen if we forgot a case above.
-					panic(fmt.Sprintf("unexpected process substitution operator: %q", ps.Op))
-				}
-				r2.stmts(ctx, ps.Stmts)
-				if !r2.exit.fatalExit {
-					r2.trapCallback(ctx, r2.callbackExit, "exit")
-				}
-				r2.exit.exiting = false // subshells don't exit the parent shell
-			}()
-			return psf.Path, nil
-		},
-	}
+	r.envProxy.r = r
+	r.roEnv.r = r
+	r.ecfg = &r.ecfgStorage
+	r.ecfg.Env = &r.envProxy
+	r.ecfg.Callbacks = &r.envProxy
+	r.ecfg.CmdSubst = nil
+	r.ecfg.ProcSubst = nil
+	r.ecfg.ReadDir = nil
+	r.ecfg.ReadDir2 = nil
 	r.updateExpandOpts()
+}
+
+func (e *expandEnv) ExpandCmdSubst(w io.Writer, cs *syntax.CmdSubst) error {
+	r := e.r
+	ctx := r.ectx
+	r.reportBgStart(0) // runs arbitrary shell code
+	switch len(cs.Stmts) {
+	case 0: // nothing to do
+		return nil
+	case 1: // $(<file)
+		word := catShortcutArg(cs.Stmts[0])
+		if word == nil {
+			break
+		}
+		path := r.literal(word)
+		f, err := r.open(ctx, path, os.O_RDONLY, 0, true)
+		if err != nil {
+			return err
+		}
+		_, err = io.Copy(w, f)
+		f.Close()
+		return err
+	}
+	r2, oenv := r.acquireCmdSubstSubshell()
+	r2.stdout = w
+	r2.stmts(ctx, cs.Stmts)
+	r2.finishSubshell(ctx)
+	exit := r2.exit
+	releaseCmdSubstSubshell(r2, oenv)
+	r.lastExpandExit = exit
+	if exit.fatalExit {
+		return exit.err // surface fatal errors immediately
+	}
+	return nil
+}
+
+func (e *expandEnv) ExpandProcSubst(ps *syntax.ProcSubst) (string, error) {
+	r := e.r
+	ctx := r.ectx
+	if ps.Op == syntax.CmdInTemp { // zsh's =(...)
+		return "", fmt.Errorf("unsupported")
+	}
+	if len(ps.Stmts) == 0 { // nothing to do
+		return os.DevNull, nil
+	}
+
+	psf, err := r.procSubstHandler(r.handlerCtx(ctx, handlerKindProcSubst, ps.OpPos), ps.Op)
+	if err != nil {
+		return "", err
+	}
+	r.procSubsts.add(psf)
+	r.stmtProcSubsts = append(r.stmtProcSubsts, psf)
+
+	r2 := r.subshell(true)
+	stdout := r.origStdout
+	// TODO: note that `man bash` mentions that `wait` only waits for the last
+	// process substitution as long as it is $!; the logic here would mean we wait for all of them.
+	bg := r.newBgProc()
+	r.bgProcs = append(r.bgProcs, bg)
+	go func() {
+		defer func() {
+			r2.resetSignals()
+			r2.closeOwnedExtraFds()
+			*bg.exit = r2.exit
+			close(bg.done)
+		}()
+		defer func() {
+			r.procSubsts.release(psf)
+			if psf.Cleanup == nil {
+				return
+			}
+			if err := psf.Cleanup(); err != nil {
+				r.errf("cleaning up process substitution: %v\n", err)
+			}
+		}()
+		f, err := psf.OpenSubshell(ctx)
+		if err != nil {
+			r.errf("cannot open process substitution: %v\n", err)
+			return
+		}
+		defer func() {
+			if err := f.Close(); err != nil {
+				r.errf("closing process substitution: %v\n", err)
+			}
+		}()
+		switch ps.Op {
+		case syntax.CmdIn:
+			r2.stdout = f
+		case syntax.CmdOut:
+			stdin, err := newStdinFile(f)
+			if err != nil {
+				r.errf("cannot use process substitution as stdin: %v\n", err)
+				return
+			}
+			r2.stdin = stdin
+			r2.stdout = stdout
+		default:
+			// Should only happen if we forgot a case above.
+			panic(fmt.Sprintf("unexpected process substitution operator: %q", ps.Op))
+		}
+		r2.stmts(ctx, ps.Stmts)
+		if !r2.exit.fatalExit {
+			r2.trapCallback(ctx, r2.callbackExit, "exit")
+		}
+		r2.exit.exiting = false // subshells don't exit the parent shell
+	}()
+	return psf.Path, nil
+}
+
+func (e *expandEnv) ExpandReadDir(s string) ([]fs.DirEntry, error) {
+	r := e.r
+	return r.readDirHandler(r.handlerCtx(r.ectx, handlerKindReadDir, todoPos), s)
 }
 
 // catShortcutArg checks if a statement is of the form "$(<file)". The redirect
@@ -165,13 +185,8 @@ func catShortcutArg(stmt *syntax.Stmt) *syntax.Word {
 }
 
 func (r *Runner) updateExpandOpts() {
-	if r.opts[optNoGlob] {
-		r.ecfg.ReadDir2 = nil
-	} else {
-		r.ecfg.ReadDir2 = func(s string) ([]fs.DirEntry, error) {
-			return r.readDirHandler(r.handlerCtx(r.ectx, handlerKindReadDir, todoPos), s)
-		}
-	}
+	r.ecfg.ReadDirEnabled = !r.opts[optNoGlob]
+	r.ecfg.ReadDir2 = nil
 	r.ecfg.GlobStar = r.opts[optGlobStar]
 	r.ecfg.DotGlob = r.opts[optDotGlob]
 	r.ecfg.NoCaseGlob = r.opts[optNoCaseGlob]
@@ -235,27 +250,67 @@ type expandEnv struct {
 	r *Runner
 }
 
-var _ expand.WriteEnviron = expandEnv{}
+var (
+	_ expand.WriteEnviron    = (*expandEnv)(nil)
+	_ expand.RunnerCallbacks = (*expandEnv)(nil)
+)
 
-func (e expandEnv) Get(name string) expand.Variable {
+func (e *expandEnv) Get(name string) expand.Variable {
 	return e.r.lookupVar(name)
 }
 
-func (e expandEnv) Set(name string, vr expand.Variable) error {
+func (e *expandEnv) Set(name string, vr expand.Variable) error {
 	return e.r.setVarErr(name, vr)
 }
 
-func (e expandEnv) Each(fn func(name string, vr expand.Variable) bool) {
-	e.r.writeEnv.Each(fn)
+func (e *expandEnv) Each(fn func(name string, vr expand.Variable) bool) {
+	stopped := false
+	e.r.writeEnv.Each(func(name string, vr expand.Variable) bool {
+		if !fn(name, vr) {
+			stopped = true
+			return false
+		}
+		return true
+	})
+	if !stopped && !e.r.pipeStatusInEnv && e.r.pipeStatusDirty {
+		fn("PIPESTATUS", e.r.materializePipeStatus())
+	}
+}
+
+type readOnlyEnv struct {
+	r *Runner
+}
+
+var _ expand.Environ = (*readOnlyEnv)(nil)
+
+func (e *readOnlyEnv) Get(name string) expand.Variable {
+	if !e.r.pipeStatusInEnv && e.r.pipeStatusDirty && isPipeStatusVar(name) {
+		return e.r.materializePipeStatus()
+	}
+	return e.r.writeEnv.Get(name)
+}
+
+func (e *readOnlyEnv) Each(fn func(name string, vr expand.Variable) bool) {
+	stopped := false
+	e.r.writeEnv.Each(func(name string, vr expand.Variable) bool {
+		if !fn(name, vr) {
+			stopped = true
+			return false
+		}
+		return true
+	})
+	if !stopped && !e.r.pipeStatusInEnv && e.r.pipeStatusDirty {
+		fn("PIPESTATUS", e.r.materializePipeStatus())
+	}
 }
 
 var todoPos syntax.Pos // for handlerCtx callers where we don't yet have a position
 
-func (r *Runner) handlerCtx(ctx context.Context, kind handlerKind, pos syntax.Pos) context.Context {
+func (r *Runner) makeHandlerCtx(kind handlerKind, pos syntax.Pos) HandlerContext {
 	hc := HandlerContext{
 		runner:         r,
 		kind:           kind,
-		Env:            &overlayEnviron{parent: r.writeEnv},
+		Env:            &r.roEnv,
 		Dir:            r.Dir,
 		Pos:            pos,
 		Stdout:         r.stdout,
@@ -265,7 +320,11 @@ func (r *Runner) handlerCtx(ctx context.Context, kind handlerKind, pos syntax.Po
 	if r.stdin != nil { // do not leave hc.Stdin as a typed nil
 		hc.Stdin = r.stdin
 	}
-	return context.WithValue(ctx, handlerCtxKey{}, hc)
+	return hc
+}
+
+func (r *Runner) handlerCtx(ctx context.Context, kind handlerKind, pos syntax.Pos) context.Context {
+	return context.WithValue(ctx, handlerCtxKey{}, r.makeHandlerCtx(kind, pos))
 }
 
 func (r *Runner) out(s string) {
@@ -343,7 +402,7 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 	// bash keeps PIPESTATUS in sync with the most recent pipeline or command.
 	if bc, ok := st.Cmd.(*syntax.BinaryCmd); !ok ||
 		(bc.Op != syntax.Pipe && bc.Op != syntax.PipeAll) {
-		r.setPipeStatus(int(r.exit.code))
+		r.setPipeStatusSingle(int(r.exit.code))
 	}
 }
 
@@ -436,11 +495,37 @@ func QueueActiveSignalByName(name string) (handled, hasActive bool) {
 	return r.QueueSignalByName(name), true
 }
 
+// setPipeStatusSingle updates PIPESTATUS for a non-pipeline command without
+// map allocations when PIPESTATUS has not been explicitly bound in writeEnv.
+func (r *Runner) setPipeStatusSingle(code int) {
+	if !r.pipeStatusInEnv && !r.opts[optAllExport] {
+		r.pipeStatusInline[0] = code
+		r.pipeStatus = r.pipeStatusInline[:1]
+		r.pipeStatusDirty = true
+		return
+	}
+	r.setPipeStatusSlow(code)
+}
+
 // setPipeStatus updates the PIPESTATUS array, like bash.
 func (r *Runner) setPipeStatus(codes ...int) {
+	if !r.pipeStatusInEnv && !r.opts[optAllExport] {
+		if len(codes) <= len(r.pipeStatusInline) {
+			copy(r.pipeStatusInline[:], codes)
+			r.pipeStatus = r.pipeStatusInline[:len(codes)]
+		} else {
+			r.pipeStatus = slices.Clone(codes)
+		}
+		r.pipeStatusDirty = true
+		return
+	}
+	r.setPipeStatusSlow(codes...)
+}
+
+func (r *Runner) setPipeStatusSlow(codes ...int) {
 	list := make([]string, len(codes))
 	for i, code := range codes {
-		list[i] = strconv.Itoa(code)
+		list[i] = expand.FormatIntFast(code)
 	}
 	r.setVar("PIPESTATUS", expand.Variable{Set: true, Kind: expand.Indexed, List: list})
 }
@@ -531,11 +616,13 @@ func (r *Runner) setSigTrap(sig os.Signal, name, callback string, ignore, reset 
 				signal.Notify(r.sigCh, s)
 			}
 		}
+		r.hasIgnoredSigs.Store(len(r.sigIgnored) > 0)
 		return
 	}
 	newCh := false
 	if r.sigCh == nil {
 		r.sigCh = make(chan os.Signal, 8)
+		r.hasActiveSigCh.Store(true)
 		activeSigChans.Add(1)
 		newCh = true
 	}
@@ -557,6 +644,7 @@ func (r *Runner) setSigTrap(sig os.Signal, name, callback string, ignore, reset 
 		delete(r.sigIgnored, sig)
 		r.sigCallbacks[sig] = callback
 	}
+	r.hasIgnoredSigs.Store(len(r.sigIgnored) > 0)
 	if !wasWatched {
 		signal.Notify(r.sigCh, sig)
 	}
@@ -571,10 +659,14 @@ func ActiveSignalChannels() int {
 }
 
 func (r *Runner) resetSignals() {
+	if !r.hasActiveSigCh.Load() {
+		return
+	}
 	r.sigMu.Lock()
 	if r.sigCh != nil {
 		signal.Stop(r.sigCh)
 		r.sigCh = nil
+		r.hasActiveSigCh.Store(false)
 		activeSigChans.Add(-1)
 	}
 	r.sigMu.Unlock()
@@ -621,7 +713,7 @@ func (r *Runner) QueueSignal(sig os.Signal) bool {
 
 // deliverSignals runs pending signal traps between commands.
 func (r *Runner) deliverSignals(ctx context.Context) {
-	if r.handlingTrap {
+	if r.handlingTrap || !r.hasActiveSigCh.Load() {
 		return
 	}
 	r.sigMu.Lock()
@@ -711,11 +803,16 @@ func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
 	oldIn, oldOut, oldErr := r.stdin, r.stdout, r.stderr
 	var oldExtraFds map[int]io.Writer
 	var oldExtraInFds map[int]io.Reader
-	var closers []io.Closer
+	var closersBuf [4]io.Closer
+	closers := closersBuf[:0]
 	if len(st.Redirs) > 0 {
 		r.reportBgStart(0) // opening a file may block
-		oldExtraFds = maps.Clone(r.extraFds)
-		oldExtraInFds = maps.Clone(r.extraInFds)
+		if len(r.extraFds) > 0 {
+			oldExtraFds = maps.Clone(r.extraFds)
+		}
+		if len(r.extraInFds) > 0 {
+			oldExtraInFds = maps.Clone(r.extraInFds)
+		}
 	}
 	for _, rd := range st.Redirs {
 		cls, err := r.redir(ctx, rd)
@@ -826,8 +923,24 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			i += len(als.args)
 		}
 		r.lastExpandExit = exitStatus{}
-		fields := r.fields(args...)
+		var fields []string
+		usedCallArgsBuf := false
+		if len(args) > 0 {
+			if !r.callArgsInUse && len(args) <= len(r.callArgsBuf) {
+				r.callArgsInUse = true
+				usedCallArgsBuf = true
+				var err error
+				fields, err = expand.FieldsInto(r.callArgsBuf[:0], r.ecfg, args...)
+				r.expandErr(err)
+			} else {
+				fields = r.fields(args...)
+			}
+		}
 		if len(fields) == 0 {
+			if usedCallArgsBuf {
+				clear(r.callArgsBuf[:])
+				r.callArgsInUse = false
+			}
 			for _, as := range cm.Assigns {
 				name := as.Name.Value
 
@@ -892,6 +1005,10 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 		trace.newLineFlush()
 
 		r.call(ctx, cm.Args[0].Pos(), fields)
+		if usedCallArgsBuf {
+			clear(r.callArgsBuf[:])
+			r.callArgsInUse = false
+		}
 		for _, restore := range restores {
 			r.setVar(restore.name, restore.vr)
 		}
@@ -906,7 +1023,16 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 				r.stmt(ctx, cm.Y)
 			}
 		case syntax.Pipe, syntax.PipeAll:
-			pr, pw, err := newPipe()
+			var (
+				pr  stdinFile
+				pw  io.WriteCloser
+				err error
+			)
+			if r.stmtCanUseMemPipe(cm.Y) {
+				pr, pw, err = newPipe()
+			} else {
+				pr, pw, err = newOSPipe()
+			}
 			if err != nil {
 				r.exit.fatal(err) // not being able to create a pipe is rare but critical
 				return
@@ -934,14 +1060,25 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			// `(a | b) | c`. The inner subshell already recorded the
 			// left-hand stages in its own pipeStatusCodes, so append this
 			// stage's status instead of overwriting (bash keeps them all).
-			var codes []int
-			if len(r2.pipeStatusCodes) > 0 {
-				codes = append(append([]int(nil), r2.pipeStatusCodes...), int(r.exit.code))
+			if nLeft := len(r2.pipeStatusCodes); nLeft > 0 {
+				total := nLeft + 1
+				var codes []int
+				if total <= len(r.pipeStatusInline) {
+					copy(r.pipeStatusInline[:], r2.pipeStatusCodes)
+					r.pipeStatusInline[nLeft] = int(r.exit.code)
+					codes = r.pipeStatusInline[:total]
+				} else {
+					codes = make([]int, total)
+					copy(codes, r2.pipeStatusCodes)
+					codes[nLeft] = int(r.exit.code)
+				}
+				r.pipeStatusCodes = codes
 			} else {
-				codes = []int{int(r2.exit.code), int(r.exit.code)}
+				r.pipeStatusInline[0] = int(r2.exit.code)
+				r.pipeStatusInline[1] = int(r.exit.code)
+				r.pipeStatusCodes = r.pipeStatusInline[:2]
 			}
-			r.setPipeStatus(codes...)
-			r.pipeStatusCodes = codes
+			r.setPipeStatus(r.pipeStatusCodes...)
 			if r.opts[optPipeFail] && !r2.exit.ok() && r.exit.ok() {
 				r.exit = r2.exit
 			}
@@ -1391,12 +1528,98 @@ func (r *Runner) stmts(ctx context.Context, stmts []*syntax.Stmt) {
 	}
 }
 
+func (r *Runner) stmtCanUseMemPipe(st *syntax.Stmt) bool {
+	if st == nil || st.Cmd == nil {
+		return true
+	}
+	switch c := st.Cmd.(type) {
+	case *syntax.CallExpr:
+		if len(c.Args) == 0 {
+			return true
+		}
+		lit := c.Args[0].Lit()
+		if lit == "" {
+			return false
+		}
+		if body := r.Funcs[lit]; body != nil {
+			return r.stmtAllInProcess(body, 0)
+		}
+		return true
+	case *syntax.BinaryCmd:
+		if c.Op == syntax.Pipe || c.Op == syntax.PipeAll {
+			return r.stmtCanUseMemPipe(c.X)
+		}
+	}
+	return r.stmtAllInProcess(st, 0)
+}
+
+func (r *Runner) stmtAllInProcess(st *syntax.Stmt, depth int) bool {
+	if st == nil || st.Cmd == nil {
+		return true
+	}
+	if depth > 8 {
+		return false
+	}
+	switch c := st.Cmd.(type) {
+	case *syntax.CallExpr:
+		if len(c.Args) == 0 {
+			return true
+		}
+		lit := c.Args[0].Lit()
+		if lit == "" {
+			return false
+		}
+		if body := r.Funcs[lit]; body != nil {
+			return r.stmtAllInProcess(body, depth+1)
+		}
+		return IsBuiltin(lit) || (r.fastCallFilter != nil && r.fastCallFilter(lit))
+	case *syntax.Block:
+		return r.stmtsAllInProcess(c.Stmts, depth+1)
+	case *syntax.Subshell:
+		return r.stmtsAllInProcess(c.Stmts, depth+1)
+	case *syntax.BinaryCmd:
+		if c.Op == syntax.Pipe || c.Op == syntax.PipeAll {
+			return r.stmtAllInProcess(c.X, depth+1)
+		}
+		return r.stmtAllInProcess(c.X, depth+1) && r.stmtAllInProcess(c.Y, depth+1)
+	case *syntax.IfClause:
+		if !r.stmtsAllInProcess(c.Cond, depth+1) || !r.stmtsAllInProcess(c.Then, depth+1) {
+			return false
+		}
+		if c.Else != nil {
+			return r.stmtAllInProcess(&syntax.Stmt{Cmd: c.Else}, depth+1)
+		}
+		return true
+	case *syntax.WhileClause:
+		return r.stmtsAllInProcess(c.Cond, depth+1) && r.stmtsAllInProcess(c.Do, depth+1)
+	case *syntax.ForClause:
+		return r.stmtsAllInProcess(c.Do, depth+1)
+	case *syntax.ArithmCmd, *syntax.TestClause, *syntax.DeclClause, *syntax.LetClause, *syntax.FuncDecl:
+		return true
+	}
+	return false
+}
+
+func (r *Runner) stmtsAllInProcess(stmts []*syntax.Stmt, depth int) bool {
+	for _, s := range stmts {
+		if !r.stmtAllInProcess(s, depth) {
+			return false
+		}
+	}
+	return true
+}
+
 func (r *Runner) hdocReader(rd *syntax.Redirect) (stdinFile, error) {
 	pr, pw, err := newPipe()
 	if err != nil {
 		return nil, err
 	}
 	hdoc := r.hdocString(rd)
+	if _, isOS := pw.(*os.File); !isOS && len(hdoc) <= 64*1024 {
+		io.WriteString(pw, hdoc)
+		pw.Close()
+		return pr, nil
+	}
 	// We write to the pipe in a new goroutine,
 	// as pipe writes may block once the buffer gets full.
 	// We still construct and buffer the entire heredoc first,
@@ -1541,6 +1764,12 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 			return nil, err
 		}
 		r.stdin = pr
+		if _, isOS := pw.(*os.File); !isOS && len(arg)+1 <= 64*1024 {
+			io.WriteString(pw, arg)
+			io.WriteString(pw, "\n")
+			pw.Close()
+			return pr, nil
+		}
 		// We write to the pipe in a new goroutine,
 		// as pipe writes may block once the buffer gets full.
 		go func() {
@@ -1656,15 +1885,28 @@ func (r *Runner) call(ctx context.Context, pos syntax.Pos, args []string) {
 		return
 	}
 	if r.callHandler != nil {
-		var err error
-		pushActiveRunner(r)
-		args, err = r.callHandler(r.handlerCtx(ctx, handlerKindCall, pos), args)
-		popActiveRunner(r)
-		if err != nil {
-			// Status errors are non-fatal, like bash builtins; custom
-			// errors still halt the shell.
-			r.exit.fromHandlerError(err)
-			return
+		if r.fastCallHandler != nil {
+			if r.fastCallFilter == nil || r.fastCallFilter(args[0]) {
+				var err error
+				args, err = r.fastCallHandler(ctx, r.makeHandlerCtx(handlerKindCall, pos), args)
+				if err != nil {
+					r.reportBgStart(0)
+					r.exit.fromHandlerError(err)
+					return
+				}
+			}
+		} else {
+			var err error
+			pushActiveRunner(r)
+			args, err = r.callHandler(r.handlerCtx(ctx, handlerKindCall, pos), args)
+			popActiveRunner(r)
+			if err != nil {
+				r.reportBgStart(0)
+				// Status errors are non-fatal, like bash builtins; custom
+				// errors still halt the shell.
+				r.exit.fromHandlerError(err)
+				return
+			}
 		}
 	}
 	name := args[0]
@@ -1702,7 +1944,23 @@ func (r *Runner) exec(ctx context.Context, pos syntax.Pos, args []string) {
 	r.exit.fromHandlerError(r.execHandler(r.handlerCtx(ctx, handlerKindExec, pos), args))
 }
 
+func isFastWriteOnlyDevNull(path string, flags int) bool {
+	if flags&(os.O_RDONLY|os.O_WRONLY|os.O_RDWR) != os.O_WRONLY {
+		return false
+	}
+	if path == "/dev/null" || path == os.DevNull {
+		return true
+	}
+	if runtime.GOOS == "windows" && len(path) == 3 && strings.EqualFold(path, "NUL") {
+		return true
+	}
+	return false
+}
+
 func (r *Runner) open(ctx context.Context, path string, flags int, mode os.FileMode, print bool) (io.ReadWriteCloser, error) {
+	if r.fastDevNull != nil && isFastWriteOnlyDevNull(path, flags) {
+		return r.fastDevNull, nil
+	}
 	// The path of an active process substitution is opened by its own
 	// handler; for example, the named pipes created by the default handler
 	// can only be opened directly via [os.OpenFile].
@@ -1739,7 +1997,6 @@ func (r *Runner) access(ctx context.Context, name string, mode AccessMode) error
 	path := absPath(r.Dir, name)
 	return r.accessHandler(r.handlerCtx(ctx, handlerKindAccess, todoPos), path, mode)
 }
-
 
 // arithmEval parses src as an arithmetic expression and evaluates it.
 // Used by declare -i, whose value is an expression rather than a literal.

@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strconv"
 	"strings"
@@ -170,6 +171,100 @@ type HandlerContext struct {
 // Returning a non-nil error will halt the [Runner] and will be returned via the API.
 type CallHandlerFunc func(ctx context.Context, args []string) ([]string, error)
 
+// FastCallHandlerFunc is an allocation-free companion to [CallHandlerFunc] that
+// receives [HandlerContext] on the stack without boxing into [context.WithValue].
+// When needActiveRunner is handled selectively by the caller via
+// [HandlerContext.RunWithActiveRunner], non-signal builtins avoid global mutex
+// contention as well.
+type FastCallHandlerFunc func(ctx context.Context, hc HandlerContext, args []string) ([]string, error)
+
+type registeredFastCall struct {
+	ptr    uintptr
+	filter func(name string) bool
+	fast   FastCallHandlerFunc
+}
+
+var (
+	fastCallMu   sync.RWMutex
+	fastCallList []registeredFastCall
+
+	fastOpenMu   sync.RWMutex
+	fastOpenNull = map[uintptr]io.ReadWriteCloser{}
+)
+
+// RegisterFastCallHandler associates a [CallHandlerFunc] with a command-name
+// filter and stack-allocated [FastCallHandlerFunc] fast path. Any Runner
+// configured via CallHandler(orig) automatically uses the fast path.
+func RegisterFastCallHandler(orig CallHandlerFunc, filter func(name string) bool, fast FastCallHandlerFunc) {
+	if orig == nil || fast == nil {
+		return
+	}
+	p := reflect.ValueOf(orig).Pointer()
+	fastCallMu.Lock()
+	fastCallList = append(fastCallList, registeredFastCall{ptr: p, filter: filter, fast: fast})
+	fastCallMu.Unlock()
+}
+
+func lookupFastCallHandler(fn CallHandlerFunc) (func(string) bool, FastCallHandlerFunc) {
+	if fn == nil {
+		return nil, nil
+	}
+	p := reflect.ValueOf(fn).Pointer()
+	fastCallMu.RLock()
+	defer fastCallMu.RUnlock()
+	for i := len(fastCallList) - 1; i >= 0; i-- {
+		if fastCallList[i].ptr == p {
+			return fastCallList[i].filter, fastCallList[i].fast
+		}
+	}
+	return nil, nil
+}
+
+// RegisterFastOpenDevNull associates an [OpenHandlerFunc] with a stateless
+// write-only /dev/null handle so Runner.open bypasses HandlerContext allocation
+// and kernel open/close syscalls on `> /dev/null` and `>> /dev/null`.
+func RegisterFastOpenDevNull(orig OpenHandlerFunc, devNull io.ReadWriteCloser) {
+	if orig == nil || devNull == nil {
+		return
+	}
+	p := reflect.ValueOf(orig).Pointer()
+	fastOpenMu.Lock()
+	fastOpenNull[p] = devNull
+	fastOpenMu.Unlock()
+}
+
+func lookupFastOpenDevNull(fn OpenHandlerFunc) io.ReadWriteCloser {
+	if fn == nil {
+		return nil
+	}
+	p := reflect.ValueOf(fn).Pointer()
+	fastOpenMu.RLock()
+	dn := fastOpenNull[p]
+	fastOpenMu.RUnlock()
+	return dn
+}
+
+// WithHandlerContext attaches hc to ctx for cold paths inside a
+// [FastCallHandlerFunc] whose callees call [HandlerCtx](ctx).
+func WithHandlerContext(ctx context.Context, hc HandlerContext) context.Context {
+	return context.WithValue(ctx, handlerCtxKey{}, hc)
+}
+
+// PushActive marks this context's Runner as active for self-targeted signals
+// (such as `kill -TERM $$` inside a CallHandler). Pair with [HandlerContext.PopActive].
+func (hc HandlerContext) PushActive() {
+	if hc.runner != nil {
+		pushActiveRunner(hc.runner)
+	}
+}
+
+// PopActive unmarks this context's Runner after [HandlerContext.PushActive].
+func (hc HandlerContext) PopActive() {
+	if hc.runner != nil {
+		popActiveRunner(hc.runner)
+	}
+}
+
 // TODO(v4): consistently treat handler errors as non-fatal by default,
 // now that [Fatal] exists to exit the shell with a particular status code.
 
@@ -211,7 +306,7 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 			fmt.Fprintln(hc.Stderr, err)
 			return ExitStatus(127)
 		}
-		newCmd := func() *exec.Cmd {
+		newCmd := func() (*exec.Cmd, func(), func()) {
 			cmd := exec.CommandContext(ctx, path)
 			cmd.Args = args
 			cmd.Env = execEnv(hc.Env)
@@ -219,6 +314,7 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 			cmd.Stdin = hc.Stdin
 			cmd.Stdout = hc.Stdout
 			cmd.Stderr = hc.Stderr
+			afterStart, afterWait := PrepareExecStdio(cmd)
 			if killTimeout > 0 && runtime.GOOS != "windows" {
 				// On cancellation, send an interrupt signal first, and let
 				// WaitDelay escalate to a kill signal if the process does not
@@ -226,9 +322,9 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 				cmd.Cancel = func() error { return cmd.Process.Signal(os.Interrupt) }
 				cmd.WaitDelay = killTimeout
 			}
-			return cmd
+			return cmd, afterStart, afterWait
 		}
-		cmd := newCmd()
+		cmd, afterStart, afterWait := newCmd()
 		err = cmd.Start()
 		// On Unix, a concurrently forked process may briefly hold a write
 		// file descriptor for the file inherited before its exec, making
@@ -236,9 +332,13 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 		// The window is short-lived, so retry with backoff. A failed Start
 		// closes the command's pipes, so build a fresh one for each attempt.
 		for delay := time.Millisecond; isETXTBSY(err) && delay < 300*time.Millisecond; delay *= 2 {
+			afterWait()
 			time.Sleep(delay)
-			cmd = newCmd()
+			cmd, afterStart, afterWait = newCmd()
 			err = cmd.Start()
+		}
+		if err != nil {
+			afterWait()
 		}
 		if isENOEXEC(err) {
 			// Like other shells, run a file which the kernel refuses to
@@ -248,8 +348,10 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 			return runScriptENOEXEC(ctx, hc, killTimeout, path, args)
 		}
 		if err == nil {
+			afterStart()
 			hc.runner.reportBgStart(cmd.Process.Pid)
 			err = cmd.Wait()
+			afterWait()
 		}
 
 		switch err := err.(type) {
@@ -271,7 +373,7 @@ func DefaultExecHandler(killTimeout time.Duration) ExecHandlerFunc {
 		default:
 			// The command exited with success, but WaitDelay elapsed with its
 			// I/O pipes still open, e.g. due to an orphaned subprocess.
-			if errors.Is(err, exec.ErrWaitDelay) {
+			if errors.Is(err, exec.ErrWaitDelay) || errors.Is(err, io.ErrClosedPipe) {
 				return nil
 			}
 			return err

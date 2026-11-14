@@ -19,17 +19,66 @@ package main
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
 	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 
+	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 )
 
 // reHexFloatExp normalizes hex-float exponents (p+00 -> p+0).
 var reHexFloatExp = regexp.MustCompile(`(?P<p>[pP])(?P<sign>[+-])0+(?P<exp>[0-9]+)`)
+
+func parseFastPrintfDecimal(s string) (int64, bool) {
+	if len(s) == 0 {
+		return 0, false
+	}
+	i := 0
+	neg := false
+	if s[0] == '+' || s[0] == '-' {
+		neg = s[0] == '-'
+		i = 1
+		if len(s) == 1 {
+			return 0, false
+		}
+	}
+	rem := s[i:]
+	if rem == "0" {
+		return 0, true
+	}
+	if rem[0] < '1' || rem[0] > '9' || len(rem) > 18 {
+		return 0, false
+	}
+	var n int64
+	for j := 0; j < len(rem); j++ {
+		c := rem[j]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, true
+}
+
+func writeFastPrintfInt(w io.Writer, n int64, newline bool) {
+	var s string
+	if n >= 0 && n < 16384 {
+		s = expand.FormatIntFast(int(n))
+	} else {
+		s = strconv.FormatInt(n, 10)
+	}
+	_, _ = io.WriteString(w, s)
+	if newline {
+		_, _ = io.WriteString(w, "\n")
+	}
+}
 
 // cmdPrintf implements `printf FORMAT [ARGS...]`.
 func cmdPrintf(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -37,14 +86,64 @@ func cmdPrintf(_ context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintln(hc.Stderr, "printf: missing operand")
 		return exitError{2}
 	}
-	if args[1] == "--" {
-		args = append(args[:1], args[2:]...)
-		if len(args) < 2 {
+	rest := args[1:]
+	if rest[0] == "--" {
+		rest = rest[1:]
+		if len(rest) == 0 {
 			fmt.Fprintln(hc.Stderr, "printf: missing operand")
 			return exitError{2}
 		}
 	}
-	format, operands := args[1], args[2:]
+	format, operands := rest[0], rest[1:]
+	switch format {
+	case "%s":
+		for _, op := range operands {
+			if op != "" {
+				_, _ = io.WriteString(hc.Stdout, op)
+			}
+		}
+		return nil
+	case "%s\\n", "%s\n":
+		if len(operands) == 0 {
+			_, _ = io.WriteString(hc.Stdout, "\n")
+			return nil
+		}
+		for _, op := range operands {
+			if op != "" {
+				_, _ = io.WriteString(hc.Stdout, op)
+			}
+			_, _ = io.WriteString(hc.Stdout, "\n")
+		}
+		return nil
+	case "%d", "%d\\n", "%d\n":
+		nl := len(format) > 2
+		if len(operands) == 0 {
+			if nl {
+				_, _ = io.WriteString(hc.Stdout, "0\n")
+			} else {
+				_, _ = io.WriteString(hc.Stdout, "0")
+			}
+			return nil
+		}
+		if len(operands) <= 8 {
+			var vals [8]int64
+			allOK := true
+			for i, op := range operands {
+				v, ok := parseFastPrintfDecimal(op)
+				if !ok {
+					allOK = false
+					break
+				}
+				vals[i] = v
+			}
+			if allOK {
+				for i := 0; i < len(operands); i++ {
+					writeFastPrintfInt(hc.Stdout, vals[i], nl)
+				}
+				return nil
+			}
+		}
+	}
 	tmpl := cachedPrintfTemplate(format)
 	if tmpl.err != nil {
 		fmt.Fprintf(hc.Stderr, "printf: %v\n", tmpl.err)
@@ -342,6 +441,8 @@ func printfIntArg(arg string) (int64, string) {
 		i++
 	}
 	base := 10
+	var val int64
+	digits := 0
 	if i < len(s) && s[i] == '0' {
 		if i+2 < len(s) && (s[i+1] == 'x' || s[i+1] == 'X') && printfIsHex(s[i+2]) {
 			base = 16
@@ -349,10 +450,9 @@ func printfIntArg(arg string) (int64, string) {
 		} else {
 			base = 8
 			i++
+			digits = 1
 		}
 	}
-	var val int64
-	digits := 0
 	const maxI = int64(^uint64(0) >> 1)
 	clamped := false
 	for i < len(s) {

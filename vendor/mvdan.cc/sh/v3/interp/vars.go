@@ -15,11 +15,18 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/internal"
 	"mvdan.cc/sh/v3/syntax"
 )
+
+var overlayEnvPool = sync.Pool{
+	New: func() any {
+		return &overlayEnviron{}
+	},
+}
 
 func newOverlayEnviron(parent expand.Environ, background bool) *overlayEnviron {
 	oenv := &overlayEnviron{}
@@ -37,16 +44,8 @@ func newOverlayEnviron(parent expand.Environ, background bool) *overlayEnviron {
 
 // overlayEnviron is our main implementation of [expand.WriteEnviron].
 type overlayEnviron struct {
-	// parent is non-nil if [values] is an overlay over a parent environment
-	// which we can safely reuse without data races, such as non-background subshells
-	// or function calls.
-	parent expand.Environ
-
-	// values maps normalized variable names, per [overlayEnviron.normalize].
-	values map[string]namedVariable
-
-	// We need to know if the current scope is a function's scope, because
-	// functions can modify global variables. When true, [parent] must not be nil.
+	parent    expand.Environ
+	values    map[string]namedVariable
 	funcScope bool
 }
 
@@ -60,11 +59,56 @@ type namedVariable struct {
 	// and know what was its original name without looping over Environ.Each.
 	// The field should be output-only: reported by Get and Each,
 	// and ignored by Set, whose name parameter remains the source of truth.
-	Name string
+	Name    string
+	normKey string
 	expand.Variable
 }
 
-func (o *overlayEnviron) normalize(name string) string {
+func scanWinVarName(name string) (hasLower, nonASCII bool) {
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		if c >= 0x80 {
+			return false, true
+		}
+		if c >= 'a' && c <= 'z' {
+			hasLower = true
+		}
+	}
+	return hasLower, false
+}
+
+func (o *overlayEnviron) lookupEntry(name string) (namedVariable, bool, string, bool) {
+	if runtime.GOOS != "windows" {
+		vr, ok := o.values[name]
+		return vr, ok, name, true
+	}
+	hasLower, nonASCII := scanWinVarName(name)
+	if !hasLower && !nonASCII {
+		vr, ok := o.values[name]
+		return vr, ok, name, true
+	}
+	if !nonASCII && len(name) <= 64 {
+		var buf [64]byte
+		for i := 0; i < len(name); i++ {
+			c := name[i]
+			if c >= 'a' && c <= 'z' {
+				c -= 'a' - 'A'
+			}
+			buf[i] = c
+		}
+		if o.values != nil {
+			if vr, ok := o.values[string(buf[:len(name)])]; ok {
+				return vr, true, vr.normKey, true
+			}
+		}
+		return namedVariable{}, false, "", false
+	}
+	norm := strings.ToUpper(name)
+	vr, ok := o.values[norm]
+	return vr, ok, norm, true
+}
+
+func (o *overlayEnviron) normalizeAlloc(name string) string {
 	if runtime.GOOS == "windows" {
 		return strings.ToUpper(name)
 	}
@@ -72,9 +116,10 @@ func (o *overlayEnviron) normalize(name string) string {
 }
 
 func (o *overlayEnviron) Get(name string) expand.Variable {
-	normalized := o.normalize(name)
-	if vr, ok := o.values[normalized]; ok {
-		return vr.Variable
+	if o.values != nil {
+		if vr, ok, _, _ := o.lookupEntry(name); ok {
+			return vr.Variable
+		}
 	}
 	if o.parent != nil {
 		return o.parent.Get(name)
@@ -83,8 +128,7 @@ func (o *overlayEnviron) Get(name string) expand.Variable {
 }
 
 func (o *overlayEnviron) Set(name string, vr expand.Variable) error {
-	normalized := o.normalize(name)
-	prev, inOverlay := o.values[normalized]
+	prev, inOverlay, normalized, haveNorm := o.lookupEntry(name)
 	// Manipulation of a global var inside a function.
 	if o.funcScope && !vr.Local && !prev.Local {
 		// In a function, the parent environment is ours, so it's always read-write.
@@ -108,15 +152,24 @@ func (o *overlayEnviron) Set(name string, vr expand.Variable) error {
 	}
 	if !vr.IsSet() { // unsetting
 		if prev.Local {
+			if !haveNorm {
+				normalized = o.normalizeAlloc(name)
+			}
 			vr.Local = true
-			o.values[normalized] = namedVariable{name, vr}
+			o.values[normalized] = namedVariable{Name: name, normKey: normalized, Variable: vr}
 			return nil
 		}
-		delete(o.values, normalized)
+		if inOverlay {
+			delete(o.values, normalized)
+		}
+		return nil
+	}
+	if !haveNorm {
+		normalized = o.normalizeAlloc(name)
 	}
 	// modifying the entire variable
 	vr.Local = prev.Local || vr.Local
-	o.values[normalized] = namedVariable{name, vr}
+	o.values[normalized] = namedVariable{Name: name, normKey: normalized, Variable: vr}
 	return nil
 }
 
@@ -153,6 +206,21 @@ func execEnv(env expand.Environ) []string {
 	return list
 }
 
+func isPipeStatusVar(name string) bool {
+	if name == "PIPESTATUS" {
+		return true
+	}
+	return runtime.GOOS == "windows" && len(name) == 10 && strings.EqualFold(name, "PIPESTATUS")
+}
+
+func (r *Runner) materializePipeStatus() expand.Variable {
+	list := make([]string, len(r.pipeStatus))
+	for i, code := range r.pipeStatus {
+		list[i] = expand.FormatIntFast(code)
+	}
+	return expand.Variable{Set: true, Kind: expand.Indexed, List: list}
+}
+
 func (r *Runner) lookupVar(name string) expand.Variable {
 	if name == "" {
 		panic("variable name must not be empty")
@@ -160,7 +228,7 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 	var vr expand.Variable
 	switch name {
 	case "#":
-		vr.Kind, vr.Str = expand.String, strconv.Itoa(len(r.Params))
+		vr.Kind, vr.Str = expand.String, expand.FormatIntFast(len(r.Params))
 	case "@", "*":
 		vr.Kind = expand.Indexed
 		if r.Params == nil {
@@ -174,7 +242,7 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 			vr.Kind, vr.Str = expand.String, r.bgProcID(n-1)
 		}
 	case "?":
-		vr.Kind, vr.Str = expand.String, strconv.Itoa(int(r.lastExit.code))
+		vr.Kind, vr.Str = expand.String, expand.FormatIntFast(int(r.lastExit.code))
 	case "-":
 		// Note that we don't support some of Bash's flags, such as h or B.
 		vr.Kind, vr.Str = expand.String, r.posixOptFlags()
@@ -192,7 +260,7 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 		} else {
 			n = mathrand.IntN(randomMax)
 		}
-		vr.Kind, vr.Str = expand.String, strconv.Itoa(n)
+		vr.Kind, vr.Str = expand.String, expand.FormatIntFast(n)
 	case "SRANDOM": // pseudo-random generator from the system
 		var p [4]byte
 		cryptorand.Read(p[:])
@@ -200,6 +268,10 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 		vr.Kind, vr.Str = expand.String, strconv.FormatUint(uint64(n), 10)
 	case "DIRSTACK":
 		vr.Kind, vr.List = expand.Indexed, r.dirStack
+	case "PIPESTATUS":
+		if !r.pipeStatusInEnv && r.pipeStatusDirty {
+			return r.materializePipeStatus()
+		}
 	case "0":
 		vr.Kind = expand.String
 		if r.filename != "" {
@@ -217,6 +289,9 @@ func (r *Runner) lookupVar(name string) expand.Variable {
 		vr.Set = true
 		return vr
 	}
+	if runtime.GOOS == "windows" && !r.pipeStatusInEnv && r.pipeStatusDirty && len(name) == 10 && strings.EqualFold(name, "PIPESTATUS") {
+		return r.materializePipeStatus()
+	}
 	if vr := r.writeEnv.Get(name); vr.Declared() {
 		return vr
 	}
@@ -228,6 +303,10 @@ func (r *Runner) envGet(name string) string {
 }
 
 func (r *Runner) delVar(name string) {
+	if isPipeStatusVar(name) {
+		r.pipeStatusInEnv = true
+		r.pipeStatusDirty = false
+	}
 	if err := r.writeEnv.Set(name, expand.Variable{}); err != nil {
 		r.errf("%s: %v\n", name, err)
 		r.exit.code = 1
@@ -255,6 +334,10 @@ const randomMax = 32768
 // setVarErr is like [Runner.setVar], but it returns any error rather than
 // reporting it, for the sake of the expand package.
 func (r *Runner) setVarErr(name string, vr expand.Variable) error {
+	if isPipeStatusVar(name) {
+		r.pipeStatusInEnv = true
+		r.pipeStatusDirty = false
+	}
 	if r.opts[optAllExport] {
 		vr.Exported = true
 	}

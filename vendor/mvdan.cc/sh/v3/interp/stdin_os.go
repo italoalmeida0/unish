@@ -8,40 +8,56 @@ package interp
 import (
 	"io"
 	"os"
+	"time"
 
 	"golang.org/x/term"
 )
 
-// stdinFile is the runner's standard input. Outside of js/wasm it is
-// always an [*os.File]: the only type that subprocesses can inherit,
-// and one supporting cancellable reads via [os.File.SetReadDeadline].
-type stdinFile = *os.File
+// stdinFile is the runner's standard input. It may be an [*os.File] or an
+// in-memory pipe/reader supporting cancellable reads via SetReadDeadline.
+type stdinFile = StdinPipe
 
-// newPipe returns an OS pipe; both ends are [*os.File] so they can
-// be inherited by subprocesses.
-func newPipe() (stdinFile, *os.File, error) {
+// readerStdin adapts a plain [io.Reader] into a [stdinFile] without allocating
+// an OS pipe or spawning a background copier goroutine.
+type readerStdin struct {
+	io.Reader
+}
+
+func (r readerStdin) Close() error {
+	if c, ok := r.Reader.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
+}
+
+func (readerStdin) SetReadDeadline(t time.Time) error { return nil }
+
+// newPipe returns a pipe for shell pipelines and here-documents, using the
+// registered pooled in-memory pipe factory when available.
+func newPipe() (stdinFile, io.WriteCloser, error) {
+	if fn := customPipeFactory.Load(); fn != nil {
+		return (*fn)()
+	}
 	return os.Pipe()
 }
 
-// newStdinFile converts a reader into the runner's stdin. Readers
-// other than [*os.File] require an [os.Pipe] and a copying goroutine,
-// as an [os.File] is the only way to share a reader with subprocesses.
+// newOSPipe returns a kernel OS pipe for cases where multiple sequential
+// subprocesses in a compound pipeline stage must share a seek/read offset.
+func newOSPipe() (stdinFile, io.WriteCloser, error) {
+	return os.Pipe()
+}
+
+// newStdinFile converts a reader into the runner's stdin. [*os.File] and
+// [StdinPipe] values are preserved directly so subprocesses inherit real OS
+// files without copying when redirected from disk.
 func newStdinFile(r io.Reader) (stdinFile, error) {
 	switch r := r.(type) {
-	case *os.File:
-		return r, nil
 	case nil:
 		return nil, nil
+	case stdinFile:
+		return r, nil
 	default:
-		pr, pw, err := os.Pipe()
-		if err != nil {
-			return nil, err
-		}
-		go func() {
-			io.Copy(pw, r)
-			pw.Close()
-		}()
-		return pr, nil
+		return readerStdin{r}, nil
 	}
 }
 
@@ -51,13 +67,14 @@ func newStdinFile(r io.Reader) (stdinFile, error) {
 // as it stops [os.File.SetReadDeadline] from working,
 // which [Runner.readLine] needs to cancel blocking reads.
 func stdinTerminal(stdin stdinFile) (int, bool) {
-	if stdin == nil {
+	f, ok := stdin.(*os.File)
+	if !ok || f == nil {
 		return -1, false
 	}
-	fi, err := stdin.Stat()
+	fi, err := f.Stat()
 	if err != nil || fi.Mode()&os.ModeCharDevice == 0 {
 		return -1, false
 	}
-	fd := int(stdin.Fd())
+	fd := int(f.Fd())
 	return fd, term.IsTerminal(fd)
 }

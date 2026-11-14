@@ -9,7 +9,45 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 )
+
+const smallIntLimit = 16384
+
+var (
+	smallIntOnce sync.Once
+	smallIntBlob string
+	smallIntIdx  [smallIntLimit]uint32
+)
+
+func initSmallInts() {
+	// Sum of digit lengths for 100..16383: 900*3 + 9000*4 + 6384*5 = 70620 bytes.
+	buf := make([]byte, 0, 70624)
+	var tmp [8]byte
+	for i := 100; i < smallIntLimit; i++ {
+		off := len(buf)
+		b := strconv.AppendInt(tmp[:0], int64(i), 10)
+		buf = append(buf, b...)
+		smallIntIdx[i] = uint32(off<<5) | uint32(len(b))
+	}
+	smallIntBlob = string(buf)
+}
+
+// FormatIntFast converts n to base-10 string with zero heap allocations for
+// 0 <= n < 16384 (covering hot shell loop counters).
+func FormatIntFast(n int) string {
+	if n >= 0 && n < 100 {
+		return strconv.Itoa(n)
+	}
+	if n >= 100 && n < smallIntLimit {
+		smallIntOnce.Do(initSmallInts)
+		entry := smallIntIdx[n]
+		off := entry >> 5
+		ln := entry & 31
+		return smallIntBlob[off : off+ln]
+	}
+	return strconv.Itoa(n)
+}
 
 // Environ is the base interface for a shell's environment, allowing it to fetch
 // variables by name and to iterate over all the currently set variables.
@@ -288,12 +326,34 @@ type listEnviron struct {
 
 func (l listEnviron) compare(a, b string) int {
 	if l.caseInsensitive {
-		// This is not particularly efficient, but it does the job.
-		// If we had a cmp-compatible version of [strings.EqualFold], we'd use it.
-		a = strings.ToUpper(a)
-		b = strings.ToUpper(b)
+		return compareFoldUpper(a, b)
 	}
 	return strings.Compare(a, b)
+}
+
+// compareFoldUpper computes strings.Compare(strings.ToUpper(a), strings.ToUpper(b))
+// without allocating for ASCII names.
+func compareFoldUpper(a, b string) int {
+	n := min(len(a), len(b))
+	for i := 0; i < n; i++ {
+		ca, cb := a[i], b[i]
+		if ca >= 0x80 || cb >= 0x80 {
+			return strings.Compare(strings.ToUpper(a[i:]), strings.ToUpper(b[i:]))
+		}
+		if ca >= 'a' && ca <= 'z' {
+			ca -= 'a' - 'A'
+		}
+		if cb >= 'a' && cb <= 'z' {
+			cb -= 'a' - 'A'
+		}
+		if ca != cb {
+			if ca < cb {
+				return -1
+			}
+			return 1
+		}
+	}
+	return cmp.Compare(len(a), len(b))
 }
 
 func (l listEnviron) Get(name string) Variable {

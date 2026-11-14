@@ -18,10 +18,7 @@ import (
 
 // stdinFile is the runner's standard input; elsewhere it is an
 // [*os.File], but on js/wasm any reader satisfying this interface works.
-type stdinFile interface {
-	io.ReadCloser
-	SetReadDeadline(t time.Time) error
-}
+type stdinFile = StdinPipe
 
 // jsReader adapts a plain reader into a stdinFile.
 type jsReader struct {
@@ -38,9 +35,16 @@ func (r jsReader) Close() error {
 func (jsReader) SetReadDeadline(t time.Time) error { return nil }
 
 // newPipe returns an in-process pipe.
-func newPipe() (stdinFile, *io.PipeWriter, error) {
+func newPipe() (stdinFile, io.WriteCloser, error) {
+	if fn := customPipeFactory.Load(); fn != nil {
+		return (*fn)()
+	}
 	pr, pw := io.Pipe()
 	return jsReader{pr}, pw, nil
+}
+
+func newOSPipe() (stdinFile, io.WriteCloser, error) {
+	return newPipe()
 }
 
 // newStdinFile converts a reader into the runner's stdin. Without

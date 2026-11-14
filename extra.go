@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/term"
@@ -33,8 +34,50 @@ type extraCmd struct {
 
 var extraCommands []extraCmd
 
+type extraRegistry struct {
+	n      int
+	data   *extraCmd
+	byName map[string]*extraCmd
+}
+
+var (
+	extraRegistryMu  sync.Mutex
+	extraRegistryPtr atomic.Pointer[extraRegistry]
+)
+
+func rebuildExtraRegistryLocked() {
+	n := len(extraCommands)
+	var data *extraCmd
+	if n > 0 {
+		data = &extraCommands[0]
+	}
+	m := make(map[string]*extraCmd, n)
+	for i := range extraCommands {
+		m[extraCommands[i].name] = &extraCommands[i]
+	}
+	extraRegistryPtr.Store(&extraRegistry{
+		n:      n,
+		data:   data,
+		byName: m,
+	})
+}
+
+func registerExtra(name string, fn func(ctx context.Context, hc interp.HandlerContext, args []string) error) {
+	extraRegistryMu.Lock()
+	defer extraRegistryMu.Unlock()
+	for i := range extraCommands {
+		if extraCommands[i].name == name {
+			extraCommands[i].main = fn
+			rebuildExtraRegistryLocked()
+			return
+		}
+	}
+	extraCommands = append(extraCommands, extraCmd{name: name, main: fn})
+	rebuildExtraRegistryLocked()
+}
+
 func init() {
-	extraCommands = []extraCmd{
+	base := []extraCmd{
 		{"cat", cmdCat},
 		{"ls", cmdLs},
 		{"grep", cmdGrep},
@@ -82,15 +125,43 @@ func init() {
 		{"mktemp", cmdMktemp},
 		{"find", cmdFind},
 	}
+	extraRegistryMu.Lock()
+	if len(extraCommands) == 0 {
+		extraCommands = make([]extraCmd, len(base), len(base)+48)
+		copy(extraCommands, base)
+	} else {
+		extraCommands = append(base, extraCommands...)
+	}
+	rebuildExtraRegistryLocked()
+	extraRegistryMu.Unlock()
+
+	interp.RegisterFastCallHandler(callOverride, isOverriddenCall, fastCallOverride)
+	interp.RegisterFastOpenDevNull(shellOpenHandlerFn, sharedDevNull)
 }
 
 func lookupExtra(name string) *extraCmd {
-	for i := range extraCommands {
-		if extraCommands[i].name == name {
-			return &extraCommands[i]
-		}
+	n := len(extraCommands)
+	if n == 0 {
+		return nil
 	}
-	return nil
+	data := &extraCommands[0]
+	if reg := extraRegistryPtr.Load(); reg != nil && reg.n == n && reg.data == data {
+		return reg.byName[name]
+	}
+	extraRegistryMu.Lock()
+	n = len(extraCommands)
+	if n == 0 {
+		extraRegistryMu.Unlock()
+		return nil
+	}
+	data = &extraCommands[0]
+	reg := extraRegistryPtr.Load()
+	if reg == nil || reg.n != n || reg.data != data {
+		rebuildExtraRegistryLocked()
+		reg = extraRegistryPtr.Load()
+	}
+	extraRegistryMu.Unlock()
+	return reg.byName[name]
 }
 
 func invokeExtra(ctx context.Context, hc interp.HandlerContext, cmd *extraCmd, args []string) error {
@@ -191,7 +262,7 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	}
 	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
 	if err != nil {
-			return nil, false
+		return nil, false
 	}
 	cmd := exec.CommandContext(ctx, path, args[1:]...)
 	cmd.Dir = hc.Dir
@@ -200,9 +271,13 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	cmd.Stderr = hc.Stderr
 	// Exported shell variables, like the default handler.
 	cmd.Env = shellExecEnv(hc)
+	afterStart, afterWait := interp.PrepareExecStdio(cmd)
 	if err := cmd.Start(); err != nil {
+		afterWait()
 		return nil, false
 	}
+	afterStart()
+	defer afterWait()
 	// Tell the parent shell the real pid so $! expands to it (and kill/wait
 	// on $! work). Must happen before any blocking work, per the mvdan
 	// contract for reportBgStart.
@@ -213,6 +288,9 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	// whole handler in a goroutine already, so no extra work needed.
 	<-j.done
 	if j.err != nil {
+		if isPipeClosed(j.err) {
+			return nil, true
+		}
 		if ee, ok := j.err.(*exec.ExitError); ok {
 			return interp.NewExitStatus(uint8(ee.ExitCode())), true
 		}
@@ -281,6 +359,19 @@ func hasVersionFlag(args []string) bool {
 	if len(args) < 2 {
 		return false
 	}
+	hasCandidate := false
+	for i := 1; i < len(args); i++ {
+		if args[i] == "--" {
+			return false
+		}
+		if args[i] == "--version" {
+			hasCandidate = true
+			break
+		}
+	}
+	if !hasCandidate {
+		return false
+	}
 	cmd := args[0]
 	switch cmd {
 	case "echo", "true", "false":
@@ -303,7 +394,7 @@ func hasVersionFlag(args []string) bool {
 		if strings.HasPrefix(a, "--") && len(a) > 2 {
 			if strings.IndexByte(a, '=') < 0 && hasSpec {
 				if short, known := spec.long[a[2:]]; known {
-					if (len(short) == 1 && strings.ContainsRune(spec.values, rune(short[0]))) ||
+					if (len(short) == 1 && strings.IndexByte(spec.values, short[0]) >= 0) ||
 						(len(short) > 1 && !spec.longBools[short]) {
 						i++
 					}
@@ -313,15 +404,15 @@ func hasVersionFlag(args []string) bool {
 		}
 		if len(a) >= 2 && a[0] == '-' && a[1] != '-' {
 			if hasSpec {
-				if len(a) == 2 && strings.ContainsRune(spec.values, rune(a[1])) {
+				if len(a) == 2 && strings.IndexByte(spec.values, a[1]) >= 0 {
 					i++
 				} else if len(a) > 2 {
 					for j := 1; j < len(a); j++ {
-						c := rune(a[j])
-						if strings.ContainsRune(spec.bools, c) {
+						c := a[j]
+						if strings.IndexByte(spec.bools, c) >= 0 {
 							continue
 						}
-						if strings.ContainsRune(spec.values, c) && j == len(a)-1 {
+						if strings.IndexByte(spec.values, c) >= 0 && j == len(a)-1 {
 							i++
 						}
 						break
@@ -362,107 +453,116 @@ func filterLsArgs(args []string) []string {
 	return out
 }
 
-func callOverride(ctx context.Context, args []string) ([]string, error) {
+func isOverriddenCall(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	switch name[0] {
+	case '[':
+		return name == "["
+	case 't':
+		return name == "test" || name == "type"
+	case 'p':
+		return name == "printf"
+	case 'u':
+		return name == "umask" || name == "ulimit"
+	case 'k':
+		return name == "kill"
+	case 'h':
+		return name == "hash" || name == "history"
+	case 'j':
+		return name == "jobs"
+	case 'w':
+		return name == "wait"
+	}
+	return false
+}
+
+func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
 	if len(args) == 0 {
 		return args, nil
 	}
 	switch args[0] {
-	case "kill":
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdKill(ctx, hc, splitAttached("kill", args)); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
-	case "umask":
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdUmask(ctx, hc, args); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
-	case "ulimit":
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdUlimit(ctx, hc, args); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
-	case "printf":
-		// Bypass mvdan/sh's printf (no precision specs like %.0s).
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdPrintf(ctx, hc, args); err != nil {
-			if ee, ok := err.(exitError); ok {
-				return []string{"true"}, interp.BuiltinExit(uint8(ee.code))
-			}
-			return []string{"true"}, interp.BuiltinExit(1)
-		}
-		return []string{"true"}, nil
-	case "hash":
-		// Bypass mvdan/sh's hash (empty-table notice differs) with a
-		// real implementation backed by the hash table below.
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdHashTable(ctx, hc, args); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
-	case "type":
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdTypeDesc(ctx, hc, args); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
-	case "jobs":
-		// Bypass mvdan/sh's stub ("unsupported builtin") with a real
-		// implementation backed by the job table.
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdJobs(hc, args); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
-	case "history":
-		// mvdan/sh declares history but never implements it
-		// (falls into "unsupported builtin"); serve the live
-		// interactive history instead.
-		hc := interp.HandlerCtx(ctx)
-		if err := cmdHistory(ctx, hc, args); err != nil {
-			return []string{"false"}, nil
-		}
-		return []string{"true"}, nil
 	case "test", "[":
 		// Own GNU test implementation: the /dev/null family always
 		// exists (Windows has no such nodes) and diagnostics match GNU.
-		hc := interp.HandlerCtx(ctx)
 		switch err := runTest(hc, args); {
 		case err == nil:
-			return []string{"true"}, nil
-		case errors.Is(err, errTestFalse):
-			return []string{"false"}, nil
+			return nil, interp.CallHandled(0)
+		case err == errTestFalse || errors.Is(err, errTestFalse):
+			return nil, interp.CallHandled(1)
 		default:
-			return []string{"true"}, interp.BuiltinExit(2)
+			return nil, interp.CallHandled(2)
 		}
+	case "printf":
+		// Bypass mvdan/sh's printf (no precision specs like %.0s).
+		if err := cmdPrintf(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "kill":
+		hc.PushActive()
+		err := cmdKill(interp.WithHandlerContext(ctx, hc), hc, splitAttached("kill", args))
+		hc.PopActive()
+		if err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "umask":
+		if err := cmdUmask(ctx, hc, args); err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "ulimit":
+		if err := cmdUlimit(ctx, hc, args); err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "hash":
+		if err := cmdHashTable(ctx, hc, args); err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "type":
+		if err := cmdTypeDesc(ctx, hc, args); err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "jobs":
+		if err := cmdJobs(hc, args); err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "history":
+		if err := cmdHistory(ctx, hc, args); err != nil {
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
 	case "wait":
-		// Tracked externals wait here; everything else flows through
-		// to mvdan/sh's builtin (in-process jobs, real pids, errors).
-		// NOTE: ["true"]/["false"] stand in for exit 0/1 because a
-		// CallHandler cannot return arbitrary codes; exact waited
-		// statuses surface via `wait $!; echo $?` == 0/1 only.
-		// Full-fidelity codes need `wait` as an ExecHandler — see
-		// cmdWaitTracked note.
-		// Bare `wait`: wait for our tracked jobs, then fall through to
-		// mvdan/sh's builtin so it also waits for its own background
-		// goroutines. Returning ["true"] here would return immediately and
-		// skip that wait (the `cmd & wait` race).
+		wctx := interp.WithHandlerContext(ctx, hc)
 		if len(args) == 1 {
-			cmdWaitTracked(ctx, args)
+			cmdWaitTracked(wctx, args)
 			return args, nil
 		}
-		if code, handled := cmdWaitTracked(ctx, args); handled {
+		if code, handled := cmdWaitTracked(wctx, args); handled {
 			if code != 0 {
-				return []string{"false"}, nil
+				return nil, interp.CallHandled(1)
 			}
-			return []string{"true"}, nil
+			return nil, interp.CallHandled(0)
 		}
 		return args, nil
 	}
 	return args, nil
+}
+
+func callOverride(ctx context.Context, args []string) ([]string, error) {
+	if len(args) == 0 || !isOverriddenCall(args[0]) {
+		return args, nil
+	}
+	return fastCallOverride(ctx, interp.HandlerCtx(ctx), args)
 }
 
 func resolve(dir, p string) string {
@@ -717,17 +817,22 @@ func shellGetenv(hc interp.HandlerContext, key string) string {
 // MSYS translation: redirections (>, >>, <) and internals that open files
 // go through here, so `/tmp/x`, `/c/...` work in redirections.
 // Keeps the /dev/null -> NUL workaround from the default handler.
-func shellOpenHandler() interp.OpenHandlerFunc {
-	return func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
-		mc := interp.HandlerCtx(ctx)
-		if runtime.GOOS == "windows" && path == "/dev/null" {
-			path = "NUL"
-			flag &^= os.O_TRUNC
-		} else if path != "" {
-			path = resolve(mc.Dir, path)
-		}
-		return os.OpenFile(path, flag, perm)
+func shellOpenHandlerFn(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+	if isWriteOnlyDevNull(path, flag) {
+		return sharedDevNull, nil
 	}
+	mc := interp.HandlerCtx(ctx)
+	if runtime.GOOS == "windows" && path == "/dev/null" {
+		path = "NUL"
+		flag &^= os.O_TRUNC
+	} else if path != "" {
+		path = resolve(mc.Dir, path)
+	}
+	return os.OpenFile(path, flag, perm)
+}
+
+func shellOpenHandler() interp.OpenHandlerFunc {
+	return shellOpenHandlerFn
 }
 
 type flagSpec struct {
@@ -940,14 +1045,81 @@ var flagSpecs = map[string]flagSpec{
 	}},
 }
 
+func splitAttachedNeedsWork(cmd string, spec flagSpec, argv []string) bool {
+	sawRest := false
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			return false
+		}
+		if len(a) > 2 && a[0] == '-' {
+			if a[1] == '-' {
+				name := a[2:]
+				if eq := strings.IndexByte(name, '='); eq >= 0 {
+					name = name[:eq]
+				}
+				if _, known := spec.long[name]; known {
+					return true
+				}
+				sawRest = true
+				continue
+			}
+			if strings.IndexByte(spec.values, a[1]) >= 0 {
+				return true
+			}
+			if isFlagChar(cmd, a[1]) && canCascadeBools(spec, a[1:]) {
+				return true
+			}
+			sawRest = true
+			continue
+		}
+		if len(a) == 2 && a[0] == '-' && strings.IndexByte(spec.values, a[1]) >= 0 &&
+			i+1 < len(argv) && len(argv[i+1]) > 1 && argv[i+1][0] == '-' && argv[i+1][1] >= '0' && argv[i+1][1] <= '9' {
+			if sawRest {
+				return true
+			}
+			i++
+			continue
+		}
+		sawRest = true
+	}
+	return false
+}
+
+func canCascadeBools(spec flagSpec, s string) bool {
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c >= '0' && c <= '9' {
+			if strings.IndexByte(spec.bools, c) >= 0 {
+				continue
+			}
+			return i > 0
+		}
+		if strings.IndexByte(spec.bools, c) >= 0 {
+			continue
+		}
+		if strings.IndexByte(spec.values, c) >= 0 {
+			return true
+		}
+		return false
+	}
+	return true
+}
+
 func splitAttached(cmd string, args []string) []string {
+	if len(args) <= 1 {
+		return args
+	}
 	spec, ok := flagSpecs[cmd]
 	if !ok {
 		return args
 	}
+	argv := args[1:]
+	if !splitAttachedNeedsWork(cmd, spec, argv) {
+		return args
+	}
 	var movable, rest []string
 	movable = append(movable, args[0])
-	argv := args[1:]
 	endFlags := false
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
@@ -995,7 +1167,7 @@ func splitAttached(cmd string, args []string) []string {
 				}
 				continue
 			}
-			if strings.ContainsRune(spec.values, rune(short[0])) {
+			if strings.IndexByte(spec.values, short[0]) >= 0 {
 				if hasVal {
 					movable = append(movable, "-"+short, val)
 				} else if i+1 < len(argv) {
@@ -1013,14 +1185,14 @@ func splitAttached(cmd string, args []string) []string {
 			continue
 		}
 		if len(a) > 2 && a[0] == '-' && a[1] != '-' &&
-			strings.ContainsRune(spec.values, rune(a[1])) {
+			strings.IndexByte(spec.values, a[1]) >= 0 {
 			movable = append(movable, "-"+string(a[1]), a[2:])
 			continue
 		}
 		// Value flags with negative-number values: "-n -1" (head/tail).
 		// Go's flag package would treat "-1" as a flag; glue it as the
 		// value so `head -n -1` / `tail -n -1` parse like GNU.
-		if len(a) == 2 && a[0] == '-' && strings.ContainsRune(spec.values, rune(a[1])) &&
+		if len(a) == 2 && a[0] == '-' && strings.IndexByte(spec.values, a[1]) >= 0 &&
 			i+1 < len(argv) && len(argv[i+1]) > 1 && argv[i+1][0] == '-' && argv[i+1][1] >= '0' && argv[i+1][1] <= '9' {
 			movable = append(movable, a, argv[i+1])
 			i++
@@ -1055,7 +1227,7 @@ func cascadeBools(spec flagSpec, s string) ([]string, bool) {
 		// Digit-combined shorts (ls -1a, head -2): the digit is a
 		// standalone bool occurrence; keep it as "-1" etc.
 		if c >= '0' && c <= '9' {
-			if strings.ContainsRune(spec.bools, rune(c)) {
+			if strings.IndexByte(spec.bools, c) >= 0 {
 				out = append(out, "-"+string(c))
 				continue
 			}
@@ -1067,11 +1239,11 @@ func cascadeBools(spec flagSpec, s string) ([]string, bool) {
 			}
 			return nil, false
 		}
-		if strings.ContainsRune(spec.bools, rune(c)) {
+		if strings.IndexByte(spec.bools, c) >= 0 {
 			out = append(out, "-"+string(c))
 			continue
 		}
-		if strings.ContainsRune(spec.values, rune(c)) {
+		if strings.IndexByte(spec.values, c) >= 0 {
 			out = append(out, "-"+string(c))
 			if i+1 < len(s) {
 				out = append(out, s[i+1:])
@@ -1334,6 +1506,89 @@ func cmdPwd(_ context.Context, hc interp.HandlerContext, args []string) error {
 var errTestFalse = errors.New("test false")
 var errTestUsage = errors.New("test usage error")
 
+func parseTestInt64(s string) (int64, bool) {
+	start := 0
+	for start < len(s) {
+		c := s[start]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\v' && c != '\f' {
+			break
+		}
+		start++
+	}
+	end := len(s)
+	for end > start {
+		c := s[end-1]
+		if c != ' ' && c != '\t' && c != '\n' && c != '\r' && c != '\v' && c != '\f' {
+			break
+		}
+		end--
+	}
+	if start >= end {
+		return 0, false
+	}
+	neg := false
+	if s[start] == '+' || s[start] == '-' {
+		neg = s[start] == '-'
+		start++
+		if start >= end {
+			return 0, false
+		}
+	}
+	rem := s[start:end]
+	if rem == "0" {
+		return 0, true
+	}
+	// Delegate leading-0 (octal/hex/binary in ParseInt base 0) and 19+ digit integers.
+	if rem[0] < '1' || rem[0] > '9' || len(rem) > 18 {
+		return 0, false
+	}
+	var n int64
+	for i := 0; i < len(rem); i++ {
+		c := rem[i]
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+		n = n*10 + int64(c-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, true
+}
+
+func evalFastTestBinary(a, op, b string) (result bool, handled bool) {
+	switch op {
+	case "=", "==":
+		return a == b, true
+	case "!=":
+		return a != b, true
+	case "-eq", "-ne", "-lt", "-le", "-gt", "-ge":
+		x, ok1 := parseTestInt64(a)
+		if !ok1 {
+			return false, false
+		}
+		y, ok2 := parseTestInt64(b)
+		if !ok2 {
+			return false, false
+		}
+		switch op {
+		case "-eq":
+			return x == y, true
+		case "-ne":
+			return x != y, true
+		case "-lt":
+			return x < y, true
+		case "-le":
+			return x <= y, true
+		case "-gt":
+			return x > y, true
+		default:
+			return x >= y, true
+		}
+	}
+	return false, false
+}
+
 // runTest implements the test/[ builtin with GNU semantics, including
 // the /dev/null device family (which does not exist on Windows).
 // A nil return means the expression is true.
@@ -1346,10 +1601,52 @@ func runTest(hc interp.HandlerContext, args []string) error {
 		}
 		a = a[:len(a)-1]
 	}
-	if len(a) == 0 {
+	switch len(a) {
+	case 0:
 		return errTestFalse
+	case 1:
+		if a[0] != ")" {
+			if a[0] != "" {
+				return nil
+			}
+			return errTestFalse
+		}
+	case 2:
+		op, arg := a[0], a[1]
+		if op != "(" && op != ")" && arg != "-a" && arg != "-o" && arg != ")" {
+			switch op {
+			case "-n":
+				if arg != "" {
+					return nil
+				}
+				return errTestFalse
+			case "-z", "!":
+				if arg == "" {
+					return nil
+				}
+				return errTestFalse
+			}
+		}
+	case 3:
+		if a[0] != "!" && a[0] != "(" && a[0] != ")" {
+			if res, ok := evalFastTestBinary(a[0], a[1], a[2]); ok {
+				if res {
+					return nil
+				}
+				return errTestFalse
+			}
+		}
+	case 4:
+		if a[0] == "!" && a[1] != "!" && a[1] != "(" && a[1] != ")" && !isTestBinaryOp(a[1]) {
+			if res, ok := evalFastTestBinary(a[1], a[2], a[3]); ok {
+				if !res {
+					return nil
+				}
+				return errTestFalse
+			}
+		}
 	}
-	t := &testParser{hc: hc, toks: a}
+	t := testParser{hc: hc, toks: a}
 	ok, err := t.orExpr()
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
@@ -2052,7 +2349,6 @@ var probeLog = func(format string, a ...any) {
 	os.Stderr.WriteString("PROBE: " + fmt.Sprintf(format, a...) + "\n")
 }
 
-
 // runSelfTracked runs a command as a REAL child process by re-executing the
 // unish binary with -c. Used for background statements: our embedded tools
 // are external programs in bash, so bash forks them; doing the same gives
@@ -2071,13 +2367,20 @@ func runSelfTracked(ctx context.Context, args []string) (error, bool) {
 	cmd.Stdout = hc.Stdout
 	cmd.Stderr = hc.Stderr
 	cmd.Env = shellExecEnv(hc)
+	afterStart, afterWait := interp.PrepareExecStdio(cmd)
 	if err := cmd.Start(); err != nil {
+		afterWait()
 		return nil, false
 	}
+	afterStart()
+	defer afterWait()
 	hc.ReportBgStart(cmd.Process.Pid)
 	j := globalJobs.track(cmd, args)
 	<-j.done
 	if j.err != nil {
+		if isPipeClosed(j.err) {
+			return nil, true
+		}
 		if ee, ok := j.err.(*exec.ExitError); ok {
 			return interp.NewExitStatus(uint8(ee.ExitCode())), true
 		}

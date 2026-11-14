@@ -31,6 +31,7 @@ import (
 	"slices"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mvdan.cc/sh/v3/expand"
@@ -93,7 +94,9 @@ type Runner struct {
 
 	// callHandler is a function allowing to replace a simple command's
 	// arguments. It may be nil.
-	callHandler CallHandlerFunc
+	callHandler     CallHandlerFunc
+	fastCallFilter  func(string) bool
+	fastCallHandler FastCallHandlerFunc
 
 	// execHandler is responsible for executing programs. It must not be nil.
 	execHandler ExecHandlerFunc
@@ -110,6 +113,7 @@ type Runner struct {
 
 	// openHandler is a function responsible for opening files. It must not be nil.
 	openHandler OpenHandlerFunc
+	fastDevNull io.ReadWriteCloser
 
 	// readDirHandler is a function responsible for reading directories during
 	// glob expansion. It must be non-nil.
@@ -133,8 +137,14 @@ type Runner struct {
 	stdout io.Writer
 	stderr io.Writer
 
-	ecfg *expand.Config
-	ectx context.Context // just so that Runner.Subshell can use it again
+	ecfg        *expand.Config
+	ecfgStorage expand.Config
+	envProxy    expandEnv
+	roEnv       readOnlyEnv
+	ectx        context.Context // just so that Runner.Subshell can use it again
+
+	callArgsBuf   [8]string
+	callArgsInUse bool
 
 	// didReset remembers whether the runner has ever been reset. This is
 	// used so that Reset is automatically called when running any program
@@ -194,7 +204,11 @@ type Runner struct {
 
 	// pipeStatusCodes accumulates the stages of the current pipeline so a
 	// left-nested `a | b | c` keeps all three, like bash.
-	pipeStatusCodes []int
+	pipeStatusCodes  []int
+	pipeStatusInline [8]int
+	pipeStatus       []int
+	pipeStatusDirty  bool
+	pipeStatusInEnv  bool
 
 	opts runnerOpts
 
@@ -230,11 +244,13 @@ type Runner struct {
 
 	// Signal traps registered via the trap builtin; like bash, they run
 	// between commands rather than re-entrantly.
-	sigMu        sync.Mutex
-	sigCallbacks map[os.Signal]string
-	sigIgnored   map[os.Signal]bool
-	sigNames     map[os.Signal]string
-	sigCh        chan os.Signal
+	sigMu          sync.Mutex
+	sigCallbacks   map[os.Signal]string
+	sigIgnored     map[os.Signal]bool
+	sigNames       map[os.Signal]string
+	sigCh          chan os.Signal
+	hasActiveSigCh atomic.Bool
+	hasIgnoredSigs atomic.Bool
 }
 
 // exitStatus holds the state of the shell after running one command.
@@ -292,6 +308,15 @@ func (e *exitStatus) fatal(err error) {
 
 func (e *exitStatus) fromHandlerError(err error) {
 	if err == nil {
+		return
+	}
+	if exit, ok := err.(errBuiltinExitStatus); ok {
+		*e = exitStatus(exit)
+		return
+	}
+	if es, ok := err.(ExitStatus); ok {
+		e.err = err
+		e.code = uint8(es)
 		return
 	}
 	if se, ok := errors.AsType[*ExitError](err); ok {
@@ -505,7 +530,7 @@ func Params(args ...string) RunnerOption {
 					r.opts[optXTrace] = false
 				}
 				if args := fp.args(); len(args) > 0 {
-					r.Params = args
+					r.Params = slices.Clone(args)
 				}
 				return nil
 			}
@@ -544,7 +569,7 @@ func Params(args ...string) RunnerOption {
 		if args := fp.args(); args != nil {
 			// If "--" wasn't given and there were zero arguments,
 			// we don't want to override the current parameters.
-			r.Params = args
+			r.Params = slices.Clone(args)
 
 			// Record whether a sourced script sets the parameters.
 			if r.inSource {
@@ -611,6 +636,7 @@ func BashOpts(args ...string) RunnerOption {
 func CallHandler(f CallHandlerFunc) RunnerOption {
 	return func(r *Runner) error {
 		r.callHandler = f
+		r.fastCallFilter, r.fastCallHandler = lookupFastCallHandler(f)
 		return nil
 	}
 }
@@ -662,6 +688,7 @@ func ExecHandlers(middlewares ...func(next ExecHandlerFunc) ExecHandlerFunc) Run
 func OpenHandler(f OpenHandlerFunc) RunnerOption {
 	return func(r *Runner) error {
 		r.openHandler = f
+		r.fastDevNull = lookupFastOpenDevNull(f)
 		return nil
 	}
 }
@@ -1013,9 +1040,12 @@ func (r *Runner) Reset() {
 		Env:                  r.Env,
 		tempDir:              r.tempDir,
 		callHandler:          r.callHandler,
+		fastCallFilter:       r.fastCallFilter,
+		fastCallHandler:      r.fastCallHandler,
 		execHandler:          r.execHandler,
 		execHandlerIsDefault: r.execHandlerIsDefault,
 		openHandler:          r.openHandler,
+		fastDevNull:          r.fastDevNull,
 		readDirHandler:       r.readDirHandler,
 		statHandler:          r.statHandler,
 		accessHandler:        r.accessHandler,
@@ -1045,6 +1075,9 @@ func (r *Runner) Reset() {
 		dirStack: r.dirStack[:0],
 		usedNew:  r.usedNew,
 	}
+	r.envProxy.r = r
+	r.roEnv.r = r
+	r.ecfg = &r.ecfgStorage
 	// Ensure we stop referencing any pointers before we reuse bgProcs.
 	clear(r.bgProcs)
 	r.bgProcs = r.bgProcs[:0]
@@ -1219,7 +1252,13 @@ func (r *Runner) Run(ctx context.Context, node syntax.Node) error {
 	if _, ok := node.(*syntax.File); ok || r.exit.exiting {
 		r.trapCallback(ctx, r.callbackExit, "exit")
 	}
+	if r.Vars == nil {
+		r.Vars = make(map[string]expand.Variable)
+	}
 	maps.Insert(r.Vars, r.writeEnv.Each)
+	if r.pipeStatusDirty && !r.pipeStatusInEnv {
+		r.Vars["PIPESTATUS"] = r.materializePipeStatus()
+	}
 	// Return the first of: a fatal error, a non-fatal handler error, or the exit code.
 	if err := r.exit.err; err != nil {
 		if r.exit.code == 0 {
@@ -1259,40 +1298,46 @@ func (r *Runner) Subshell() *Runner {
 	return r.subshell(true)
 }
 
-// subshell is like [Runner.Subshell], but allows skipping some allocations and copies
-// when creating subshells which will not be used concurrently with the parent shell.
-// TODO(v4): rename Subshell to Clone, making its deep copy explicit and
-// leaving room for exposing this cheaper variant under a name of its own,
-// if a use case for it ever appears.
-func (r *Runner) subshell(background bool) *Runner {
-	if !r.didReset {
-		r.Reset()
-	}
-	// Keep in sync with the Runner type. Manually copy fields, to not copy
-	// sensitive ones like [errgroup.Group], and to do deep copies of slices.
-	r2 := &Runner{
-		Dir:                  r.Dir,
-		tempDir:              r.tempDir,
-		Params:               r.Params,
-		callHandler:          r.callHandler,
-		execHandler:          r.execHandler,
-		execHandlerIsDefault: r.execHandlerIsDefault,
-		openHandler:          r.openHandler,
-		readDirHandler:       r.readDirHandler,
-		statHandler:          r.statHandler,
-		accessHandler:        r.accessHandler,
-		procSubstHandler:     r.procSubstHandler,
-		procSubsts:           r.procSubsts,
-		stdin:                r.stdin,
-		stdout:               r.stdout,
-		stderr:               r.stderr,
-		filename:             r.filename,
-		opts:                 r.opts,
-		usedNew:              r.usedNew,
-		exit:                 r.exit,
-		lastExit:             r.lastExit,
+var cmdSubstRunnerPool = sync.Pool{
+	New: func() any {
+		return &Runner{}
+	},
+}
 
-		origStdout: r.origStdout, // used for process substitutions
+func (r *Runner) initSubshellFields(r2 *Runner, oenv *overlayEnviron) {
+	r2.Dir = r.Dir
+	r2.tempDir = r.tempDir
+	r2.Params = r.Params
+	r2.callHandler = r.callHandler
+	r2.fastCallFilter = r.fastCallFilter
+	r2.fastCallHandler = r.fastCallHandler
+	r2.execHandler = r.execHandler
+	r2.execHandlerIsDefault = r.execHandlerIsDefault
+	r2.openHandler = r.openHandler
+	r2.fastDevNull = r.fastDevNull
+	r2.readDirHandler = r.readDirHandler
+	r2.statHandler = r.statHandler
+	r2.accessHandler = r.accessHandler
+	r2.procSubstHandler = r.procSubstHandler
+	r2.procSubsts = r.procSubsts
+	r2.stdin = r.stdin
+	r2.stdout = r.stdout
+	r2.stderr = r.stderr
+	r2.filename = r.filename
+	r2.opts = r.opts
+	r2.usedNew = r.usedNew
+	r2.exit = r.exit
+	r2.lastExit = r.lastExit
+	r2.origStdout = r.origStdout
+	r2.pipeStatusDirty = r.pipeStatusDirty
+	r2.pipeStatusInEnv = r.pipeStatusInEnv
+	if len(r.pipeStatus) > 0 {
+		if len(r.pipeStatus) <= len(r2.pipeStatusInline) {
+			copy(r2.pipeStatusInline[:], r.pipeStatus)
+			r2.pipeStatus = r2.pipeStatusInline[:len(r.pipeStatus)]
+		} else {
+			r2.pipeStatus = slices.Clone(r.pipeStatus)
+		}
 	}
 	if len(r.extraFds) > 0 {
 		r2.extraFds = make(map[int]io.Writer, len(r.extraFds))
@@ -1306,26 +1351,77 @@ func (r *Runner) subshell(background bool) *Runner {
 			r2.extraInFds[fd] = nopCloseReader{r: rd}
 		}
 	}
-	r.sigMu.Lock()
-	if len(r.sigIgnored) > 0 {
-		r2.sigIgnored = maps.Clone(r.sigIgnored)
-		r2.sigNames = make(map[os.Signal]string, len(r.sigIgnored))
-		for sig := range r.sigIgnored {
-			if name := r.sigNames[sig]; name != "" {
-				r2.sigNames[sig] = name
+	if r.hasIgnoredSigs.Load() {
+		r.sigMu.Lock()
+		if len(r.sigIgnored) > 0 {
+			r2.sigIgnored = maps.Clone(r.sigIgnored)
+			r2.sigNames = make(map[os.Signal]string, len(r.sigIgnored))
+			for sig := range r.sigIgnored {
+				if name := r.sigNames[sig]; name != "" {
+					r2.sigNames[sig] = name
+				}
 			}
+			r2.hasIgnoredSigs.Store(true)
 		}
+		r.sigMu.Unlock()
 	}
-	r.sigMu.Unlock()
-	r2.writeEnv = newOverlayEnviron(r.writeEnv, background)
-	// Funcs are copied, since they might be modified.
-	r2.Funcs = maps.Clone(r.Funcs)
-	r2.Vars = make(map[string]expand.Variable)
-	r2.alias = maps.Clone(r.alias)
-
-	r2.dirStack = append(r2.dirBootstrap[:0], r.dirStack...)
+	r2.writeEnv = oenv
+	if len(r.Funcs) > 0 {
+		r2.Funcs = maps.Clone(r.Funcs)
+	}
+	if len(r.alias) > 0 {
+		r2.alias = maps.Clone(r.alias)
+	}
+	if len(r.dirStack) <= len(r2.dirBootstrap) {
+		copy(r2.dirBootstrap[:], r.dirStack)
+		r2.dirStack = r2.dirBootstrap[:len(r.dirStack)]
+	} else {
+		r2.dirStack = slices.Clone(r.dirStack)
+	}
+	r2.envProxy.r = r2
+	r2.roEnv.r = r2
 	r2.fillExpandConfig(r.ectx)
 	r2.didReset = true
+}
+
+func (r *Runner) acquireCmdSubstSubshell() (*Runner, *overlayEnviron) {
+	if !r.didReset {
+		r.Reset()
+	}
+	r2 := cmdSubstRunnerPool.Get().(*Runner)
+	oenv := overlayEnvPool.Get().(*overlayEnviron)
+	oenv.parent = r.writeEnv
+	oenv.funcScope = false
+	r.initSubshellFields(r2, oenv)
+	return r2, oenv
+}
+
+func releaseCmdSubstSubshell(r2 *Runner, oenv *overlayEnviron) {
+	if len(r2.bgProcs) > 0 {
+		return
+	}
+	oenv.parent = nil
+	oenv.funcScope = false
+	if len(oenv.values) <= 32 {
+		clear(oenv.values)
+		overlayEnvPool.Put(oenv)
+	}
+	*r2 = Runner{}
+	cmdSubstRunnerPool.Put(r2)
+}
+
+// subshell is like [Runner.Subshell], but allows skipping some allocations and copies
+// when creating subshells which will not be used concurrently with the parent shell.
+// TODO(v4): rename Subshell to Clone, making its deep copy explicit and
+// leaving room for exposing this cheaper variant under a name of its own,
+// if a use case for it ever appears.
+func (r *Runner) subshell(background bool) *Runner {
+	if !r.didReset {
+		r.Reset()
+	}
+	r2 := &Runner{}
+	oenv := newOverlayEnviron(r.writeEnv, background)
+	r.initSubshellFields(r2, oenv)
 	return r2
 }
 
@@ -1347,6 +1443,9 @@ func (r *Runner) finishSubshell(ctx context.Context) {
 }
 
 func (r *Runner) closeOwnedExtraFds() {
+	if len(r.extraFds) == 0 && len(r.extraInFds) == 0 {
+		return
+	}
 	seen := make(map[io.Closer]struct{})
 	for _, w := range r.extraFds {
 		if c, ok := w.(io.Closer); ok {

@@ -58,7 +58,7 @@ func Arithm(cfg *Config, expr syntax.ArithmExpr) (int, error) {
 			} else {
 				val--
 			}
-			if err := lv.set(cfg, strconv.FormatInt(val, 10)); err != nil {
+			if err := lv.set(cfg, formatArithInt64(val)); err != nil {
 				return 0, err
 			}
 			if expr.Post {
@@ -157,17 +157,23 @@ func arithLitSafe(s string) bool {
 // arithWordNum resolves an arithmetic word: valid names dereference
 // variables (including namerefs), everything else is a number.
 func arithWordNum(cfg *Config, str string) (int, error) {
-	// recursively fetch vars
-	i := 0
-	for syntax.ValidName(str) {
-		val := cfg.envGet(str)
-		if val == "" {
-			break
+	// Fast path: non-empty string starting with an ASCII digit cannot be a
+	// shell variable name, so skip ValidName entirely.
+	if len(str) == 0 || str[0] < '0' || str[0] > '9' {
+		i := 0
+		for syntax.ValidName(str) {
+			val := cfg.envGet(str)
+			if val == "" {
+				return 0, nil
+			}
+			if i++; i >= maxNameRefDepth {
+				break
+			}
+			str = val
+			if len(str) > 0 && str[0] >= '0' && str[0] <= '9' {
+				break
+			}
 		}
-		if i++; i >= maxNameRefDepth {
-			break
-		}
-		str = val
 	}
 	// default to 0
 	n, err := atoi(str)
@@ -175,6 +181,13 @@ func arithWordNum(cfg *Config, str string) (int, error) {
 		return 0, err
 	}
 	return int(n), nil
+}
+
+func formatArithInt64(v int64) string {
+	if v >= 0 && v < smallIntLimit {
+		return FormatIntFast(int(v))
+	}
+	return strconv.FormatInt(v, 10)
 }
 
 // atoi is like [strconv.ParseInt](s, BASE, 64), but it handles integer
@@ -185,6 +198,24 @@ func arithWordNum(cfg *Config, str string) (int, error) {
 // refer to the bash manual:
 // https://www.man7.org/linux/man-pages/man1/bash.1.html
 func atoi(s string) (int64, error) {
+	if s == "" || s == "0" {
+		return 0, nil
+	}
+	if len(s) <= 18 && s[0] >= '1' && s[0] <= '9' {
+		n := int64(s[0] - '0')
+		plain := true
+		for i := 1; i < len(s); i++ {
+			c := s[i]
+			if c < '0' || c > '9' {
+				plain = false
+				break
+			}
+			n = n*10 + int64(c-'0')
+		}
+		if plain {
+			return n, nil
+		}
+	}
 	orig := strings.TrimSpace(s)
 	s = orig
 	neg := false
@@ -470,7 +501,7 @@ func (cfg *Config) assgnArit(b *syntax.BinaryArithm) (int, error) {
 	case syntax.ShrAssgn:
 		val >>= uint(arg)
 	}
-	if err := lv.set(cfg, strconv.FormatInt(val, 10)); err != nil {
+	if err := lv.set(cfg, formatArithInt64(val)); err != nil {
 		return 0, err
 	}
 	return int(val), nil
