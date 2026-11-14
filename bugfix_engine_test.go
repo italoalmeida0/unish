@@ -604,3 +604,110 @@ type -p ls
 		t.Fatalf("got:\n%s\nwant:\n%s\n(stderr=%q)", out, want, serr)
 	}
 }
+
+// 12. Subshell trap inheritance (sigIgnored + sigNames), subshell EXIT traps across (...)/$(...)/<(...)/|/&, and subshell os/signal teardown.
+func TestBugfixEngine_SubshellTrapsIgnoredExitAndTeardown(t *testing.T) {
+	bin := engineTestBinary(t)
+	dir := t.TempDir()
+
+	// Part A: inherited `trap '' TERM` keeps signal name in `( trap )` and is not wiped by setting another trap in the subshell.
+	cmdA := exec.Command(bin, "-c", `
+trap '' TERM
+( trap )
+echo "---"
+(
+	trap 'echo got_int' INT
+	trap
+	kill -TERM $$
+	kill -INT $$
+	echo "after_sub_signals"
+)
+`)
+	cmdA.Dir = dir
+	rawA, err := cmdA.CombinedOutput()
+	if err != nil {
+		t.Fatalf("Part A subshell sigIgnored failed: %v\noutput:\n%s", err, string(rawA))
+	}
+	gotA := strings.ReplaceAll(string(rawA), "\r\n", "\n")
+	wantA := strings.Join([]string{
+		"trap -- '' TERM",
+		"---",
+		"trap -- 'echo got_int' INT",
+		"trap -- '' TERM",
+		"got_int",
+		"after_sub_signals",
+	}, "\n") + "\n"
+	if gotA != wantA {
+		t.Fatalf("Part A got:\n%s\nwant:\n%s", gotA, wantA)
+	}
+
+	// Part B: subshell EXIT traps in (...), $(...), <(...), pipeline, and { ...; } &.
+	scriptB := `
+( trap 'echo "sub_false:$?"' EXIT; false )
+echo "rc1:$?"
+( trap 'echo "sub_exit:$?"' EXIT; exit 3; echo NEVER )
+echo "rc2:$?"
+( trap 'echo "sub_override:$?"; exit 9; echo NEVER_IN_TRAP' EXIT; exit 3 )
+echo "rc3:$?"
+cs=$( trap 'echo "cs_exit:$?"' EXIT; echo body; (exit 4) )
+echo "cs_rc:$? cs_val:${cs//$'\n'/|}"
+{ trap 'echo "bg_norm:$?" > bg1.txt' EXIT; false; } &
+p1=$!
+wait $p1
+echo "bg1_rc:$? bg1:$(cat bg1.txt)"
+{ trap 'echo "bg_exp:$?" >> bg2.txt' EXIT; exit 5; } &
+p2=$!
+wait $p2
+echo "bg2_rc:$? bg2:$(cat bg2.txt)"
+read -r psline < <( trap 'echo "ps_exit:$?"' EXIT; false )
+echo "ps:$psline"
+( trap 'echo "pipe_exit:$?"' EXIT; echo pbody ) | tr '\n' ':'
+echo ""
+`
+	outB, serrB, err := runEngineScript(t, dir, scriptB)
+	if err != nil {
+		t.Fatalf("Part B subshell EXIT traps failed: %v (stderr=%q)", err, serrB)
+	}
+	wantB := strings.Join([]string{
+		"sub_false:1",
+		"rc1:1",
+		"sub_exit:3",
+		"rc2:3",
+		"sub_override:3",
+		"rc3:9",
+		"cs_rc:4 cs_val:body|cs_exit:4",
+		"bg1_rc:1 bg1:bg_norm:1",
+		"bg2_rc:5 bg2:bg_exp:5",
+		"ps:ps_exit:1",
+		"pbody:pipe_exit:0:",
+	}, "\n") + "\n"
+	if outB != wantB {
+		t.Fatalf("Part B got:\n%s\nwant:\n%s\n(stderr=%q)", outB, wantB, serrB)
+	}
+
+	// Part C: subshell signal traps across all 5 subshell forms must unregister their os/signal channels on exit.
+	baseChans := interp.ActiveSignalChannels()
+	teardownScript := `
+for i in 1 2 3; do
+	( trap 'echo x' INT TERM )
+	v=$( trap 'echo x' INT; echo ok )
+	read -r u < <( trap 'echo x' INT; echo ok )
+	( trap 'echo x' INT; echo ok ) | cat >/dev/null
+	{ trap 'echo x' INT; true; } &
+	wait
+done
+`
+	if _, serrC, err := runEngineScript(t, dir, teardownScript); err != nil {
+		t.Fatalf("Part C teardown script failed: %v (stderr=%q)", err, serrC)
+	}
+	if afterChans := interp.ActiveSignalChannels(); afterChans != baseChans {
+		t.Fatalf("subshell signal channels leaked: before=%d after=%d", baseChans, afterChans)
+	}
+	if runtime.GOOS != "windows" {
+		cmdU := exec.Command(bin, "-c", `( trap 'echo x' USR1 ); kill -USR1 $$; echo SHOULD_NOT_SURVIVE`)
+		outU, errU := cmdU.CombinedOutput()
+		if errU == nil || strings.Contains(string(outU), "SHOULD_NOT_SURVIVE") {
+			t.Fatalf("expected unhandled SIGUSR1 after subshell exit to terminate process, err=%v out=%q", errU, string(outU))
+		}
+	}
+}

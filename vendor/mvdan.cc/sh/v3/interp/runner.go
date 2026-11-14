@@ -67,8 +67,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r2 := r.subshell(false)
 			r2.stdout = w
 			r2.stmts(ctx, cs.Stmts)
-			r2.closeOwnedExtraFds()
-			r2.exit.exiting = false // subshells don't exit the parent shell
+			r2.finishSubshell(ctx)
 			r.lastExpandExit = r2.exit
 			if r2.exit.fatalExit {
 				return r2.exit.err // surface fatal errors immediately
@@ -98,6 +97,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r.bgProcs = append(r.bgProcs, bg)
 			go func() {
 				defer func() {
+					r2.resetSignals()
 					r2.closeOwnedExtraFds()
 					*bg.exit = r2.exit
 					close(bg.done)
@@ -137,6 +137,9 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 					panic(fmt.Sprintf("unexpected process substitution operator: %q", ps.Op))
 				}
 				r2.stmts(ctx, ps.Stmts)
+				if !r2.exit.fatalExit {
+					r2.trapCallback(ctx, r2.callbackExit, "exit")
+				}
 				r2.exit.exiting = false // subshells don't exit the parent shell
 			}()
 			return psf.Path, nil
@@ -278,8 +281,7 @@ func (r *Runner) errf(format string, a ...any) {
 }
 
 func (r *Runner) stop(ctx context.Context) bool {
-	// Some traps trigger on exit, so we do want those to run.
-	if !r.handlingTrap && (r.exit.returning || r.exit.exiting) {
+	if r.exit.returning || r.exit.exiting {
 		return true
 	}
 	if err := ctx.Err(); err != nil {
@@ -321,12 +323,16 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 		go func() {
 			defer func() {
 				noteBgStartDone(r2.bgTrackOnce)
+				r2.resetSignals()
 				r2.closeOwnedExtraFds()
 				*bg.exit = r2.exit
 				close(bg.done)
 			}()
 			r2.Run(ctx, &st2)
-			r2.reportBgStart(0)     // in case we didn't get to start a program
+			r2.reportBgStart(0) // in case we didn't get to start a program
+			if !r2.exit.exiting && !r2.exit.fatalExit {
+				r2.trapCallback(ctx, r2.callbackExit, "exit")
+			}
 			r2.exit.exiting = false // subshells don't exit the parent shell
 		}()
 	} else {
@@ -527,15 +533,22 @@ func (r *Runner) setSigTrap(sig os.Signal, name, callback string, ignore, reset 
 		}
 		return
 	}
+	newCh := false
 	if r.sigCh == nil {
 		r.sigCh = make(chan os.Signal, 8)
+		activeSigChans.Add(1)
+		newCh = true
 	}
 	if r.sigCallbacks == nil {
 		r.sigCallbacks = map[os.Signal]string{}
+	}
+	if r.sigIgnored == nil {
 		r.sigIgnored = map[os.Signal]bool{}
+	}
+	if r.sigNames == nil {
 		r.sigNames = map[os.Signal]string{}
 	}
-	wasWatched := r.sigCallbacks[sig] != "" || r.sigIgnored[sig]
+	wasWatched := !newCh && (r.sigCallbacks[sig] != "" || r.sigIgnored[sig])
 	r.sigNames[sig] = name
 	if ignore {
 		delete(r.sigCallbacks, sig)
@@ -549,10 +562,20 @@ func (r *Runner) setSigTrap(sig os.Signal, name, callback string, ignore, reset 
 	}
 }
 
+var activeSigChans atomic.Int32
+
+// ActiveSignalChannels reports the number of Runner signal channels currently
+// registered with os/signal (for leak verification in tests).
+func ActiveSignalChannels() int {
+	return int(activeSigChans.Load())
+}
+
 func (r *Runner) resetSignals() {
 	r.sigMu.Lock()
 	if r.sigCh != nil {
 		signal.Stop(r.sigCh)
+		r.sigCh = nil
+		activeSigChans.Add(-1)
 	}
 	r.sigMu.Unlock()
 }
@@ -586,7 +609,7 @@ func (r *Runner) QueueSignal(sig os.Signal) bool {
 	if ignored {
 		return true
 	}
-	if !registered {
+	if !registered || ch == nil {
 		return false
 	}
 	select {
@@ -782,8 +805,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 	case *syntax.Subshell:
 		r2 := r.subshell(false)
 		r2.stmts(ctx, cm.Stmts)
-		r2.closeOwnedExtraFds()
-		r2.exit.exiting = false // subshells don't exit the parent shell
+		r2.finishSubshell(ctx)
 		r.exit = r2.exit
 	case *syntax.CallExpr:
 		// Build new slices, to not modify the caller's AST
@@ -901,8 +923,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			var wg sync.WaitGroup
 			wg.Go(func() {
 				r2.stmt(ctx, cm.X)
-				r2.closeOwnedExtraFds()
-				r2.exit.exiting = false // subshells don't exit the parent shell
+				r2.finishSubshell(ctx)
 				pw.Close()
 			})
 			r.stmt(ctx, cm.Y)
@@ -1282,8 +1303,9 @@ func (r *Runner) trapCallback(ctx context.Context, callback, name string) {
 	}
 	oldExit, oldLastExit := r.exit, r.lastExit
 	r.lastExit = r.exit
+	r.exit = exitStatus{}
 	r.stmts(ctx, file.Stmts)
-	if r.exit.exiting {
+	if r.exit.exiting || r.exit.returning {
 		oldExit = r.exit
 	}
 	r.exit, r.lastExit = oldExit, oldLastExit // traps on EXIT or ERR should not modify the result

@@ -1309,6 +1309,12 @@ func (r *Runner) subshell(background bool) *Runner {
 	r.sigMu.Lock()
 	if len(r.sigIgnored) > 0 {
 		r2.sigIgnored = maps.Clone(r.sigIgnored)
+		r2.sigNames = make(map[os.Signal]string, len(r.sigIgnored))
+		for sig := range r.sigIgnored {
+			if name := r.sigNames[sig]; name != "" {
+				r2.sigNames[sig] = name
+			}
+		}
 	}
 	r.sigMu.Unlock()
 	r2.writeEnv = newOverlayEnviron(r.writeEnv, background)
@@ -1330,6 +1336,15 @@ func (n nopCloseWriter) Write(p []byte) (int, error) { return n.w.Write(p) }
 type nopCloseReader struct{ r io.Reader }
 
 func (n nopCloseReader) Read(p []byte) (int, error) { return n.r.Read(p) }
+
+func (r *Runner) finishSubshell(ctx context.Context) {
+	if !r.exit.fatalExit {
+		r.trapCallback(ctx, r.callbackExit, "exit")
+	}
+	r.resetSignals()
+	r.closeOwnedExtraFds()
+	r.exit.exiting = false // subshells don't exit the parent shell
+}
 
 func (r *Runner) closeOwnedExtraFds() {
 	seen := make(map[io.Closer]struct{})
