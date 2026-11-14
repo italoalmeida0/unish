@@ -572,19 +572,27 @@ func readSlurpFile(ctx context.Context, hc interp.HandlerContext, fpath string) 
 
 func buildJqEnvObj(hc interp.HandlerContext) jqVal {
 	obj := newJqObj(32)
-	if envFallbackAllowed(hc, "") {
-		for _, kv := range os.Environ() {
-			if eq := strings.IndexByte(kv, '='); eq >= 0 {
-				obj.set(kv[:eq], jqMakeStr(kv[eq+1:]))
+	if hc.Env != nil {
+		if ee, ok := hc.Env.(explicitEnviron); ok {
+			for _, kv := range ee.pairs {
+				if eq := strings.IndexByte(kv, '='); eq >= 0 {
+					obj.set(kv[:eq], jqMakeStr(kv[eq+1:]))
+				}
+			}
+		} else if envFallbackAllowed(hc, "") {
+			for _, kv := range os.Environ() {
+				if eq := strings.IndexByte(kv, '='); eq >= 0 {
+					obj.set(kv[:eq], jqMakeStr(kv[eq+1:]))
+				}
 			}
 		}
+		hc.Env.Each(func(name string, vr expand.Variable) bool {
+			if vr.IsSet() && vr.Exported {
+				obj.set(name, jqMakeStr(vr.String()))
+			}
+			return true
+		})
 	}
-	hc.Env.Each(func(name string, vr expand.Variable) bool {
-		if vr.IsSet() && vr.Exported {
-			obj.set(name, jqMakeStr(vr.String()))
-		}
-		return true
-	})
 	return jqVal{kind: jqObject, obj: obj}
 }
 

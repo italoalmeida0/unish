@@ -414,20 +414,34 @@ func newAwkVM(ctx context.Context, hc interp.HandlerContext, prog *awkProgram, a
 	}
 	vm.vars["ARGV"] = &awkSlot{kind: slotArray, arr: argvMap}
 
-	// Populate ENVIRON from OS env overlaid with shell hc.Env
+	// Populate ENVIRON from explicit/OS env overlaid with shell hc.Env
 	envMap := make(map[string]awkVal, 64)
-	for _, kv := range os.Environ() {
-		if eq := strings.IndexByte(kv, '='); eq >= 0 {
-			envMap[kv[:eq]] = awkStrNumVal(kv[eq+1:])
-		}
-	}
 	if hc.Env != nil {
+		if ee, ok := hc.Env.(explicitEnviron); ok {
+			for _, kv := range ee.pairs {
+				if eq := strings.IndexByte(kv, '='); eq >= 0 {
+					envMap[kv[:eq]] = awkStrNumVal(kv[eq+1:])
+				}
+			}
+		} else if envFallbackAllowed(hc, "") {
+			for _, kv := range os.Environ() {
+				if eq := strings.IndexByte(kv, '='); eq >= 0 {
+					envMap[kv[:eq]] = awkStrNumVal(kv[eq+1:])
+				}
+			}
+		}
 		hc.Env.Each(func(name string, vr expand.Variable) bool {
 			if vr.IsSet() && vr.Kind == expand.String {
 				envMap[name] = awkStrNumVal(vr.Str)
 			}
 			return true
 		})
+	} else {
+		for _, kv := range os.Environ() {
+			if eq := strings.IndexByte(kv, '='); eq >= 0 {
+				envMap[kv[:eq]] = awkStrNumVal(kv[eq+1:])
+			}
+		}
 	}
 	vm.vars["ENVIRON"] = &awkSlot{kind: slotArray, arr: envMap}
 
@@ -488,6 +502,10 @@ func runAwkShellCmd(ctx context.Context, hc interp.HandlerContext, cmd string, s
 	if hc.Env == nil {
 		hc.Env = expand.ListEnviron()
 	}
+	execHandlers := []func(interp.ExecHandlerFunc) interp.ExecHandlerFunc{trackExec, extraHandler}
+	if ee, ok := hc.Env.(explicitEnviron); ok {
+		execHandlers = []func(interp.ExecHandlerFunc) interp.ExecHandlerFunc{wrapExplicitEnvMiddleware(ee.cleared), trackExec, extraHandler}
+	}
 	r, err := interp.New(
 		interp.Dir(hc.Dir),
 		interp.Env(expand.ListEnviron(shellExecEnv(hc)...)),
@@ -497,7 +515,7 @@ func runAwkShellCmd(ctx context.Context, hc interp.HandlerContext, cmd string, s
 		interp.ReadDirHandler2(shellReadDirHandler()),
 		interp.StatHandler(shellStatHandler()),
 		interp.AccessHandler(shellAccessHandler()),
-		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ExecHandlers(execHandlers...),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
 	if err != nil {

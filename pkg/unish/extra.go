@@ -396,7 +396,7 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 		if jailed {
 			hc.ReportBgStart(0)
 			if runtime.GOOS != "windows" && errors.Is(err, syscall.ENOEXEC) {
-				return runJailedENOEXEC(ctx, hc, checkedBin, args), true
+				return runExtraJailedENOEXEC(ctx, hc, checkedBin, args), true
 			}
 			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
 			if os.IsNotExist(err) {
@@ -431,7 +431,33 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	return nil, true
 }
 
-func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin string, args []string) error {
+func wrapExplicitEnvMiddleware(cleared bool) func(interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+	return func(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
+		return func(ctx context.Context, args []string) error {
+			hcChild := interp.HandlerCtx(ctx)
+			if hcChild.Env != nil {
+				if _, already := hcChild.Env.(explicitEnviron); !already {
+					var pairs []string
+					hcChild.Env.Each(func(name string, vr expand.Variable) bool {
+						if vr.Exported && vr.IsSet() && vr.Kind == expand.String {
+							pairs = append(pairs, name+"="+vr.Str)
+						}
+						return true
+					})
+					hcChild.Env = explicitEnviron{
+						Environ: hcChild.Env,
+						pairs:   pairs,
+						cleared: cleared,
+					}
+					ctx = interp.WithHandlerContext(ctx, hcChild)
+				}
+			}
+			return next(ctx, args)
+		}
+	}
+}
+
+func runExtraJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin string, args []string) error {
 	b, err := fsReadFile(ctx, hc.Dir, args[0], checkedBin)
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
@@ -447,6 +473,12 @@ func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin 
 		fmt.Fprintln(hc.Stderr, err)
 		return interp.NewExitStatus(2)
 	}
+	execHandlers := []func(interp.ExecHandlerFunc) interp.ExecHandlerFunc{trackExec, extraHandler}
+	if hc.Env != nil {
+		if ee, ok := hc.Env.(explicitEnviron); ok {
+			execHandlers = []func(interp.ExecHandlerFunc) interp.ExecHandlerFunc{wrapExplicitEnvMiddleware(ee.cleared), trackExec, extraHandler}
+		}
+	}
 	r, err := interp.New(
 		interp.Dir(hc.Dir),
 		interp.Env(expand.ListEnviron(shellExecEnv(hc)...)),
@@ -456,7 +488,7 @@ func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin 
 		interp.ReadDirHandler2(shellReadDirHandler()),
 		interp.StatHandler(shellStatHandler()),
 		interp.AccessHandler(shellAccessHandler()),
-		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ExecHandlers(execHandlers...),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
 	if err != nil {
@@ -476,7 +508,18 @@ func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin 
 // under cp1252/cp850 consoles — the classic Windows agent papercut.
 // Shell exports always win over the injected defaults.
 func shellExecEnv(hc interp.HandlerContext) []string {
-	base := os.Environ()
+	var base []string
+	explicitCleared := false
+	if hc.Env != nil {
+		if ee, ok := hc.Env.(explicitEnviron); ok {
+			base = ee.pairs
+			explicitCleared = ee.cleared
+		} else {
+			base = os.Environ()
+		}
+	} else {
+		base = os.Environ()
+	}
 	merged := make(map[string]string, len(base)+16)
 	order := make([]string, 0, len(base)+16)
 	for _, kv := range base {
@@ -488,16 +531,18 @@ func shellExecEnv(hc interp.HandlerContext) []string {
 			merged[k] = kv[i+1:]
 		}
 	}
-	hc.Env.Each(func(name string, vr expand.Variable) bool {
-		if vr.Exported && vr.IsSet() && vr.Kind == expand.String {
-			if _, ok := merged[name]; !ok {
-				order = append(order, name)
+	if hc.Env != nil {
+		hc.Env.Each(func(name string, vr expand.Variable) bool {
+			if vr.Exported && vr.IsSet() && vr.Kind == expand.String {
+				if _, ok := merged[name]; !ok {
+					order = append(order, name)
+				}
+				merged[name] = vr.Str
 			}
-			merged[name] = vr.Str
-		}
-		return true
-	})
-	if runtime.GOOS == "windows" {
+			return true
+		})
+	}
+	if runtime.GOOS == "windows" && !explicitCleared {
 		if _, ok := merged["PYTHONIOENCODING"]; !ok {
 			order = append(order, "PYTHONIOENCODING")
 			merged["PYTHONIOENCODING"] = "utf-8"
@@ -1277,8 +1322,13 @@ func pinAX(m map[string]string) {
 }
 
 func shellGetenv(hc interp.HandlerContext, key string) string {
-	if v := hc.Env.Get(key); v.IsSet() {
-		return v.Str
+	if hc.Env != nil {
+		if v := hc.Env.Get(key); v.IsSet() {
+			return v.Str
+		}
+		if _, ok := hc.Env.(explicitEnviron); ok {
+			return ""
+		}
 	}
 	return os.Getenv(key)
 }
@@ -3471,6 +3521,12 @@ func cmdPrintenv(_ context.Context, hc interp.HandlerContext, args []string) err
 // shell environment is not deliberately emptied: with `env -i` the child
 // must see nothing, so the fallback is suppressed.
 func envFallbackAllowed(hc interp.HandlerContext, name string) bool {
+	if hc.Env == nil {
+		return false
+	}
+	if _, ok := hc.Env.(explicitEnviron); ok {
+		return false
+	}
 	// If the shell has no exported variables at all, it is an emptied
 	// environment (env -i): do not resurrect anything from os.Environ.
 	saw := false

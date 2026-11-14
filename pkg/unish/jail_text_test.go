@@ -1461,3 +1461,28 @@ func TestJailSedInplaceWriteAllowedDeleteDenied(t *testing.T) {
 		}
 	}
 }
+
+func TestJailExplicitEnvNoHostSecretLeak(t *testing.T) {
+	workDir, _, jail := setupJailFixture(t)
+	t.Setenv("UNISH_HOST_SECRET_CANARY", "TOP_HOST_SECRET_777")
+
+	script := `
+env -u UNISH_HOST_SECRET_CANARY awk 'BEGIN { print "awk=" ENVIRON["UNISH_HOST_SECRET_CANARY"] }'
+env -u UNISH_HOST_SECRET_CANARY jq -rn '"jq=" + ($ENV.UNISH_HOST_SECRET_CANARY // "")'
+env -u UNISH_HOST_SECRET_CANARY printenv UNISH_HOST_SECRET_CANARY || echo "printenv=absent"
+env -u UNISH_HOST_SECRET_CANARY awk 'BEGIN { system("printenv UNISH_HOST_SECRET_CANARY || echo sub_absent") }'
+env -i KEEP_VAR=ok awk 'BEGIN { print "awk_i=" ENVIRON["KEEP_VAR"] ":" ENVIRON["UNISH_HOST_SECRET_CANARY"] }'
+env -i KEEP_VAR=ok jq -rn '"jq_i=" + ($ENV.KEEP_VAR // "") + ":" + ($ENV.UNISH_HOST_SECRET_CANARY // "")'
+`
+	out, stderr, code := runJailedShell(t, workDir, jail, nil, script)
+	if code != 0 {
+		t.Fatalf("explicitEnviron test script failed (code=%d): out=%q stderr=%q", code, out, stderr)
+	}
+	if strings.Contains(out, "TOP_HOST_SECRET_777") {
+		t.Fatalf("leaked unset/scrubbed host secret in output: %q", out)
+	}
+	want := "awk=\njq=\nprintenv=absent\nsub_absent\nawk_i=ok:\njq_i=ok:\n"
+	if out != want {
+		t.Fatalf("explicitEnviron output mismatch:\ngot:  %q\nwant: %q", out, want)
+	}
+}
