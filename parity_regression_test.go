@@ -1097,7 +1097,14 @@ func TestParityLsTimeStyle(t *testing.T) {
 		t.Errorf("ls --time-style=+HMS = %q", out)
 	}
 	out, _, _ = runParityScript(t, dir, "ls -la f.txt")
-	if !strings.Contains(out, "Sep") && !strings.Contains(out, "Jan") && !strings.Contains(out, "Oct") && !strings.Contains(out, "202") {
+	hasTimeToken := strings.Contains(out, "202")
+	for _, mon := range []string{"Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"} {
+		if strings.Contains(out, mon) {
+			hasTimeToken = true
+			break
+		}
+	}
+	if !hasTimeToken {
 		t.Errorf("ls default time = %q", out)
 	}
 }
