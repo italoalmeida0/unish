@@ -2116,6 +2116,21 @@ func sedInplace(ctx context.Context, hc interp.HandlerContext, prog []*sedCmd, q
 		}
 		outBytes := []byte(out.String())
 		targetDir := filepath.Dir(in)
+		if CapabilityHookFromContext(ctx) != nil {
+			resolvedDir := resolveHostPath(hc.Dir, targetDir)
+			if _, delErr := checkFSNoFollowLeaf(ctx, "", "sed", filepath.Join(resolvedDir, ".sed-probe"), OpDelete); delErr != nil {
+				if lfi.Mode()&os.ModeSymlink == 0 && errors.Is(delErr, os.ErrPermission) {
+					if ferr := fsWriteFile(ctx, hc.Dir, "sed", in, outBytes, perm); ferr != nil {
+						fmt.Fprintln(hc.Stderr, "sed:", ferr)
+						code = 1
+					}
+					continue
+				}
+				fmt.Fprintln(hc.Stderr, "sed:", delErr)
+				code = 1
+				continue
+			}
+		}
 		tf, err := fsCreateTemp(ctx, hc.Dir, "sed", targetDir, ".sed-*")
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "sed:", err)

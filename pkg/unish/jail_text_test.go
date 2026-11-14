@@ -20,8 +20,11 @@ import (
 )
 
 type testWorkspaceJail struct {
-	root      string
-	allowExec bool
+	root            string
+	allowExec       bool
+	allowExecInRoot bool
+	allowProc       bool
+	denyDelete      bool
 
 	mu      sync.Mutex
 	denials []AccessRequest
@@ -93,13 +96,34 @@ func (j *testWorkspaceJail) CheckAccess(_ context.Context, req AccessRequest) er
 		if j.allowExec {
 			return nil
 		}
+		if j.allowExecInRoot && isPathWithinJailRoot(req.Path, j.root) {
+			return nil
+		}
 		j.recordDenial(req)
 		return AccessDenialError{
 			Op:     OpExec,
 			Target: req.Binary,
 			Reason: "external binary execution blocked by workspace jail",
 		}
+	case OpProc:
+		if j.allowProc {
+			return nil
+		}
+		j.recordDenial(req)
+		return AccessDenialError{
+			Op:     OpProc,
+			Target: req.Command,
+			Reason: "process control blocked by workspace jail",
+		}
 	case OpRead, OpWrite, OpDelete, OpList, OpStat, OpChdir, OpLink:
+		if req.Op == OpDelete && j.denyDelete {
+			j.recordDenial(req)
+			return AccessDenialError{
+				Op:     OpDelete,
+				Target: req.RawPath,
+				Reason: "delete blocked by workspace policy",
+			}
+		}
 		if isNullDevPath(req.Path) || isNullDevPath(req.RawPath) {
 			return nil
 		}
@@ -989,5 +1013,451 @@ cat chunk_aa chunk_ab awk.txt
 	close(errCh)
 	for err := range errCh {
 		t.Error(err)
+	}
+}
+
+func writeDummyExecFile(t testing.TB, dir, baseName string) string {
+	t.Helper()
+	name := baseName
+	if runtime.GOOS == "windows" && filepath.Ext(name) == "" {
+		name += ".exe"
+	}
+	full := filepath.Join(dir, name)
+	if err := os.WriteFile(full, []byte("#!/bin/sh\necho SHOULD_NOT_EXEC\n"), 0o755); err != nil {
+		t.Fatalf("writeDummyExecFile %s: %v", full, err)
+	}
+	return full
+}
+
+func TestJailExecNoStatOracleMSYSAndENOEXEC(t *testing.T) {
+	workDir, outsideDir, jail := setupJailFixture(t)
+	jail.allowExecInRoot = true
+	outSlash := filepath.ToSlash(outsideDir)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	_ = writeDummyExecFile(t, outsideDir, "secret_exec")
+
+	// 1. Explicit outside paths (existing exec, non-exec file, directory, nonexistent, MSYS)
+	// MUST all hit checkExec FIRST and return 126 with OpExec denial (never 127 or os.Stat oracle).
+	explicitTargets := []string{
+		outSlash + "/secret_exec",
+		outSlash + "/nonexistent_secret_probe",
+		outSlash + "/secret.txt",
+		outSlash,
+		filepath.ToSlash(exe),
+	}
+	if runtime.GOOS == "windows" && len(outsideDir) >= 3 && outsideDir[1] == ':' {
+		drive := strings.ToLower(outsideDir[:1])
+		tail := strings.ReplaceAll(outsideDir[2:], `\`, "/")
+		explicitTargets = append(explicitTargets, "/"+drive+tail+"/nonexistent_msys_probe")
+		explicitTargets = append(explicitTargets, "/"+drive+tail+"/secret.txt")
+	}
+
+	for _, target := range explicitTargets {
+		jail.resetDenials()
+		_, stderr, code := runJailedShell(t, workDir, jail, nil, fmt.Sprintf(`%q`, target))
+		if code != 126 {
+			t.Fatalf("explicit outside exec %q: expected 126 (no stat oracle), got %d (stderr=%q)", target, code, stderr)
+		}
+		if !jail.hasDeniedOp(OpExec) {
+			t.Fatalf("explicit outside exec %q: expected OpExec denial, got %+v", target, jail.snapshotDenials())
+		}
+		if jail.hasDeniedOp(OpStat) {
+			t.Fatalf("explicit outside exec %q: unexpected OpStat before checkExec: %+v", target, jail.snapshotDenials())
+		}
+	}
+
+	// 2. Bare command lookup must ONLY use fsStat on $PATH (never raw LookPathDir)
+	// and must not execute <hc.Dir>/<bare> when not found on $PATH.
+	_ = writeDummyExecFile(t, workDir, "cwd_only_bin")
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// With OpExec allowed globally, bare command not on $PATH returns 127 ("command not found")
+	// even if a file of that name exists in hc.Dir.
+	jailAllowAllExec := newTestWorkspaceJail(t, workDir)
+	jailAllowAllExec.allowExec = true
+	out, stderr, code := runJailedShell(t, workDir, jailAllowAllExec, []string{"PATH=" + binDir}, `cwd_only_bin`)
+	if code != 127 || strings.Contains(out, "SHOULD_NOT_EXEC") {
+		t.Fatalf("bare command not on PATH: expected 127, got %d (out=%q stderr=%q)", code, out, stderr)
+	}
+
+	// With PATH pointing outside, bare lookup records OpStat denial on outsideDir and never leaks/executes.
+	jailAllowAllExec.resetDenials()
+	out, _, code = runJailedShell(t, workDir, jailAllowAllExec, []string{"PATH=" + outsideDir}, `secret_exec`)
+	if code != 127 || strings.Contains(out, "SHOULD_NOT_EXEC") || !jailAllowAllExec.hasDeniedOp(OpStat) {
+		t.Fatalf("bare command on outside PATH: expected 127 + OpStat denial, got code=%d out=%q denials=%+v", code, out, jailAllowAllExec.snapshotDenials())
+	}
+
+	// With OpExec denied by jail, unknown bare command returns 126 with OpExec denial.
+	jailDenyExec := newTestWorkspaceJail(t, workDir)
+	_, _, code = runJailedShell(t, workDir, jailDenyExec, []string{"PATH=" + binDir}, `nonexistent_bare_xyz`)
+	if code != 126 || !jailDenyExec.hasDeniedOp(OpExec) {
+		t.Fatalf("bare command with OpExec denied: expected 126 + OpExec denial, got code=%d denials=%+v", code, jailDenyExec.snapshotDenials())
+	}
+
+	// 3. Unix ENOEXEC shebang-less +x script inside allowed root must run in a jailed sub-runner.
+	if runtime.GOOS != "windows" {
+		noShebang := filepath.Join(binDir, "noshebang_script")
+		scriptBody := fmt.Sprintf(
+			"echo \"arg1=$1\"\necho %s/*\ncat %q 2>/dev/null || echo \"cat_blocked\"\n",
+			outSlash, outSlash+"/secret.txt",
+		)
+		if err := os.WriteFile(noShebang, []byte(scriptBody), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		jail.resetDenials()
+		out, stderr, code := runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `noshebang_script world`)
+		if code != 0 {
+			t.Fatalf("jailed ENOEXEC script failed (code=%d): out=%q stderr=%q", code, out, stderr)
+		}
+		if strings.Contains(out, "TOP_SECRET_CANARY") || strings.Contains(out, "secret.txt") {
+			t.Fatalf("jailed ENOEXEC sub-runner leaked outside info: %q", out)
+		}
+		if !strings.Contains(out, "arg1=world\n") || !strings.Contains(out, outSlash+"/*\n") || !strings.Contains(out, "cat_blocked\n") {
+			t.Fatalf("unexpected jailed ENOEXEC output: %q", out)
+		}
+		if !jail.hasDeniedOp(OpList) || !jail.hasDeniedOp(OpRead) {
+			t.Fatalf("expected OpList and OpRead denials from jailed ENOEXEC sub-runner, got %+v", jail.snapshotDenials())
+		}
+	}
+}
+
+func TestJailCompgenAndPwd(t *testing.T) {
+	workDir, outsideDir, jail := setupJailFixture(t)
+	_ = writeDummyExecFile(t, outsideDir, "secret_outside_tool")
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = writeDummyExecFile(t, binDir, "allowed_inside_tool")
+
+	// 1. compgen / compgen -c / compgen -A command must not read outside $PATH dirs.
+	for _, cmd := range []string{`compgen`, `compgen -c`, `compgen -A command`} {
+		jail.resetDenials()
+		out, stderr, code := runJailedShell(t, workDir, jail, []string{"PATH=" + outsideDir}, cmd)
+		if code != 0 {
+			t.Fatalf("%s failed (code=%d): stderr=%q", cmd, code, stderr)
+		}
+		if strings.Contains(out, "secret_outside_tool") || strings.Contains(out, "secret.txt") || strings.Contains(out, "evil.sh") {
+			t.Fatalf("%s leaked outside PATH filenames: %q", cmd, out)
+		}
+		if !strings.Contains(out, "echo\n") || !strings.Contains(out, "grep\n") {
+			t.Fatalf("%s missing expected builtins/extras: %q", cmd, out)
+		}
+		if !jail.hasDeniedOp(OpList) {
+			t.Fatalf("%s did not record OpList denial on outside PATH: %+v", cmd, jail.snapshotDenials())
+		}
+	}
+
+	// Allowed inside-jail PATH directory works in compgen -c.
+	jail.resetDenials()
+	out, stderr, code := runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `compgen -c allowed_inside_`)
+	if code != 0 || strings.TrimSpace(out) != "allowed_inside_tool" {
+		t.Fatalf("compgen -c inside PATH failed: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+	// In-memory compgen actions (-b, -A function) work cleanly.
+	out, stderr, code = runJailedShell(t, workDir, jail, nil, `my_jail_fn() { :; }; compgen -b true; compgen -A function my_jail_`)
+	if code != 0 || out != "true\nmy_jail_fn\n" {
+		t.Fatalf("in-memory compgen failed: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+
+	// 2. pwd / pwd -P with forged outside $PWD or outside symlink must never leak outside target.
+	realWork, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		realWork = filepath.Clean(workDir)
+	}
+	for _, cmd := range []string{`pwd`, `pwd -P`, `builtin pwd -P`, `command pwd -P`} {
+		jail.resetDenials()
+		script := fmt.Sprintf(`PWD=%q; %s`, filepath.ToSlash(outsideDir), cmd)
+		out, stderr, code := runJailedShell(t, workDir, jail, nil, script)
+		if code != 0 {
+			t.Fatalf("%s failed (code=%d): stderr=%q", cmd, code, stderr)
+		}
+		got := filepath.Clean(strings.TrimSpace(out))
+		if strings.Contains(strings.ToLower(got), "outside") {
+			t.Fatalf("%s leaked forged outside PWD: %q", cmd, got)
+		}
+		if got != filepath.Clean(workDir) && got != filepath.Clean(realWork) {
+			t.Fatalf("%s unexpected output %q (want %q or %q)", cmd, got, workDir, realWork)
+		}
+	}
+
+	secretRealDir := filepath.Join(outsideDir, "real_secret_target_dir")
+	if err := os.MkdirAll(secretRealDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	outsideSym := filepath.Join(outsideDir, "forged_pwd_link")
+	if err := os.Symlink(secretRealDir, outsideSym); err == nil {
+		symSlash := filepath.ToSlash(outsideSym)
+		jail.resetDenials()
+		out, _, code := runJailedShell(t, workDir, jail, nil, fmt.Sprintf(`PWD=%q; pwd -P`, symSlash))
+		if code != 0 || strings.Contains(out, "real_secret_target_dir") || strings.Contains(out, "outside") {
+			t.Fatalf("pwd -P leaked outside symlink target: code=%d out=%q", code, out)
+		}
+		jail.resetDenials()
+		out, _, code = runJailedShell(t, workDir, jail, nil, fmt.Sprintf(`PWD=%q; pwd`, symSlash))
+		if code != 0 || strings.Contains(out, "real_secret_target_dir") || strings.Contains(out, "forged_pwd_link") || !jail.hasDeniedOp(OpStat) {
+			t.Fatalf("pwd -L leaked forged outside symlink: code=%d out=%q denials=%+v", code, out, jail.snapshotDenials())
+		}
+	}
+}
+
+func TestJailCommandVTypeAndHash(t *testing.T) {
+	workDir, outsideDir, jail := setupJailFixture(t)
+	outsideBin := writeDummyExecFile(t, outsideDir, "secret_bin")
+	outsideBinSlash := filepath.ToSlash(outsideBin)
+
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_ = writeDummyExecFile(t, binDir, "local_bin")
+
+	outsideProbes := []string{
+		`command -v secret_bin`,
+		`command -V secret_bin`,
+		fmt.Sprintf(`command -v %q`, outsideBinSlash),
+		fmt.Sprintf(`command -V %q`, outsideBinSlash),
+		`type secret_bin`,
+		`type -t secret_bin`,
+		`type -p secret_bin`,
+		`type -P secret_bin`,
+		fmt.Sprintf(`type -P %q`, outsideBinSlash),
+		`hash secret_bin`,
+	}
+	for _, cmd := range outsideProbes {
+		jail.resetDenials()
+		out, _, code := runJailedShell(t, workDir, jail, []string{"PATH=" + outsideDir}, cmd)
+		if code == 0 {
+			t.Fatalf("%s unexpectedly exited 0 (out=%q)", cmd, out)
+		}
+		if out != "" {
+			t.Fatalf("%s leaked path on stdout: %q", cmd, out)
+		}
+		if !jail.hasDeniedOp(OpStat) {
+			t.Fatalf("%s did not record OpStat denial: %+v", cmd, jail.snapshotDenials())
+		}
+	}
+
+	// Process-global globalHash must neither leak into nor be mutated by jailed sessions.
+	hashRecord("host_cached_secret", outsideBin)
+	defer func() {
+		globalHash.mu.Lock()
+		delete(globalHash.entries, "host_cached_secret")
+		globalHash.mu.Unlock()
+	}()
+
+	out, _, code := runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `hash`)
+	if code != 0 || out != "hash: hash table empty\n" {
+		t.Fatalf("jailed hash leaked globalHash: code=%d out=%q", code, out)
+	}
+	_, _, code = runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `type host_cached_secret`)
+	if code == 0 {
+		t.Fatalf("jailed type leaked host_cached_secret from globalHash")
+	}
+	_, _, _ = runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `hash -r; hash -d host_cached_secret`)
+	globalHash.mu.Lock()
+	hostEntry, hostOK := globalHash.entries["host_cached_secret"]
+	globalHash.mu.Unlock()
+	if !hostOK || hostEntry.path != outsideBin {
+		t.Fatalf("jailed hash -r/-d mutated host globalHash: ok=%v entry=%+v", hostOK, hostEntry)
+	}
+
+	// Allowed inside-jail lookups work without polluting host globalHash.
+	jail.resetDenials()
+	out, stderr, code := runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `
+command -v local_bin >/dev/null
+command -V grep
+type -t grep
+type -P local_bin >/dev/null
+hash local_bin
+`)
+	if code != 0 {
+		t.Fatalf("inside-jail command/type/hash failed (code=%d): stderr=%q", code, stderr)
+	}
+	if out != "grep is a unish builtin\nbuiltin\n" {
+		t.Fatalf("unexpected inside-jail command/type output: %q", out)
+	}
+	globalHash.mu.Lock()
+	_, polluted := globalHash.entries["local_bin"]
+	if polluted {
+		delete(globalHash.entries, "local_bin")
+	}
+	globalHash.mu.Unlock()
+	if polluted {
+		t.Fatalf("jailed hash local_bin polluted process-global globalHash")
+	}
+}
+
+func TestJailSourcePathOracleAndPushdPopdStack(t *testing.T) {
+	workDir, outsideDir, jail := setupJailFixture(t)
+
+	// 1. source / . with bare name and outside $PATH must check $PATH via fsStat (OpStat denied)
+	// and fall back to <hc.Dir>/<name>, giving no existence oracle on outside files.
+	jail.resetDenials()
+	_, errExisting, codeExisting := runJailedShell(t, workDir, jail, []string{"PATH=" + outsideDir}, `source secret.txt`)
+	if codeExisting == 0 || !jail.hasDeniedOp(OpStat) {
+		t.Fatalf("PATH=outside source secret.txt expected non-zero + OpStat denial: code=%d denials=%+v", codeExisting, jail.snapshotDenials())
+	}
+
+	jail.resetDenials()
+	_, errMissing, codeMissing := runJailedShell(t, workDir, jail, []string{"PATH=" + outsideDir}, `source definitely_absent_999.txt`)
+	if codeMissing == 0 || !jail.hasDeniedOp(OpStat) {
+		t.Fatalf("PATH=outside source missing expected non-zero + OpStat denial: code=%d denials=%+v", codeMissing, jail.snapshotDenials())
+	}
+	if strings.Contains(strings.ToLower(errExisting), "permission denied") || strings.Contains(strings.ToLower(errExisting), "outside") {
+		t.Fatalf("PATH=outside source secret.txt leaked outside existence via error message: %q", errExisting)
+	}
+	if codeExisting != codeMissing {
+		t.Fatalf("source exit code oracle: existing=%d vs missing=%d (err1=%q err2=%q)", codeExisting, codeMissing, errExisting, errMissing)
+	}
+
+	// Verify in-shell source semantics (caller vars, positional params, return) remain intact.
+	binDir := filepath.Join(workDir, "bin")
+	if err := os.MkdirAll(binDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(binDir, "sourced_mod.sh"), []byte("MOD_OUT=\"$1:$2\"\nreturn 7\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	jail.resetDenials()
+	out, stderr, code := runJailedShell(t, workDir, jail, []string{"PATH=" + binDir}, `
+set -- orig1 orig2
+source sourced_mod.sh alpha beta
+rc=$?
+echo "rc=$rc mod=$MOD_OUT orig=$1:$2"
+`)
+	if code != 0 || out != "rc=7 mod=alpha:beta orig=orig1:orig2\n" {
+		t.Fatalf("in-shell source semantics broken: code=%d out=%q stderr=%q", code, out, stderr)
+	}
+
+	// 2. pushd -n ../.. inside sub/a/b followed by cd ../.. && popd must NOT escape workDir!
+	realWork, err := filepath.EvalSymlinks(workDir)
+	if err != nil {
+		realWork = filepath.Clean(workDir)
+	}
+	jail.resetDenials()
+	out, stderr, code = runJailedShell(t, workDir, jail, nil, `
+mkdir -p a/b && cd a/b && pushd -n ../.. >/dev/null && cd ../.. && popd >/dev/null && pwd -P
+`)
+	if code != 0 {
+		t.Fatalf("pushd -n ../.. -> popd sequence failed (code=%d): stderr=%q", code, stderr)
+	}
+	gotPwd := filepath.Clean(strings.TrimSpace(out))
+	if gotPwd != filepath.Clean(realWork) && gotPwd != filepath.Clean(workDir) {
+		t.Fatalf("pushd -n ../.. -> popd escaped workspace! got pwd=%q, want %q", gotPwd, realWork)
+	}
+}
+
+func TestJailUlimitUmaskAndHistoryIsolation(t *testing.T) {
+	workDir, outsideDir, jail := setupJailFixture(t)
+	outSlash := filepath.ToSlash(outsideDir)
+
+	origUmask := shellUmask.Load()
+	origNofile, origNofileErr := ulimitNofile()
+
+	// 1. Read-only ulimit and umask succeed inside jail.
+	jail.resetDenials()
+	out, stderr, code := runJailedShell(t, workDir, jail, nil, `ulimit; ulimit -n >/dev/null; ulimit -a >/dev/null; umask; umask -S; umask -p`)
+	if code != 0 {
+		t.Fatalf("read-only ulimit/umask failed in jail (code=%d): out=%q stderr=%q", code, out, stderr)
+	}
+
+	// 2. Setting ulimit or umask is blocked (exit 1 + OpProc denial) and never mutates host state.
+	jail.resetDenials()
+	_, _, code = runJailedShell(t, workDir, jail, nil, `ulimit -n 8`)
+	if code == 0 || !jail.hasDeniedOp(OpProc) {
+		t.Fatalf("jailed ulimit -n 8 should fail with OpProc denial: code=%d denials=%+v", code, jail.snapshotDenials())
+	}
+	jail.resetDenials()
+	_, _, code = runJailedShell(t, workDir, jail, nil, `umask 0777`)
+	if code == 0 || !jail.hasDeniedOp(OpProc) {
+		t.Fatalf("jailed umask 0777 should fail with OpProc denial: code=%d denials=%+v", code, jail.snapshotDenials())
+	}
+
+	// Even if a hook permits OpProc, jailed mode must NEVER mutate host RLIMIT_NOFILE or shellUmask.
+	jailAllowProc := newTestWorkspaceJail(t, workDir)
+	jailAllowProc.allowProc = true
+	if _, _, code = runJailedShell(t, workDir, jailAllowProc, nil, `ulimit -n 8`); code == 0 {
+		t.Fatalf("jailed ulimit -n 8 succeeded even though host process limits must be protected")
+	}
+	if _, _, code = runJailedShell(t, workDir, jailAllowProc, nil, `umask 0777`); code == 0 {
+		t.Fatalf("jailed umask 0777 succeeded even though host process umask must be protected")
+	}
+
+	if gotUmask := shellUmask.Load(); gotUmask != origUmask {
+		t.Fatalf("host shellUmask mutated: got %04o, want %04o", gotUmask, origUmask)
+	}
+	if origNofileErr == nil {
+		if gotNofile, err := ulimitNofile(); err == nil && gotNofile != origNofile {
+			t.Fatalf("host RLIMIT_NOFILE mutated: got %d, want %d", gotNofile, origNofile)
+		}
+	}
+
+	// 3. Jailed history is isolated from replHist and enforces OpRead/OpWrite on file flags.
+	jail.resetDenials()
+	if _, _, code = runJailedShell(t, workDir, jail, nil, fmt.Sprintf(`history -r %q`, outSlash+"/secret.txt")); code == 0 || !jail.hasDeniedOp(OpRead) {
+		t.Fatalf("history -r outside not blocked: code=%d denials=%+v", code, jail.snapshotDenials())
+	}
+	jail.resetDenials()
+	if _, _, code = runJailedShell(t, workDir, jail, nil, fmt.Sprintf(`history -w %q`, outSlash+"/hist_w.txt")); code == 0 || !jail.hasDeniedOp(OpWrite) {
+		t.Fatalf("history -w outside not blocked: code=%d denials=%+v", code, jail.snapshotDenials())
+	}
+	jail.resetDenials()
+	if _, _, code = runJailedShell(t, workDir, jail, []string{"HISTFILE=" + filepath.Join(outsideDir, "hist_a.txt")}, `history -a`); code == 0 || !jail.hasDeniedOp(OpWrite) {
+		t.Fatalf("history -a outside HISTFILE not blocked: code=%d denials=%+v", code, jail.snapshotDenials())
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "hist_w.txt")); !os.IsNotExist(err) {
+		t.Fatalf("history -w created outside file")
+	}
+	if _, err := os.Stat(filepath.Join(outsideDir, "hist_a.txt")); !os.IsNotExist(err) {
+		t.Fatalf("history -a created outside file")
+	}
+
+	// Inside-jail history file operations succeed cleanly.
+	jail.resetDenials()
+	if _, stderr, code = runJailedShell(t, workDir, jail, nil, `history -w sub/hist.txt && history -a sub/hist.txt && history -r sub/hist.txt`); code != 0 {
+		t.Fatalf("inside-jail history failed (code=%d): stderr=%q", code, stderr)
+	}
+}
+
+func TestJailSedInplaceWriteAllowedDeleteDenied(t *testing.T) {
+	workDir, _, _ := setupJailFixture(t)
+	jailNoDelete := newTestWorkspaceJail(t, workDir)
+	jailNoDelete.denyDelete = true
+
+	target := filepath.Join(workDir, "inplace_nodelete.txt")
+	if err := os.WriteFile(target, []byte("before_val\nsecond_line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, stderr, code := runJailedShell(t, workDir, jailNoDelete, nil, `sed -i 's/before_val/after_val/' inplace_nodelete.txt`)
+	if code != 0 {
+		t.Fatalf("sed -i with OpWrite allowed and OpDelete denied failed (code=%d): stderr=%q", code, stderr)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "after_val\nsecond_line\n" {
+		t.Fatalf("sed -i direct write content mismatch: got %q", string(got))
+	}
+	if !jailNoDelete.hasDeniedOp(OpDelete) {
+		t.Fatalf("expected OpDelete probe denial recorded, got %+v", jailNoDelete.snapshotDenials())
+	}
+
+	entries, err := os.ReadDir(workDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".sed-") {
+			t.Fatalf("orphan sed temp file left behind when OpDelete denied: %s", e.Name())
+		}
 	}
 }

@@ -1,6 +1,7 @@
 package unish
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"flag"
@@ -12,10 +13,12 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"golang.org/x/term"
@@ -300,29 +303,105 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	if interp.IsBuiltin(args[0]) || lookupExtra(args[0]) != nil {
 		return nil, false
 	}
-	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
-	if err != nil {
-		return nil, false
-	}
-	checkedBin, err := checkExec(ctx, args[0], path, args, hc.Dir)
-	if err != nil {
-		hc.ReportBgStart(0)
-		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
-		return interp.NewExitStatus(126), true
-	}
-	cmd := exec.CommandContext(ctx, checkedBin, args[1:]...)
-	cmd.Dir = hc.Dir
-	cmd.Stdin = hc.Stdin
-	cmd.Stdout = hc.Stdout
-	cmd.Stderr = hc.Stderr
-	// Exported shell variables, like the default handler.
-	cmd.Env = shellExecEnv(hc)
-	afterStart, afterWait := interp.PrepareExecStdio(cmd)
-	if err := cmd.Start(); err != nil {
-		afterWait()
-		if CapabilityHookFromContext(ctx) != nil {
+
+	jailed := CapabilityHookFromContext(ctx) != nil
+	var path string
+	var checkedBin string
+	if jailed {
+		isExplicit := strings.ContainsAny(args[0], `/\`) || (runtime.GOOS == "windows" && isRawAbsOrMSYS(args[0]))
+		if isExplicit {
+			var err error
+			checkedBin, err = checkExec(ctx, args[0], args[0], args, hc.Dir)
+			if err != nil {
+				hc.ReportBgStart(0)
+				fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+				return interp.NewExitStatus(126), true
+			}
+			fi, serr := os.Stat(checkedBin)
+			if serr != nil {
+				hc.ReportBgStart(0)
+				fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], serr)
+				if os.IsNotExist(serr) {
+					return interp.NewExitStatus(127), true
+				}
+				return interp.NewExitStatus(126), true
+			}
+			if fi.IsDir() {
+				hc.ReportBgStart(0)
+				fmt.Fprintf(hc.Stderr, "%s: is a directory\n", args[0])
+				return interp.NewExitStatus(126), true
+			}
+			if runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
+				hc.ReportBgStart(0)
+				fmt.Fprintf(hc.Stderr, "%s: permission denied\n", args[0])
+				return interp.NewExitStatus(126), true
+			}
+			path = checkedBin
+		} else {
+			cand, ferr := findExecCtx(ctx, hc, args[0])
+			if ferr != nil {
+				_, cerr := checkExec(ctx, args[0], args[0], args, hc.Dir)
+				hc.ReportBgStart(0)
+				if cerr != nil && errors.Is(cerr, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
+					return interp.NewExitStatus(126), true
+				}
+				fmt.Fprintf(hc.Stderr, "%s: command not found\n", args[0])
+				return interp.NewExitStatus(127), true
+			}
+			var err error
+			checkedBin, err = checkExec(ctx, args[0], cand, args, hc.Dir)
+			if err != nil {
+				hc.ReportBgStart(0)
+				fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+				return interp.NewExitStatus(126), true
+			}
+			path = checkedBin
+		}
+	} else {
+		var err error
+		path, err = interp.LookPathDir(hc.Dir, hc.Env, args[0])
+		if err != nil {
+			return nil, false
+		}
+		checkedBin, err = checkExec(ctx, args[0], path, args, hc.Dir)
+		if err != nil {
 			hc.ReportBgStart(0)
 			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+			return interp.NewExitStatus(126), true
+		}
+	}
+
+	newCmd := func() (*exec.Cmd, func(), func()) {
+		c := exec.CommandContext(ctx, checkedBin, args[1:]...)
+		c.Dir = hc.Dir
+		c.Stdin = hc.Stdin
+		c.Stdout = hc.Stdout
+		c.Stderr = hc.Stderr
+		// Exported shell variables, like the default handler.
+		c.Env = shellExecEnv(hc)
+		as, aw := interp.PrepareExecStdio(c)
+		return c, as, aw
+	}
+	cmd, afterStart, afterWait := newCmd()
+	err := cmd.Start()
+	for delay := time.Millisecond; runtime.GOOS != "windows" && errors.Is(err, syscall.ETXTBSY) && delay < 300*time.Millisecond; delay *= 2 {
+		afterWait()
+		time.Sleep(delay)
+		cmd, afterStart, afterWait = newCmd()
+		err = cmd.Start()
+	}
+	if err != nil {
+		afterWait()
+		if jailed {
+			hc.ReportBgStart(0)
+			if runtime.GOOS != "windows" && errors.Is(err, syscall.ENOEXEC) {
+				return runJailedENOEXEC(ctx, hc, checkedBin, args), true
+			}
+			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+			if os.IsNotExist(err) {
+				return interp.NewExitStatus(127), true
+			}
 			return interp.NewExitStatus(126), true
 		}
 		return nil, false
@@ -334,7 +413,9 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	// contract for reportBgStart.
 	hc.ReportBgStart(cmd.Process.Pid)
 	j := globalJobs.track(cmd, args)
-	hashRecord(args[0], path)
+	if !jailed {
+		hashRecord(args[0], path)
+	}
 	// Wait synchronously (foreground). Background statements run this
 	// whole handler in a goroutine already, so no extra work needed.
 	<-j.done
@@ -348,6 +429,41 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 		return j.err, true
 	}
 	return nil, true
+}
+
+func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin string, args []string) error {
+	b, err := fsReadFile(ctx, hc.Dir, args[0], checkedBin)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+		return interp.NewExitStatus(126)
+	}
+	line, _, _ := bytes.Cut(b, []byte("\n"))
+	if bytes.IndexByte(line, 0) >= 0 {
+		fmt.Fprintf(hc.Stderr, "%s: cannot execute binary file\n", args[0])
+		return interp.NewExitStatus(126)
+	}
+	file, err := syntax.NewParser().Parse(bytes.NewReader(b), args[0])
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, err)
+		return interp.NewExitStatus(2)
+	}
+	r, err := interp.New(
+		interp.Dir(hc.Dir),
+		interp.Env(expand.ListEnviron(shellExecEnv(hc)...)),
+		interp.StdIO(hc.Stdin, hc.Stdout, hc.Stderr),
+		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
+		interp.ReadDirHandler2(shellReadDirHandler()),
+		interp.StatHandler(shellStatHandler()),
+		interp.AccessHandler(shellAccessHandler()),
+		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ProcSubstHandler(procSubstHandler),
+	)
+	if err != nil {
+		return err
+	}
+	r.Params = slices.Clone(args[1:])
+	return r.Run(ctx, file)
 }
 
 // shellExecEnv builds the environment for external processes from the
@@ -583,7 +699,7 @@ func isOverriddenCall(name string) bool {
 		if name == "printf" {
 			return true
 		}
-		return hasActiveCapabilityHooks.Load() && (name == "pushd" || name == "popd")
+		return hasActiveCapabilityHooks.Load() && (name == "pushd" || name == "popd" || name == "pwd")
 	case 'u':
 		return name == "umask" || name == "ulimit"
 	case 'k':
@@ -595,9 +711,13 @@ func isOverriddenCall(name string) bool {
 	case 'w':
 		return name == "wait"
 	case 'c':
-		return hasActiveCapabilityHooks.Load() && (name == "cd" || name == "command")
+		return hasActiveCapabilityHooks.Load() && (name == "cd" || name == "command" || name == "compgen")
 	case 'b':
 		return hasActiveCapabilityHooks.Load() && name == "builtin"
+	case 's':
+		return hasActiveCapabilityHooks.Load() && name == "source"
+	case '.':
+		return hasActiveCapabilityHooks.Load() && name == "."
 	}
 	return false
 }
@@ -684,17 +804,17 @@ func checkJailedDirBuiltin(ctx context.Context, hc interp.HandlerContext, args [
 		}
 		rest := args[i:]
 		if len(rest) == 1 && rest[0] != "" {
-			if _, err := checkChdir(ctx, hc.Dir, "pushd", rest[0]); err != nil {
+			checkedDir, err := checkChdir(ctx, hc.Dir, "pushd", rest[0])
+			if err != nil {
 				fmt.Fprintf(hc.Stderr, "pushd: %v\n", err)
 				return nil, interp.CallHandled(1)
 			}
-			if runtime.GOOS == "windows" && isRawAbsOrMSYS(rest[0]) {
-				resolved := resolveHostPath(hc.Dir, rest[0])
-				if noChange {
-					return []string{"pushd", "-n", resolved}, nil
-				}
-				return []string{"pushd", resolved}, nil
+			// Always rewrite to canonical absolute path so r.dirStack never stores
+			// relative entries like "../.." that popd would later evaluate elsewhere.
+			if noChange {
+				return []string{"pushd", "-n", checkedDir}, nil
 			}
+			return []string{"pushd", checkedDir}, nil
 		}
 		return args, nil
 	}
@@ -722,6 +842,21 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 			return args, nil
 		}
 		return checkJailedDirBuiltin(ctx, hc, args)
+	case "pwd":
+		if CapabilityHookFromContext(ctx) == nil {
+			return args, nil
+		}
+		return nil, cmdPwdJailed(ctx, hc, args)
+	case "compgen":
+		if CapabilityHookFromContext(ctx) == nil {
+			return args, nil
+		}
+		return handleCompgenJailed(ctx, hc, args)
+	case "source", ".":
+		if CapabilityHookFromContext(ctx) == nil {
+			return args, nil
+		}
+		return resolveJailedSourceArgs(ctx, hc, args)
 	case "builtin":
 		if CapabilityHookFromContext(ctx) == nil || len(args) < 2 {
 			return args, nil
@@ -744,7 +879,7 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		if CapabilityHookFromContext(ctx) == nil || len(args) < 2 {
 			return args, nil
 		}
-		show := false
+		showMode := byte(0) // 'v' or 'V'
 		i := 1
 		for i < len(args) {
 			a := args[i]
@@ -756,8 +891,13 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 				break
 			}
 			for j := 1; j < len(a); j++ {
-				if a[j] == 'v' || a[j] == 'V' {
-					show = true
+				switch a[j] {
+				case 'v', 'V':
+					showMode = a[j]
+				case 'p':
+				default:
+					fmt.Fprintf(hc.Stderr, "command: invalid option %q\n", a)
+					return nil, interp.CallHandled(2)
 				}
 			}
 			i++
@@ -765,45 +905,8 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		if i >= len(args) {
 			return args, nil
 		}
-		if show {
-			// Gate slash-containing path probes (e.g. `command -v /outside/bin`).
-			allOK := true
-			printed := false
-			hasSlash := false
-			for _, q := range args[i:] {
-				if strings.ContainsAny(q, `/\`) {
-					hasSlash = true
-					break
-				}
-			}
-			if !hasSlash {
-				return args, nil
-			}
-			for _, q := range args[i:] {
-				if strings.ContainsAny(q, `/\`) {
-					if fi, err := fsStat(ctx, hc.Dir, "command", q); err == nil && !fi.IsDir() && (runtime.GOOS == "windows" || fi.Mode()&0o111 != 0) {
-						fmt.Fprintln(hc.Stdout, resolveHostPath(hc.Dir, q))
-						printed = true
-					} else {
-						allOK = false
-					}
-					continue
-				}
-				if hc.HasFunc(q) || interp.IsBuiltin(q) || lookupExtra(q) != nil {
-					fmt.Fprintln(hc.Stdout, q)
-					printed = true
-				} else if p, err := findExecCtx(ctx, hc, q); err == nil {
-					fmt.Fprintln(hc.Stdout, p)
-					printed = true
-				} else {
-					allOK = false
-				}
-			}
-			_ = printed
-			if !allOK {
-				return nil, interp.CallHandled(1)
-			}
-			return nil, interp.CallHandled(0)
+		if showMode != 0 {
+			return nil, cmdCommandShowJailed(ctx, hc, showMode == 'V', args[i:])
 		}
 		sub := args[i:]
 		if interp.IsBuiltin(sub[0]) && isOverriddenCall(sub[0]) {
@@ -837,21 +940,57 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		return nil, interp.CallHandled(0)
 	case "umask":
+		if CapabilityHookFromContext(ctx) != nil {
+			if err := cmdUmaskJailed(ctx, hc, args); err != nil {
+				if err == flag.ErrHelp {
+					return nil, interp.CallHandled(2)
+				}
+				return nil, interp.CallHandled(1)
+			}
+			return nil, interp.CallHandled(0)
+		}
 		if err := cmdUmask(ctx, hc, args); err != nil {
 			return nil, interp.CallHandled(1)
 		}
 		return nil, interp.CallHandled(0)
 	case "ulimit":
+		if CapabilityHookFromContext(ctx) != nil {
+			if err := cmdUlimitJailed(ctx, hc, args); err != nil {
+				if err == flag.ErrHelp {
+					return nil, interp.CallHandled(2)
+				}
+				return nil, interp.CallHandled(1)
+			}
+			return nil, interp.CallHandled(0)
+		}
 		if err := cmdUlimit(ctx, hc, args); err != nil {
 			return nil, interp.CallHandled(1)
 		}
 		return nil, interp.CallHandled(0)
 	case "hash":
+		if CapabilityHookFromContext(ctx) != nil {
+			if err := cmdHashTableJailed(ctx, hc, args); err != nil {
+				if err == flag.ErrHelp {
+					return nil, interp.CallHandled(2)
+				}
+				return nil, interp.CallHandled(1)
+			}
+			return nil, interp.CallHandled(0)
+		}
 		if err := cmdHashTable(ctx, hc, args); err != nil {
 			return nil, interp.CallHandled(1)
 		}
 		return nil, interp.CallHandled(0)
 	case "type":
+		if CapabilityHookFromContext(ctx) != nil {
+			if err := cmdTypeDescJailed(ctx, hc, args); err != nil {
+				if err == flag.ErrHelp {
+					return nil, interp.CallHandled(2)
+				}
+				return nil, interp.CallHandled(1)
+			}
+			return nil, interp.CallHandled(0)
+		}
 		if err := cmdTypeDesc(ctx, hc, args); err != nil {
 			return nil, interp.CallHandled(1)
 		}
@@ -862,6 +1001,12 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		return nil, interp.CallHandled(0)
 	case "history":
+		if CapabilityHookFromContext(ctx) != nil {
+			if err := cmdHistoryJailed(ctx, hc, args); err != nil {
+				return nil, interp.CallHandled(1)
+			}
+			return nil, interp.CallHandled(0)
+		}
 		if err := cmdHistory(ctx, hc, args); err != nil {
 			return nil, interp.CallHandled(1)
 		}
@@ -2546,7 +2691,7 @@ func findExec(hc interp.HandlerContext, name string) (string, error) {
 }
 
 func findExecCtx(ctx context.Context, hc interp.HandlerContext, name string) (string, error) {
-	if strings.ContainsAny(name, `/\`) {
+	if strings.ContainsAny(name, `/\`) || (runtime.GOOS == "windows" && isRawAbsOrMSYS(name)) {
 		fi, err := fsStat(ctx, hc.Dir, "which", name)
 		if err != nil {
 			return "", err
@@ -2563,14 +2708,20 @@ func findExecCtx(ctx context.Context, hc interp.HandlerContext, name string) (st
 		}
 		return abs, nil
 	}
-	path := shellGetenv(hc, "PATH")
+	jailed := CapabilityHookFromContext(ctx) != nil
+	var path string
+	if jailed {
+		path = hc.Env.Get("PATH").String()
+	} else {
+		path = shellGetenv(hc, "PATH")
+	}
 	for _, dir := range strings.Split(path, string(os.PathListSeparator)) {
 		if dir == "" {
 			continue
 		}
-		for _, cand := range execCandidates(dir, name) {
+		for _, cand := range execCandidatesEnv(hc, jailed, dir, name) {
 			if fi, err := fsStat(ctx, hc.Dir, "which", cand); err == nil && !fi.IsDir() && (runtime.GOOS == "windows" || fi.Mode()&0o111 != 0) {
-				return cand, nil
+				return resolveHostPath(hc.Dir, cand), nil
 			}
 		}
 	}
@@ -2578,9 +2729,26 @@ func findExecCtx(ctx context.Context, hc interp.HandlerContext, name string) (st
 }
 
 func execCandidates(dir, name string) []string {
+	return execCandidatesEnv(interp.HandlerContext{}, false, dir, name)
+}
+
+func execCandidatesEnv(hc interp.HandlerContext, jailed bool, dir, name string) []string {
 	if runtime.GOOS == "windows" {
 		out := []string{filepath.Join(dir, name)}
-		for _, e := range strings.Split(os.Getenv("PATHEXT"), ";") {
+		var pathext string
+		if jailed {
+			if hc.Env != nil {
+				pathext = hc.Env.Get("PATHEXT").String()
+			}
+		} else if hc.Env != nil {
+			pathext = shellGetenv(hc, "PATHEXT")
+		} else {
+			pathext = os.Getenv("PATHEXT")
+		}
+		if pathext == "" {
+			pathext = ".COM;.EXE;.BAT;.CMD"
+		}
+		for _, e := range strings.Split(pathext, ";") {
 			if e = strings.TrimSpace(e); e != "" {
 				out = append(out, filepath.Join(dir, name+e))
 			}
@@ -2588,6 +2756,685 @@ func execCandidates(dir, name string) []string {
 		return out
 	}
 	return []string{filepath.Join(dir, name)}
+}
+
+var jailedShellBuiltinNames = []string{
+	"alias", "bg", "cd", "command", "false", "fc", "fg", "getopts", "hash",
+	"jobs", "kill", "newgrp", "pwd", "read", "true", "umask", "unalias", "wait",
+	"break", ":", "continue", ".", "eval", "exec", "exit", "export", "readonly",
+	"return", "set", "shift", "times", "trap", "unset",
+	"source", "bind", "builtin", "caller", "compgen", "complete", "compopt",
+	"declare", "typeset", "dirs", "disown", "enable", "history", "help",
+	"let", "local", "logout", "mapfile", "popd", "pushd", "readarray", "shopt",
+	"type", "echo", "printf", "test", "[", "ulimit",
+}
+
+func cmdPwdJailed(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	evalSymlinks := false
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			break
+		}
+		if len(a) < 2 || a[0] != '-' {
+			break
+		}
+		for j := 1; j < len(a); j++ {
+			switch a[j] {
+			case 'L':
+				evalSymlinks = false
+			case 'P':
+				evalSymlinks = true
+			default:
+				fmt.Fprintf(hc.Stderr, "invalid option: %q\n", a)
+				return interp.CallHandled(2)
+			}
+		}
+	}
+	physDir, err := checkFS(ctx, hc.Dir, "pwd", hc.Dir, OpStat)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "pwd: %v\n", err)
+		return interp.CallHandled(1)
+	}
+	if evalSymlinks {
+		fmt.Fprintln(hc.Stdout, physDir)
+		return interp.CallHandled(0)
+	}
+	pwdEnv := hc.Env.Get("PWD").String()
+	if pwdEnv != "" && !sameCleanPath(pwdEnv, hc.Dir) {
+		if candPhys, cerr := checkFS(ctx, hc.Dir, "pwd", pwdEnv, OpStat); cerr == nil && sameCleanPath(candPhys, physDir) {
+			fmt.Fprintln(hc.Stdout, pwdEnv)
+			return interp.CallHandled(0)
+		}
+	}
+	fmt.Fprintln(hc.Stdout, hc.Dir)
+	return interp.CallHandled(0)
+}
+
+func handleCompgenJailed(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	action := ""
+	prefix := ""
+	i := 1
+	for i < len(args) {
+		a := args[i]
+		if a == "--" {
+			i++
+			break
+		}
+		if len(a) < 2 || a[0] != '-' {
+			break
+		}
+		if a == "-A" {
+			if i+1 < len(args) {
+				action = args[i+1]
+				i += 2
+				continue
+			}
+			action = ""
+			i++
+			continue
+		}
+		if strings.HasPrefix(a, "-A") && len(a) > 2 {
+			action = a[2:]
+			i++
+			continue
+		}
+		for j := 1; j < len(a); j++ {
+			switch a[j] {
+			case 'c':
+				action = "command"
+			case 'b':
+				action = "builtin"
+			case 'a':
+				action = "alias"
+			default:
+				fmt.Fprintf(hc.Stderr, "compgen: invalid option %q\n", a)
+				return nil, interp.CallHandled(2)
+			}
+		}
+		i++
+	}
+	if i < len(args) {
+		prefix = args[i]
+	}
+	switch action {
+	case "alias", "builtin", "function":
+		// Purely in-memory actions in mvdan/sh.
+		return args, nil
+	case "command", "":
+	default:
+		fmt.Fprintf(hc.Stderr, "compgen: %s: invalid action\n", action)
+		return nil, interp.CallHandled(2)
+	}
+
+	var words []string
+	words = append(words, jailedShellBuiltinNames...)
+	if reg := extraRegistryPtr.Load(); reg != nil {
+		for name := range reg.byName {
+			words = append(words, name)
+		}
+	}
+	for _, dir := range filepath.SplitList(hc.Env.Get("PATH").String()) {
+		if dir == "" {
+			continue
+		}
+		entries, err := fsReadDir(ctx, hc.Dir, "compgen", dir)
+		if err != nil {
+			continue
+		}
+		for _, e := range entries {
+			if e.IsDir() {
+				continue
+			}
+			name := e.Name()
+			if e.Type()&os.ModeSymlink != 0 {
+				fi, serr := fsStat(ctx, hc.Dir, "compgen", filepath.Join(dir, name))
+				if serr != nil || fi.IsDir() || (runtime.GOOS != "windows" && fi.Mode()&0o111 == 0) {
+					continue
+				}
+			} else if runtime.GOOS != "windows" {
+				fi, ierr := e.Info()
+				if ierr != nil || fi.Mode()&0o111 == 0 {
+					continue
+				}
+			}
+			if runtime.GOOS == "windows" {
+				ext := strings.ToLower(filepath.Ext(name))
+				if ext != ".exe" && ext != ".bat" && ext != ".cmd" && ext != ".com" {
+					continue
+				}
+				name = strings.TrimSuffix(name, filepath.Ext(name))
+			}
+			words = append(words, name)
+		}
+	}
+	slices.Sort(words)
+	anyMatch := false
+	for _, w := range slices.Compact(words) {
+		if prefix == "" || strings.HasPrefix(w, prefix) {
+			fmt.Fprintln(hc.Stdout, w)
+			anyMatch = true
+		}
+	}
+	if !anyMatch {
+		return nil, interp.CallHandled(1)
+	}
+	return nil, interp.CallHandled(0)
+}
+
+func resolveJailedSourceArgs(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	if len(args) < 2 {
+		return args, nil
+	}
+	scriptArg := args[1]
+	if scriptArg == "" {
+		return args, nil
+	}
+	hasSep := strings.ContainsRune(scriptArg, '/') || (runtime.GOOS == "windows" && (strings.ContainsRune(scriptArg, '\\') || isRawAbsOrMSYS(scriptArg)))
+	var resolved string
+	if hasSep {
+		resolved = resolveHostPath(hc.Dir, scriptArg)
+	} else {
+		for _, dir := range filepath.SplitList(hc.Env.Get("PATH").String()) {
+			if dir == "" {
+				continue
+			}
+			cand := filepath.Join(dir, scriptArg)
+			if fi, err := fsStat(ctx, hc.Dir, args[0], cand); err == nil && !fi.IsDir() {
+				resolved = resolveHostPath(hc.Dir, cand)
+				break
+			}
+		}
+		if resolved == "" {
+			resolved = resolveHostPath(hc.Dir, scriptArg)
+		}
+	}
+	if _, err := checkFS(ctx, hc.Dir, args[0], resolved, OpRead); err != nil {
+		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+		return nil, interp.CallHandled(1)
+	}
+	if !strings.ContainsRune(resolved, '/') && (runtime.GOOS != "windows" || !strings.ContainsAny(resolved, `:\`)) {
+		resolved = "." + string(filepath.Separator) + resolved
+	}
+	out := make([]string, len(args))
+	copy(out, args)
+	out[1] = resolved
+	return out, nil
+}
+
+func cmdCommandShowJailed(ctx context.Context, hc interp.HandlerContext, verbose bool, queries []string) error {
+	allOK := true
+	for _, q := range queries {
+		isExplicit := strings.ContainsAny(q, `/\`) || (runtime.GOOS == "windows" && isRawAbsOrMSYS(q))
+		if isExplicit {
+			if fi, err := fsStat(ctx, hc.Dir, "command", q); err == nil && !fi.IsDir() && (runtime.GOOS == "windows" || fi.Mode()&0o111 != 0) {
+				resolved := resolveHostPath(hc.Dir, q)
+				if verbose {
+					fmt.Fprintf(hc.Stdout, "%s is %s\n", q, resolved)
+				} else {
+					fmt.Fprintln(hc.Stdout, resolved)
+				}
+			} else {
+				if verbose {
+					fmt.Fprintf(hc.Stderr, "command: %s: not found\n", q)
+				}
+				allOK = false
+			}
+			continue
+		}
+		if def, ok := hc.LookupAlias(q); ok {
+			if verbose {
+				fmt.Fprintf(hc.Stdout, "%s is aliased to `%s'\n", q, def)
+			} else {
+				fmt.Fprintf(hc.Stdout, "alias %s=%q\n", q, def)
+			}
+			continue
+		}
+		if syntax.IsKeyword(q) {
+			if verbose {
+				fmt.Fprintf(hc.Stdout, "%s is a shell keyword\n", q)
+			} else {
+				fmt.Fprintln(hc.Stdout, q)
+			}
+			continue
+		}
+		if hc.HasFunc(q) {
+			if verbose {
+				fmt.Fprintf(hc.Stdout, "%s is a function\n", q)
+			} else {
+				fmt.Fprintln(hc.Stdout, q)
+			}
+			continue
+		}
+		if lookupExtra(q) != nil {
+			if verbose {
+				fmt.Fprintf(hc.Stdout, "%s is a unish builtin\n", q)
+			} else {
+				fmt.Fprintln(hc.Stdout, q)
+			}
+			continue
+		}
+		if interp.IsBuiltin(q) {
+			if verbose {
+				fmt.Fprintf(hc.Stdout, "%s is a shell builtin\n", q)
+			} else {
+				fmt.Fprintln(hc.Stdout, q)
+			}
+			continue
+		}
+		if p, err := findExecCtx(ctx, hc, q); err == nil {
+			if verbose {
+				fmt.Fprintf(hc.Stdout, "%s is %s\n", q, p)
+			} else {
+				fmt.Fprintln(hc.Stdout, p)
+			}
+		} else {
+			if verbose {
+				fmt.Fprintf(hc.Stderr, "command: %s: not found\n", q)
+			}
+			allOK = false
+		}
+	}
+	if !allOK {
+		return interp.CallHandled(1)
+	}
+	return interp.CallHandled(0)
+}
+
+func cmdHashTableJailed(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	reset := false
+	forget := false
+	var names []string
+	argv := args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		switch a {
+		case "-r":
+			reset = true
+		case "-d":
+			forget = true
+		case "-rd", "-dr":
+			reset = true
+			forget = true
+		case "--":
+			names = append(names, argv[i+1:]...)
+			i = len(argv)
+		default:
+			if strings.HasPrefix(a, "-") && a != "-" {
+				fmt.Fprintf(hc.Stderr, "hash: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+				return flag.ErrHelp
+			}
+			names = append(names, a)
+		}
+	}
+	if reset && len(names) == 0 {
+		return nil
+	}
+	if forget {
+		if len(names) == 0 {
+			fmt.Fprintln(hc.Stderr, "hash: -d: option requires an argument")
+			return flag.ErrHelp
+		}
+		return nil
+	}
+	if len(names) == 0 {
+		fmt.Fprintln(hc.Stdout, "hash: hash table empty")
+		return nil
+	}
+	for _, n := range names {
+		if interp.IsBuiltin(n) {
+			continue
+		}
+		if lookupExtra(n) != nil {
+			fmt.Fprintf(hc.Stderr, "hash: %s: not found\n", n)
+			return exitError{1}
+		}
+		if _, err := findExecCtx(ctx, hc, n); err != nil {
+			fmt.Fprintf(hc.Stderr, "hash: %s: not found\n", n)
+			return exitError{1}
+		}
+	}
+	return nil
+}
+
+func cmdTypeDescJailed(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	mode := ""
+	all := false
+	noFuncs := false
+	var names []string
+	argv := args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			names = append(names, argv[i+1:]...)
+			break
+		}
+		if len(a) > 1 && a[0] == '-' {
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 't':
+					mode = "-t"
+				case 'p':
+					mode = "-p"
+				case 'P':
+					mode = "-P"
+				case 'a':
+					all = true
+				case 'f':
+					noFuncs = true
+				default:
+					fmt.Fprintf(hc.Stderr, "type: -%c: invalid option\n", a[j])
+					return flag.ErrHelp
+				}
+			}
+			continue
+		}
+		names = append(names, a)
+	}
+	if len(names) == 0 {
+		return nil
+	}
+	code := 0
+	for _, n := range names {
+		if mode == "-P" {
+			if p, err := findExecCtx(ctx, hc, n); err == nil {
+				fmt.Fprintln(hc.Stdout, p)
+			} else {
+				code = 1
+			}
+			continue
+		}
+		found := false
+		if def, ok := hc.LookupAlias(n); ok {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "alias")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is aliased to `%s'\n", n, def)
+			}
+			if !all {
+				continue
+			}
+		}
+		if syntax.IsKeyword(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "keyword")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a shell keyword\n", n)
+			}
+			if !all {
+				continue
+			}
+		}
+		if !noFuncs && hc.HasFunc(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "function")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a function\n", n)
+			}
+			if !all {
+				continue
+			}
+		}
+		if isUnishCommand(n) && !strings.ContainsAny(n, `/\`) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "builtin")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a unish builtin\n", n)
+			}
+			if !all {
+				continue
+			}
+		} else if interp.IsBuiltin(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "builtin")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a shell builtin\n", n)
+			}
+			if !all {
+				continue
+			}
+		}
+		if p, err := findExecCtx(ctx, hc, n); err == nil {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "file")
+			case "-p":
+				fmt.Fprintln(hc.Stdout, p)
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is %s\n", n, p)
+			}
+		}
+		if !found {
+			if mode == "" {
+				fmt.Fprintf(hc.Stderr, "type: %s: not found\n", n)
+			}
+			code = 1
+		}
+	}
+	if code != 0 {
+		return exitError{code}
+	}
+	return nil
+}
+
+func cmdUmaskJailed(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	if len(args) == 1 {
+		fmt.Fprintf(hc.Stdout, "%04o\n", shellUmask.Load())
+		return nil
+	}
+	endOpts := false
+	printed := false
+	var modes []string
+	for _, a := range args[1:] {
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if a == "-S" {
+				printed = true
+				fmt.Fprintln(hc.Stdout, umaskSymbolic(int(shellUmask.Load())))
+				continue
+			}
+			if a == "-p" {
+				printed = true
+				fmt.Fprintf(hc.Stdout, "umask %04o\n", shellUmask.Load())
+				continue
+			}
+			if strings.HasPrefix(a, "-") && len(a) > 1 {
+				fmt.Fprintf(hc.Stderr, "umask: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+				return flag.ErrHelp
+			}
+		}
+		modes = append(modes, a)
+	}
+	if len(modes) == 0 {
+		if !printed {
+			fmt.Fprintf(hc.Stdout, "%04o\n", shellUmask.Load())
+		}
+		return nil
+	}
+	for _, a := range modes {
+		v, err := strconv.ParseUint(a, 8, 32)
+		if err != nil || v > 0o777 {
+			fmt.Fprintf(hc.Stderr, "umask: '%s': invalid octal number\n", a)
+			return exitError{1}
+		}
+	}
+	if err := checkProc(ctx, "umask", os.Getpid(), "UMASK"); err != nil {
+		fmt.Fprintf(hc.Stderr, "umask: %v\n", err)
+		return exitError{1}
+	}
+	fmt.Fprintln(hc.Stderr, "umask: cannot modify host process umask in jailed mode")
+	return exitError{1}
+}
+
+func cmdUlimitJailed(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	showAll := false
+	resource := "n"
+	var setVal *uint64
+	argv := args[1:]
+	endOpts := false
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if !endOpts {
+			switch {
+			case a == "--":
+				endOpts = true
+				continue
+			case a == "-a":
+				showAll = true
+				continue
+			case a == "-n" || a == "-u" || a == "-f" || a == "-c" || a == "-d" || a == "-s" || a == "-v" || a == "-m":
+				resource = strings.TrimPrefix(a, "-")
+				continue
+			case (len(a) == 3 && a[0] == '-' && (a[1] == 'H' || a[1] == 'S')) ||
+				(len(a) == 4 && a[0] == '-' && a[1] == 'H' && a[2] == 'S') ||
+				(len(a) == 4 && a[0] == '-' && a[1] == 'S' && a[2] == 'H'):
+				resource = a[len(a)-1:]
+				continue
+			case a == "-H" || a == "-S":
+				continue
+			case strings.HasPrefix(a, "-"):
+				fmt.Fprintf(hc.Stderr, "ulimit: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+				return flag.ErrHelp
+			}
+		}
+		if v, err := strconv.ParseUint(a, 10, 64); err == nil {
+			setVal = &v
+		} else {
+			fmt.Fprintf(hc.Stderr, "ulimit: '%s': invalid number\n", a)
+			return exitError{1}
+		}
+	}
+	if showAll && setVal == nil {
+		nofile, _ := ulimitNofile()
+		fmt.Fprintf(hc.Stdout, "open files                      (-n) %d\n", nofile)
+		return nil
+	}
+	if setVal != nil {
+		if err := checkProc(ctx, "ulimit", os.Getpid(), "RLIMIT"); err != nil {
+			fmt.Fprintf(hc.Stderr, "ulimit: %v\n", err)
+			return exitError{1}
+		}
+		fmt.Fprintln(hc.Stderr, "ulimit: cannot modify limit: operation not permitted")
+		return exitError{1}
+	}
+	switch resource {
+	case "n":
+		nofile, err := ulimitNofile()
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "ulimit:", err)
+			return exitError{1}
+		}
+		fmt.Fprintln(hc.Stdout, nofile)
+	default:
+		fmt.Fprintln(hc.Stdout, "unlimited")
+	}
+	return nil
+}
+
+func cmdHistoryJailed(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	a := args[1:]
+	optFileArg := func(idx int) string {
+		if idx+1 < len(a) && !strings.HasPrefix(a[idx+1], "-") {
+			return a[idx+1]
+		}
+		return ""
+	}
+	resolveHistTarget := func(explicit string) string {
+		if explicit != "" {
+			return explicit
+		}
+		envF := hc.Env.Get("HISTFILE").String()
+		if isNullDevPath(envF) {
+			return ""
+		}
+		return envF
+	}
+	for i := 0; i < len(a); i++ {
+		switch a[i] {
+		case "-c", "-s":
+			return nil
+		case "-d":
+			if i+1 >= len(a) {
+				fmt.Fprintln(hc.Stderr, "history: -d: option requires an argument")
+				return exitError{1}
+			}
+			fmt.Fprintf(hc.Stderr, "history: %s: history position out of range\n", a[i+1])
+			return exitError{1}
+		case "-p":
+			var out []string
+			for j := i + 1; j < len(a); j++ {
+				exp, _, err := expandBang(a[j], nil)
+				if err != nil {
+					fmt.Fprintln(hc.Stderr, err.Error())
+					return exitError{1}
+				}
+				out = append(out, exp)
+			}
+			for _, l := range out {
+				fmt.Fprintln(hc.Stdout, l)
+			}
+			return nil
+		case "-r", "-n":
+			target := resolveHistTarget(optFileArg(i))
+			if target != "" && !isNullDevPath(target) {
+				if _, err := fsReadFile(ctx, hc.Dir, "history", target); err != nil {
+					fmt.Fprintf(hc.Stderr, "history: %v\n", err)
+					return exitError{1}
+				}
+			}
+			return nil
+		case "-w":
+			target := resolveHistTarget(optFileArg(i))
+			if target != "" && !isNullDevPath(target) {
+				if err := fsWriteFile(ctx, hc.Dir, "history", target, nil, 0o600); err != nil {
+					fmt.Fprintf(hc.Stderr, "history: %v\n", err)
+					return exitError{1}
+				}
+			}
+			return nil
+		case "-a":
+			target := resolveHistTarget(optFileArg(i))
+			if target != "" && !isNullDevPath(target) {
+				f, err := fsOpenFile(ctx, hc.Dir, "history", target, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+				if err != nil {
+					fmt.Fprintf(hc.Stderr, "history: %v\n", err)
+					return exitError{1}
+				}
+				_ = f.Close()
+			}
+			return nil
+		default:
+			if strings.HasPrefix(a[i], "-") {
+				fmt.Fprintf(hc.Stderr, "history: invalid option -- '%s'\n", strings.TrimPrefix(a[i], "-"))
+				return exitError{1}
+			}
+			if cnt, err := strconv.Atoi(a[i]); err != nil || cnt < 0 {
+				fmt.Fprintf(hc.Stderr, "history: %s: numeric argument required\n", a[i])
+				return exitError{1}
+			}
+			return nil
+		}
+	}
+	return nil
 }
 
 func cmdPrintenv(_ context.Context, hc interp.HandlerContext, args []string) error {
