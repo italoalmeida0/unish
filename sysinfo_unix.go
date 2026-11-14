@@ -223,6 +223,10 @@ func setProcNice(pid, n int) {
 	}
 }
 
+func selfPgid() int {
+	return syscall.Getpgrp()
+}
+
 var tcpStates = map[string]string{
 	"01": "ESTAB", "02": "SYN-SENT", "03": "SYN-RECV", "04": "FIN-WAIT-1",
 	"05": "FIN-WAIT-2", "06": "TIME-WAIT", "07": "CLOSE", "08": "CLOSE-WAIT",

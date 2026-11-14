@@ -183,6 +183,8 @@ func setProcNice(pid, n int) {
 	_, _ = pid, n
 }
 
+func selfPgid() int { return 0 }
+
 const (
 	th32csSnapProcess  = 0x00000002
 	maxPath            = 260

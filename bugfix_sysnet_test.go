@@ -444,7 +444,8 @@ func TestBugSysnetPgrepPkillMatching(t *testing.T) {
 	}
 }
 
-// 9. Unit regression tests for matchProcsFromList and recoverPkillSplitArgs.
+// 9. Unit & live regression tests for matchProcsFromList and recoverPkillSplitArgs
+// (including -stop/-segv/-sys/-abrt/-alrm and rejecting pkill -i pat1 pat2).
 func TestBugSysnetMatchProcsAndPkillSplitRecovery(t *testing.T) {
 	// Verify splitAttached("pkill", ...) + recoverPkillSplitArgs round-trip.
 	cases := []struct {
@@ -464,8 +465,36 @@ func TestBugSysnetMatchProcsAndPkillSplitRecovery(t *testing.T) {
 			want: []string{"pkill", "-sigterm", "my_daemon"},
 		},
 		{
+			raw:  []string{"pkill", "-stop", "my_daemon"},
+			want: []string{"pkill", "-stop", "my_daemon"},
+		},
+		{
+			raw:  []string{"pkill", "-segv", "my_daemon"},
+			want: []string{"pkill", "-segv", "my_daemon"},
+		},
+		{
+			raw:  []string{"pkill", "-sys", "my_daemon"},
+			want: []string{"pkill", "-sys", "my_daemon"},
+		},
+		{
+			raw:  []string{"pkill", "-abrt", "my_daemon"},
+			want: []string{"pkill", "-abrt", "my_daemon"},
+		},
+		{
+			raw:  []string{"pkill", "-alrm", "my_daemon"},
+			want: []string{"pkill", "-alrm", "my_daemon"},
+		},
+		{
+			raw:  []string{"pkill", "-s", "stop", "my_daemon"},
+			want: []string{"pkill", "-s", "stop", "my_daemon"},
+		},
+		{
 			raw:  []string{"pkill", "-i", "nt"},
 			want: []string{"pkill", "-i", "nt"},
+		},
+		{
+			raw:  []string{"pkill", "-i", "pat1", "pat2"},
+			want: []string{"pkill", "-i", "pat1", "pat2"},
 		},
 	}
 	for _, tc := range cases {
@@ -474,6 +503,19 @@ func TestBugSysnetMatchProcsAndPkillSplitRecovery(t *testing.T) {
 		if !reflect.DeepEqual(got, tc.want) {
 			t.Errorf("recoverPkillSplitArgs(splitAttached(%v)) = %v (mangled=%v), want %v", tc.raw, got, mangled, tc.want)
 		}
+	}
+
+	// Live shell verification: -stop/-segv/-sys must parse as valid signals (exit 1 on non-matching pattern, no "invalid signal"),
+	// and `pkill -i pat1 pat2` must exit 2 instead of merging into `-ipat1`.
+	for _, sigFlag := range []string{"-stop", "-segv", "-sys"} {
+		_, stderr, err := runSysnetScript(t, nil, "", fmt.Sprintf("pkill %s nonexistent_unish_target_999888", sigFlag))
+		if exitCode(err) != 1 || stderr != "" {
+			t.Errorf("pkill %s nonexistent got exit=%d stderr=%q, want exit=1 empty stderr", sigFlag, exitCode(err), stderr)
+		}
+	}
+	_, extraStderr, err := runSysnetScript(t, nil, "", "pkill -i pat1 pat2")
+	if exitCode(err) != 2 || !strings.Contains(extraStderr, "only one pattern") {
+		t.Errorf("pkill -i pat1 pat2 got exit=%d stderr=%q, want exit=2 'only one pattern'", exitCode(err), extraStderr)
 	}
 
 	// Verify command-name extraction never matches slash-bearing arguments unless -f is set.
@@ -528,10 +570,11 @@ func TestBugSysnetProcStatBtimeAndDarwinArgs(t *testing.T) {
 	}
 	shortFields[0] = "S"
 	shortFields[1] = "42"
+	shortFields[2] = "84"
 	shortStat := "1234 (short_stat) " + strings.Join(shortFields, " ")
-	comm, statCh, ppid, _, _, rssKB, _, ok := parseProcStat(shortStat, 1000, 4096)
-	if !ok || comm != "short_stat" || statCh != "S" || ppid != 42 || rssKB != -1 {
-		t.Fatalf("parseProcStat(len(rest)==21) = (%q, %q, %d, rss=%d, ok=%v)", comm, statCh, ppid, rssKB, ok)
+	comm, statCh, ppid, pgid, _, _, rssKB, _, ok := parseProcStat(shortStat, 1000, 4096)
+	if !ok || comm != "short_stat" || statCh != "S" || ppid != 42 || pgid != 84 || rssKB != -1 {
+		t.Fatalf("parseProcStat(len(rest)==21) = (%q, %q, ppid=%d, pgid=%d, rss=%d, ok=%v)", comm, statCh, ppid, pgid, rssKB, ok)
 	}
 
 	// Full /proc/[pid]/stat with spaces & nested parens in comm + 64KiB page size (ARM64 Linux).
@@ -541,15 +584,16 @@ func TestBugSysnetProcStatBtimeAndDarwinArgs(t *testing.T) {
 	}
 	fullFields[0] = "R"
 	fullFields[1] = "777"
+	fullFields[2] = "888"      // pgrp / pgid
 	fullFields[11] = "200"     // utime ticks
 	fullFields[12] = "100"     // stime ticks
 	fullFields[19] = "5000"    // starttime ticks
 	fullFields[20] = "1048576" // vsize bytes (1024 KiB)
 	fullFields[21] = "10"      // rss pages (10 * 64KiB = 640 KiB)
 	fullStat := "5678 (Web (Content) Helper) " + strings.Join(fullFields, " ")
-	comm, statCh, ppid, _, vszKB, rssKB, cpuTime, ok := parseProcStat(fullStat, 100, 65536)
-	if !ok || comm != "Web (Content) Helper" || statCh != "R" || ppid != 777 || vszKB != 1024 || rssKB != 640 || cpuTime != "00:00:03" {
-		t.Fatalf("parseProcStat(64K) = (%q, %q, %d, vsz=%d, rss=%d, time=%q, ok=%v)", comm, statCh, ppid, vszKB, rssKB, cpuTime, ok)
+	comm, statCh, ppid, pgid, _, vszKB, rssKB, cpuTime, ok := parseProcStat(fullStat, 100, 65536)
+	if !ok || comm != "Web (Content) Helper" || statCh != "R" || ppid != 777 || pgid != 888 || vszKB != 1024 || rssKB != 640 || cpuTime != "00:00:03" {
+		t.Fatalf("parseProcStat(64K) = (%q, %q, ppid=%d, pgid=%d, vsz=%d, rss=%d, time=%q, ok=%v)", comm, statCh, ppid, pgid, vszKB, rssKB, cpuTime, ok)
 	}
 
 	// Malformed /proc/stat "btime   " (no value field) previously panicked with index out of range [1].
@@ -632,5 +676,156 @@ func TestBugSysnetNiceIsolationAndStatSymlink(t *testing.T) {
 		if strings.Count(stOut, "symbolic link") != 2 {
 			t.Errorf("stat did not identify both valid and dangling symlinks: %q", stOut)
 		}
+	}
+}
+
+// 13. pkill -g OS PGID matching (including -g 0 caller PGID + pattern filter as in parity/sandbox.py:68).
+func TestBugSysnetPkillPgidMatching(t *testing.T) {
+	// Unit tests for parsePkillPgids and filterProcsByPgid + matchProcsFromList.
+	want0, err := parsePkillPgids("0", 4321)
+	if err != nil || !want0[4321] || len(want0) != 1 {
+		t.Fatalf("parsePkillPgids('0', 4321) = (%v, %v), want {4321:true}", want0, err)
+	}
+	wantList, err := parsePkillPgids("100,200", 4321)
+	if err != nil || !wantList[100] || !wantList[200] || len(wantList) != 2 {
+		t.Fatalf("parsePkillPgids('100,200', 4321) = (%v, %v)", wantList, err)
+	}
+	for _, bad := range []string{"", "abc", "-5", "100,,200"} {
+		if _, err := parsePkillPgids(bad, 4321); err == nil {
+			t.Errorf("parsePkillPgids(%q) succeeded, want error", bad)
+		}
+	}
+
+	procs := []procInfo{
+		{pid: 500, pgid: 4321, comm: "unish", cmd: "/tmp/unish -c pkill -g 0 -f 'sleep 30'"},
+		{pid: 501, pgid: 4321, comm: "sleep", cmd: "sleep 30"},
+		{pid: 502, pgid: 9999, comm: "sleep", cmd: "sleep 30"},
+		{pid: 503, pgid: 4321, comm: "sh", cmd: "sh"},
+	}
+	pgFiltered := filterProcsByPgid(procs, 500, want0, 0)
+	if len(pgFiltered) != 2 || pgFiltered[0].pid != 501 || pgFiltered[1].pid != 503 {
+		t.Fatalf("filterProcsByPgid = %v, want pids [501, 503]", pgFiltered)
+	}
+	matched, err := matchProcsFromList(pgFiltered, 500, "sleep 30", true, false, false)
+	if err != nil || len(matched) != 1 || matched[0].pid != 501 {
+		t.Fatalf("pkill -g 0 -f 'sleep 30' simulation matched %v (err=%v), want [pid 501]", matched, err)
+	}
+
+	// Invalid -g argument must fail with exit status 2.
+	_, badStderr, err := runSysnetScript(t, nil, "", "pkill -g not_a_pgid")
+	if exitCode(err) != 2 || !strings.Contains(badStderr, "invalid process group") {
+		t.Errorf("pkill -g not_a_pgid got exit=%d stderr=%q, want exit=2", exitCode(err), badStderr)
+	}
+
+	// On Unix, live-test `pkill -g 0 -f ...` against a child in our own OS process group.
+	if runtime.GOOS != "windows" && selfPgid() > 0 {
+		exe, err := os.Executable()
+		if err != nil {
+			t.Fatalf("os.Executable: %v", err)
+		}
+		helperBin := filepath.Join(t.TempDir(), "unish_pgid_victim_88")
+		data, err := os.ReadFile(exe)
+		if err != nil {
+			t.Fatalf("read test exe: %v", err)
+		}
+		if err := os.WriteFile(helperBin, data, 0o755); err != nil {
+			t.Fatalf("write helper: %v", err)
+		}
+		cmd := exec.Command(helperBin, "-test.run=^TestSysnetHelperProcess$", "--", "--unish-helper-mode=sleep")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("start helper: %v", err)
+		}
+		waitCh := make(chan error, 1)
+		go func() { waitCh <- cmd.Wait() }()
+		defer func() { _ = cmd.Process.Kill() }()
+
+		time.Sleep(60 * time.Millisecond)
+		_, stderr, err := runSysnetScript(t, nil, "", "pkill -g 0 -f unish_pgid_victim_88")
+		if err != nil {
+			t.Fatalf("pkill -g 0 -f unish_pgid_victim_88 failed: %v (stderr=%q)", err, stderr)
+		}
+		select {
+		case <-waitCh:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("pkill -g 0 -f did not terminate same-PGID child")
+		}
+	}
+}
+
+// 14. env -u PATH must NOT resurrect os.Getenv("PATH"), and Windows Path= must match case-insensitively.
+func TestBugSysnetEnvUnsetPathAndCaseFolding(t *testing.T) {
+	// Cross-OS unit test of case-insensitive Path= set/unset (Windows semantics).
+	winEnv := []string{"SystemRoot=C:\\Windows", "Path=C:\\Windows\\System32"}
+	replaced := setEnvVarCase(append([]string(nil), winEnv...), "PATH", "C:\\Custom\\bin", true)
+	if !reflect.DeepEqual(replaced, []string{"SystemRoot=C:\\Windows", "PATH=C:\\Custom\\bin"}) {
+		t.Fatalf("setEnvVarCase(foldCase=true) = %v, want single PATH entry", replaced)
+	}
+	removed := unsetEnvVarCase(append([]string(nil), winEnv...), "PATH", true)
+	if !reflect.DeepEqual(removed, []string{"SystemRoot=C:\\Windows"}) {
+		t.Fatalf("unsetEnvVarCase(foldCase=true) = %v, want Path removed", removed)
+	}
+
+	// Build a custom executable placed ONLY in a temporary directory on PATH.
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	customDir := t.TempDir()
+	binBase := "unish_path_probe_bin_91"
+	binFile := binBase
+	if runtime.GOOS == "windows" {
+		binFile += ".exe"
+	}
+	data, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("read test exe: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(customDir, binFile), data, 0o755); err != nil {
+		t.Fatalf("write custom bin: %v", err)
+	}
+
+	t.Setenv("PATH", customDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// 1) With inherited PATH (which on Windows is stored as `Path=` in os.Environ()),
+	// `env EXTRA_FLAG=1 unish_path_probe_bin_91 ...` MUST find and run the binary.
+	out, stderr, err := runSysnetScript(t, nil, "", fmt.Sprintf("env EXTRA_FLAG=ok %s -test.run=^TestSysnetHelperProcess$ -- --unish-helper-mode=printenv", binBase))
+	if err != nil {
+		t.Fatalf("env with inherited PATH failed to locate %s: %v (stderr=%q)", binBase, err, stderr)
+	}
+	if !strings.Contains(out, "EXTRA_FLAG=ok") {
+		t.Fatalf("expected EXTRA_FLAG=ok in output, got:\n%s", out)
+	}
+
+	// 2) With `env -u PATH` (without `-i`), `findSubcommandExec` must NOT fall back to
+	// `os.Getenv("PATH")`, so `unish_path_probe_bin_91` must NOT be found (exit 127).
+	_, unsetStderr, err := runSysnetScript(t, nil, "", fmt.Sprintf("env -u PATH %s -test.run=^TestSysnetHelperProcess$ -- --unish-helper-mode=printenv", binBase))
+	if exitCode(err) != 127 {
+		t.Fatalf("env -u PATH %s exited %d (err=%v, stderr=%q), want 127", binBase, exitCode(err), err, unsetStderr)
+	}
+
+	// 3) `env -u PATH env` must emit zero PATH/Path entries, and `env PATH=<customDir> env`
+	// must emit exactly one PATH entry (never duplicate Path= + PATH= on Windows).
+	unsetEnvOut, _, err := runSysnetScript(t, nil, "", "env -u PATH env")
+	if err != nil {
+		t.Fatalf("env -u PATH env failed: %v", err)
+	}
+	for _, line := range strings.Split(unsetEnvOut, "\n") {
+		if envKeyMatch(line, "PATH") {
+			t.Fatalf("env -u PATH env still contained PATH entry: %q", line)
+		}
+	}
+
+	overrideOut, _, err := runSysnetScript(t, nil, "", fmt.Sprintf("env PATH=%q env", filepath.ToSlash(customDir)))
+	if err != nil {
+		t.Fatalf("env PATH=... env failed: %v", err)
+	}
+	pathCount := 0
+	for _, line := range strings.Split(overrideOut, "\n") {
+		if envKeyMatch(line, "PATH") {
+			pathCount++
+		}
+	}
+	if pathCount != 1 {
+		t.Fatalf("env PATH=... env had %d PATH/Path entries, want 1", pathCount)
 	}
 }

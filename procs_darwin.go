@@ -96,6 +96,7 @@ func listProcs() ([]procInfo, error) {
 		out = append(out, procInfo{
 			pid:    pid,
 			ppid:   int(kp.Eproc.Ppid),
+			pgid:   int(kp.Eproc.Pgid),
 			user:   userName,
 			comm:   comm,
 			tty:    "?",

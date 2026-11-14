@@ -122,18 +122,18 @@ func dfHuman(n int64) string {
 }
 
 type procInfo struct {
-	pid, ppid int
-	user      string
-	comm      string
-	cpu       float64
-	memPct    float64
-	vszKB     int64
-	rssKB     int64
-	tty       string
-	stat      string
-	start     string
-	time      string
-	cmd       string
+	pid, ppid, pgid int
+	user            string
+	comm            string
+	cpu             float64
+	memPct          float64
+	vszKB           int64
+	rssKB           int64
+	tty             string
+	stat            string
+	start           string
+	time            string
+	cmd             string
 }
 
 func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -604,22 +604,54 @@ func cmdEnv(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	return runSysSubcommand(ctx, hc, childEnv, cleared, 0, false, cmd)
 }
 
-func setEnvVar(env []string, name, value string) []string {
-	prefix := name + "="
-	for i, e := range env {
-		if strings.HasPrefix(e, prefix) {
-			env[i] = prefix + value
-			return env
-		}
+func envKeyMatchCase(entry, name string, foldCase bool) bool {
+	eq := strings.IndexByte(entry, '=')
+	if eq < 0 {
+		return false
 	}
-	return append(env, prefix+value)
+	k := entry[:eq]
+	if foldCase {
+		return strings.EqualFold(k, name)
+	}
+	return k == name
+}
+
+func envKeyMatch(entry, name string) bool {
+	return envKeyMatchCase(entry, name, runtime.GOOS == "windows")
+}
+
+func setEnvVar(env []string, name, value string) []string {
+	return setEnvVarCase(env, name, value, runtime.GOOS == "windows")
+}
+
+func setEnvVarCase(env []string, name, value string, foldCase bool) []string {
+	pair := name + "=" + value
+	replaced := false
+	out := env[:0]
+	for _, e := range env {
+		if envKeyMatchCase(e, name, foldCase) {
+			if !replaced {
+				out = append(out, pair)
+				replaced = true
+			}
+			continue
+		}
+		out = append(out, e)
+	}
+	if !replaced {
+		out = append(out, pair)
+	}
+	return out
 }
 
 func unsetEnvVar(env []string, name string) []string {
-	prefix := name + "="
+	return unsetEnvVarCase(env, name, runtime.GOOS == "windows")
+}
+
+func unsetEnvVarCase(env []string, name string, foldCase bool) []string {
 	out := env[:0]
 	for _, e := range env {
-		if !strings.HasPrefix(e, prefix) {
+		if !envKeyMatchCase(e, name, foldCase) {
 			out = append(out, e)
 		}
 	}
@@ -1082,30 +1114,32 @@ func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error
 }
 
 func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared bool, name string) (string, error) {
+	_ = cleared
 	if strings.ContainsAny(name, `/\`) || (runtime.GOOS == "windows" && len(name) > 1 && name[1] == ':') {
 		return findExec(hc, name)
 	}
 	var pathVal string
 	hasPath := false
 	for _, kv := range childEnv {
-		if strings.HasPrefix(kv, "PATH=") {
-			pathVal = kv[5:]
+		if envKeyMatch(kv, "PATH") {
+			eq := strings.IndexByte(kv, '=')
+			pathVal = kv[eq+1:]
 			hasPath = true
 			break
 		}
 	}
-	if !hasPath {
-		if !cleared {
-			pathVal = os.Getenv("PATH")
-		} else if runtime.GOOS != "windows" {
-			pathVal = "/usr/bin:/bin"
-		}
+	if !hasPath && runtime.GOOS != "windows" {
+		pathVal = "/usr/bin:/bin"
 	}
 	for _, dir := range strings.Split(pathVal, string(os.PathListSeparator)) {
 		if dir == "" {
 			continue
 		}
-		for _, cand := range execCandidates(dir, name) {
+		searchDir := dir
+		if !filepath.IsAbs(searchDir) {
+			searchDir = resolve(hc.Dir, searchDir)
+		}
+		for _, cand := range execCandidates(searchDir, name) {
 			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
 				return cand, nil
 			}

@@ -105,13 +105,15 @@ func recoverPkillSplitArgs(args []string) []string {
 		}
 		if i+1 < len(args) && !strings.HasPrefix(args[i+1], "-") {
 			next := args[i+1]
-			if a == "-s" && strings.HasPrefix(strings.ToLower(next), "ig") &&
+			if a == "-s" && !isValidKillSignal(strings.ToUpper(next)) &&
 				isSignalName(strings.ToUpper("s"+next)) && hasTrailingOperand(i+2) {
 				out = append(out, "-s"+next)
 				i++
 				continue
 			}
-			if (a == "-i" || a == "-n" || a == "-a" || a == "-l") && hasTrailingOperand(i+2) {
+			if (a == "-i" || a == "-n" || a == "-a" || a == "-l") &&
+				(isSignalName(strings.ToUpper(a[1:]+next)) || allCharsIn(a[1:]+next, pkillBoolFlags)) &&
+				hasTrailingOperand(i+2) {
 				out = append(out, a+next)
 				i++
 				continue
@@ -192,32 +194,57 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	}
 	_ = ancestors
 	rest := fs.Args()
-	if *pgroup != "" {
-		j := globalJobs.resolveJobSpec("%" + *pgroup)
-		if j == nil || j.proc == nil {
-			return exitError{1}
-		}
-		if sig == "0" {
-			return nil
-		}
-		if err := killProc(j.proc, sig); err != nil {
-			return exitError{1}
-		}
-		return nil
-	}
-	if len(rest) == 0 {
-		fmt.Fprintln(hc.Stderr, "pkill: no matching criteria specified")
-		return flag.ErrHelp
-	}
 	if len(rest) > 1 {
 		fmt.Fprintln(hc.Stderr, "pkill: only one pattern can be provided")
 		return exitError{2}
 	}
-	pattern := rest[0]
-	matched, err := matchProcs(pattern, *full, *ignoreCase, *exact)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
-		return exitError{2}
+	var matched []procInfo
+	if *pgroup != "" {
+		j := globalJobs.resolveJobSpec("%" + *pgroup)
+		if len(rest) == 0 && j != nil && j.proc != nil {
+			if sig == "0" {
+				return nil
+			}
+			if err := killProc(j.proc, sig); err != nil {
+				return exitError{1}
+			}
+			return nil
+		}
+		wantPgid, err := parsePkillPgids(*pgroup, selfPgid())
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
+			return exitError{2}
+		}
+		procs, err := listProcs()
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
+			return exitError{2}
+		}
+		jobPid := 0
+		if j != nil && j.proc != nil {
+			jobPid = j.proc.Pid
+		}
+		pgidProcs := filterProcsByPgid(procs, os.Getpid(), wantPgid, jobPid)
+		if len(rest) == 1 {
+			matched, err = matchProcsFromList(pgidProcs, os.Getpid(), rest[0], *full, *ignoreCase, *exact)
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
+				return exitError{2}
+			}
+		} else {
+			matched = pgidProcs
+		}
+	} else {
+		if len(rest) == 0 {
+			fmt.Fprintln(hc.Stderr, "pkill: no matching criteria specified")
+			return flag.ErrHelp
+		}
+		var err error
+		matched, err = matchProcs(rest[0], *full, *ignoreCase, *exact)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
+			return exitError{2}
+		}
 	}
 	if *newest && len(matched) > 1 {
 		newestProc := matched[0]
@@ -380,21 +407,63 @@ func matchProcsFromList(procs []procInfo, myPid int, pattern string, full, ignor
 	return matched, nil
 }
 
+func parsePkillPgids(spec string, callerPgid int) (map[int]bool, error) {
+	rawParts := strings.Split(spec, ",")
+	if len(rawParts) == 0 {
+		return nil, fmt.Errorf("invalid process group: %s", spec)
+	}
+	want := make(map[int]bool, len(rawParts))
+	for _, raw := range rawParts {
+		part := strings.TrimSpace(raw)
+		if !allASCIIUint(part) {
+			return nil, fmt.Errorf("invalid process group: %s", spec)
+		}
+		pg, err := strconv.Atoi(part)
+		if err != nil || pg < 0 {
+			return nil, fmt.Errorf("invalid process group: %s", spec)
+		}
+		if pg == 0 {
+			if callerPgid > 0 {
+				want[callerPgid] = true
+			}
+		} else {
+			want[pg] = true
+		}
+	}
+	return want, nil
+}
+
+func filterProcsByPgid(procs []procInfo, myPid int, wantPgid map[int]bool, jobPid int) []procInfo {
+	var out []procInfo
+	for _, p := range procs {
+		if p.pid == myPid {
+			continue
+		}
+		if (p.pgid > 0 && wantPgid[p.pgid]) || (jobPid > 0 && p.pid == jobPid) {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
 // parseProcStat parses a Linux /proc/[pid]/stat record safely, supporting
 // process names containing spaces and parentheses and arbitrary page sizes.
-func parseProcStat(s string, uptime float64, pageSize int) (comm, stat string, ppid int, cpu float64, vszKB, rssKB int64, cpuTime string, ok bool) {
+func parseProcStat(s string, uptime float64, pageSize int) (comm, stat string, ppid, pgid int, cpu float64, vszKB, rssKB int64, cpuTime string, ok bool) {
 	li := strings.IndexByte(s, '(')
 	ri := strings.LastIndexByte(s, ')')
 	if li < 0 || ri <= li {
-		return "", "", 0, -1, -1, -1, "00:00:00", false
+		return "", "", 0, 0, -1, -1, -1, "00:00:00", false
 	}
 	comm = s[li+1 : ri]
 	rest := strings.Fields(s[ri+1:])
 	if len(rest) < 2 {
-		return comm, "?", 0, -1, -1, -1, "00:00:00", false
+		return comm, "?", 0, 0, -1, -1, -1, "00:00:00", false
 	}
 	stat = rest[0]
 	ppid, _ = strconv.Atoi(rest[1])
+	if len(rest) > 2 {
+		pgid, _ = strconv.Atoi(rest[2])
+	}
 	cpu = -1
 	vszKB = -1
 	rssKB = -1
@@ -422,7 +491,7 @@ func parseProcStat(s string, uptime float64, pageSize int) (comm, stat string, p
 		secs := totalTicks / clkTck % 60
 		cpuTime = fmt.Sprintf("%02d:%02d:%02d", mins/60, mins%60, secs)
 	}
-	return comm, stat, ppid, cpu, vszKB, rssKB, cpuTime, true
+	return comm, stat, ppid, pgid, cpu, vszKB, rssKB, cpuTime, true
 }
 
 // parseProcBtime extracts the btime epoch seconds from Linux /proc/stat safely.

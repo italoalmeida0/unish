@@ -61,10 +61,11 @@ func listProcs() ([]procInfo, error) {
 			}
 		}
 		if data, err := os.ReadFile(procDir + "/stat"); err == nil {
-			if comm, statCh, ppid, cpu, vszKB, rssKB, cpuTime, ok := parseProcStat(string(data), uptime, pageSize); ok {
+			if comm, statCh, ppid, pgid, cpu, vszKB, rssKB, cpuTime, ok := parseProcStat(string(data), uptime, pageSize); ok {
 				p.comm = comm
 				p.stat = statCh
 				p.ppid = ppid
+				p.pgid = pgid
 				p.cpu = cpu
 				p.vszKB = vszKB
 				p.rssKB = rssKB
