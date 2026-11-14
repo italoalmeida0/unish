@@ -249,6 +249,12 @@ func TestBugfixPrintfStarWidthAndNegativePrecision(t *testing.T) {
 	if exitCode(err) != 1 || out != "[hi]\n" || errOut == "" {
 		t.Errorf("printf invalid * width: exit=%d out=%q stderr=%q", exitCode(err), out, errOut)
 	}
+
+	// Preserve bare-dot '%0.sx' parity behavior (parity/edge_cases.py).
+	out, errOut, err = runParityScript(t, dir, `printf '%0.sx' 1 2 3`)
+	if exitCode(err) != 0 || out != "1x2x3x" {
+		t.Errorf("printf %%0.sx: exit=%d out=%q stderr=%q", exitCode(err), out, errOut)
+	}
 }
 
 func TestBugfixSedStreamingPipeCancelAndMultiFileLastLine(t *testing.T) {

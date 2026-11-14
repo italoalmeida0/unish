@@ -111,11 +111,7 @@ func parsePrintfSpecs(format string) []printfSpec {
 				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
 					i++
 				}
-				if i == start {
-					sp.prec = "0"
-				} else {
-					sp.prec = format[start:i]
-				}
+				sp.prec = format[start:i]
 			}
 		}
 		if i < len(format) {
