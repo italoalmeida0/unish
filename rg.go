@@ -272,30 +272,25 @@ func cmdRg(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	}
 
-	// Fast path for stdin-only search.
+	// Fast path for stdin-only search (streams line-by-line to hc.Stdout so unbounded pipes & head -n work immediately).
 	if searchStdinOnly {
 		var out bytes.Buffer
 		label := ""
 		if showFilename {
 			label = "<stdin>"
 		}
-		matched, _, serr := rgSearchReader(ctx, hc.Stdin, label, &opts, matcher, showFilename, showLineNum, &out)
+		matched, _, serr := rgSearchReader(ctx, hc.Stdin, hc.Stdout, label, &opts, matcher, showFilename, showLineNum, &out)
 		if serr != nil {
-			if isPipeClosed(serr) || ctx.Err() != nil {
-				return serr
+			if isPipeClosed(serr) {
+				return nil
+			}
+			if ctx.Err() != nil {
+				return ctx.Err()
 			}
 			if !opts.noMessages {
 				fmt.Fprintf(hc.Stderr, "rg: %v\n", serr)
 			}
 			return exitError{2}
-		}
-		if out.Len() > 0 && !opts.quiet {
-			if _, werr := hc.Stdout.Write(out.Bytes()); werr != nil {
-				if isPipeClosed(werr) {
-					return werr
-				}
-				return exitError{2}
-			}
 		}
 		if matched {
 			return nil
@@ -1432,11 +1427,17 @@ type rgFileJob struct {
 }
 
 type rgFileResult struct {
-	idx     int
-	out     []byte
-	matched bool
-	err     error
+	idx         int
+	displayPath string
+	isStdin     bool
+	out         []byte
+	matched     bool
+	err         error
 }
+
+type rgWriteFunc func([]byte) (int, error)
+
+func (fn rgWriteFunc) Write(p []byte) (int, error) { return fn(p) }
 
 func formatRgChildDisplay(parentDisplay, name string) string {
 	if parentDisplay == "" || parentDisplay == "." {
@@ -1712,18 +1713,20 @@ func runRgSearchTargets(
 				if searchCtx.Err() != nil {
 					return
 				}
+				if job.isStdin {
+					select {
+					case results <- rgFileResult{idx: job.idx, displayPath: job.displayPath, isStdin: true}:
+					case <-searchCtx.Done():
+						return
+					}
+					continue
+				}
 				localBuf.Reset()
-				var matched bool
-				var err error
 				label := ""
 				if showFilename {
 					label = job.displayPath
 				}
-				if job.isStdin {
-					matched, _, err = rgSearchReader(searchCtx, hc.Stdin, label, opts, matcher, showFilename, showLineNum, &localBuf)
-				} else {
-					matched, err = rgSearchFile(searchCtx, job, label, opts, matcher, showFilename, showLineNum, &localBuf)
-				}
+				matched, err := rgSearchFile(searchCtx, job, label, opts, matcher, showFilename, showLineNum, &localBuf)
 				var outCopy []byte
 				if localBuf.Len() > 0 && !opts.quiet {
 					outCopy = append([]byte(nil), localBuf.Bytes()...)
@@ -1803,6 +1806,47 @@ func runRgSearchTargets(
 			}
 			delete(pending, nextIdx)
 			nextIdx++
+			if cur.isStdin {
+				var stdinBuf bytes.Buffer
+				label := ""
+				if showFilename {
+					label = cur.displayPath
+				}
+				streamW := rgWriteFunc(func(p []byte) (int, error) {
+					if len(p) == 0 || opts.quiet {
+						return len(p), nil
+					}
+					if needCtxFileSep && printedHunkFile {
+						if _, werr := hc.Stdout.Write([]byte("--\n")); werr != nil {
+							return 0, werr
+						}
+					}
+					printedHunkFile = true
+					return hc.Stdout.Write(p)
+				})
+				sMatched, _, serr := rgSearchReader(searchCtx, hc.Stdin, streamW, label, opts, matcher, showFilename, showLineNum, &stdinBuf)
+				if sMatched {
+					anyMatch = true
+					if opts.quiet {
+						cancel()
+						break
+					}
+				}
+				if serr != nil {
+					if isPipeClosed(serr) {
+						pipeErr = serr
+						cancel()
+						break
+					}
+					if ctx.Err() == nil {
+						hadErr.Store(true)
+						if !opts.noMessages {
+							fmt.Fprintf(hc.Stderr, "rg: %v\n", serr)
+						}
+					}
+				}
+				continue
+			}
 			if len(cur.out) > 0 && !opts.quiet && pipeErr == nil {
 				if needCtxFileSep && printedHunkFile {
 					if _, werr := hc.Stdout.Write([]byte("--\n")); werr != nil {
@@ -1914,6 +1958,7 @@ func writeRgFileMatchName(out *bytes.Buffer, name string, nullSep bool) {
 func rgSearchReader(
 	ctx context.Context,
 	r io.Reader,
+	streamTo io.Writer,
 	label string,
 	opts *rgOptions,
 	matcher *rgMatcher,
@@ -1925,7 +1970,7 @@ func rgSearchReader(
 	if displayName == "" {
 		displayName = "<stdin>"
 	}
-	matched, matchedLines := rgSearchStream(ctx, displayName, label, opts, matcher, showFilename, showLineNum, true, out, func() ([]byte, bool) {
+	matched, matchedLines, serr := rgSearchStream(ctx, displayName, label, opts, matcher, showFilename, showLineNum, true, out, streamTo, func() ([]byte, bool) {
 		if !lr.Scan() {
 			return nil, false
 		}
@@ -1935,6 +1980,9 @@ func rgSearchReader(
 		}
 		return []byte(line), true
 	})
+	if serr != nil {
+		return matched, matchedLines, serr
+	}
 	if err := lr.Err(); err != nil {
 		return matched, matchedLines, err
 	}
@@ -1954,7 +2002,7 @@ func rgSearchBytes(
 	out *bytes.Buffer,
 ) bool {
 	pos := 0
-	matched, _ := rgSearchStream(ctx, displayPath, label, opts, matcher, showFilename, showLineNum, false, out, func() ([]byte, bool) {
+	matched, _, _ := rgSearchStream(ctx, displayPath, label, opts, matcher, showFilename, showLineNum, false, out, nil, func() ([]byte, bool) {
 		if pos >= len(data) {
 			return nil, false
 		}
@@ -1982,8 +2030,9 @@ func rgSearchStream(
 	matcher *rgMatcher,
 	showFilename, showLineNum, copyRing bool,
 	out *bytes.Buffer,
+	streamTo io.Writer,
 	nextLine func() ([]byte, bool),
-) (bool, int) {
+) (bool, int, error) {
 	type ctxLine struct {
 		num  int
 		text []byte
@@ -1996,6 +2045,18 @@ func rgSearchStream(
 	useContext := (opts.beforeCtx > 0 || opts.afterCtx > 0) &&
 		!opts.filesWithMatches && !opts.filesWithoutMatch && !opts.count && !opts.vimgrep && !opts.onlyMatching && !opts.passthru
 
+	flush := func() error {
+		if streamTo == nil || out.Len() == 0 {
+			return nil
+		}
+		var werr error
+		if !opts.quiet {
+			_, werr = streamTo.Write(out.Bytes())
+		}
+		out.Reset()
+		return werr
+	}
+
 	lineNum := 0
 	matchedLines := 0
 	totalMatchSpans := 0
@@ -2005,7 +2066,7 @@ func rgSearchStream(
 
 	for {
 		if (copyRing || lineNum&255 == 0) && ctx.Err() != nil {
-			return matchedLines > 0, matchedLines
+			return matchedLines > 0, matchedLines, ctx.Err()
 		}
 		lineBytes, ok := nextLine()
 		if !ok {
@@ -2019,17 +2080,18 @@ func rgSearchStream(
 			isMatch = matcher.matchLine(lineBytes) != opts.invertMatch
 		}
 
+		stopLoop := false
 		if isMatch {
 			matchedLines++
 			if opts.quiet {
-				return true, matchedLines
+				return true, matchedLines, nil
 			}
 			if opts.filesWithMatches {
 				writeRgFileMatchName(out, displayPath, opts.nullSep)
-				return true, matchedLines
+				return true, matchedLines, flush()
 			}
 			if opts.filesWithoutMatch {
-				return false, matchedLines
+				return false, matchedLines, nil
 			}
 			if opts.count {
 				if opts.countMatches && !opts.invertMatch {
@@ -2070,21 +2132,19 @@ func rgSearchStream(
 				afterRemaining = opts.afterCtx
 			}
 			if opts.maxCount > 0 && matchedLines >= opts.maxCount && afterRemaining == 0 && !opts.passthru {
-				break
+				stopLoop = true
 			}
 		} else {
 			if opts.passthru && !opts.filesWithMatches && !opts.filesWithoutMatch && !opts.count && !opts.quiet {
 				writeRgFormattedLine(out, label, showFilename, showLineNum, opts.nullSep, '-', lineNum, lineBytes)
 				lastPrintedLine = lineNum
-				continue
-			}
-			if useContext {
+			} else if useContext {
 				if afterRemaining > 0 {
 					writeRgFormattedLine(out, label, showFilename, showLineNum, opts.nullSep, '-', lineNum, lineBytes)
 					lastPrintedLine = lineNum
 					afterRemaining--
 					if opts.maxCount > 0 && matchedLines >= opts.maxCount && afterRemaining == 0 {
-						break
+						stopLoop = true
 					}
 				} else if opts.beforeCtx > 0 {
 					if opts.maxCount > 0 && matchedLines >= opts.maxCount {
@@ -2105,19 +2165,28 @@ func rgSearchStream(
 				break
 			}
 		}
+
+		if streamTo != nil && out.Len() > 0 {
+			if werr := flush(); werr != nil {
+				return matchedLines > 0, matchedLines, werr
+			}
+		}
+		if stopLoop {
+			break
+		}
 	}
 
 	if opts.filesWithoutMatch {
 		if matchedLines == 0 {
 			writeRgFileMatchName(out, displayPath, opts.nullSep)
-			return true, 0
+			return true, 0, flush()
 		}
-		return false, matchedLines
+		return false, matchedLines, nil
 	}
 	if opts.count && totalMatchSpans > 0 {
 		writeRgCountLine(out, label, showFilename, opts.nullSep, totalMatchSpans)
 	}
-	return matchedLines > 0, matchedLines
+	return matchedLines > 0, matchedLines, flush()
 }
 
 func writeRgCountLine(out *bytes.Buffer, label string, showFilename, nullSep bool, n int) {

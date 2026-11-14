@@ -751,6 +751,21 @@ func TestAgentToolsCancelAndEPIPE(t *testing.T) {
 		}
 	}
 
+	// Unbounded producer -> streaming rg stdin -> head -n 2 must stream immediately and exit 0 without buffering until EOF!
+	for _, tc := range []struct {
+		script string
+		want   string
+	}{
+		{`yes NEEDLE | rg NEEDLE | head -n 2`, "NEEDLE\nNEEDLE\n"},
+		{`yes NEEDLE | rg -n NEEDLE - /dev/null | head -n 2`, "<stdin>:1:NEEDLE\n<stdin>:2:NEEDLE\n"},
+		{`yes NEEDLE | rg --passthru OTHER | head -n 2`, "NEEDLE\nNEEDLE\n"},
+	} {
+		outS, stderrS, errS := runAgentScript(t, dir, tc.script)
+		if agentExitCode(errS) != 0 || stderrS != "" || outS != tc.want {
+			t.Fatalf("streaming stdin %q failed: code=%d stderr=%q got=%q want=%q", tc.script, agentExitCode(errS), stderrS, outS, tc.want)
+		}
+	}
+
 	// /dev/null cross-platform safety (including classic `rg pat file /dev/null` filename trick on Windows!)
 	outDevNull, stderrDN, errDN := runAgentScript(t, dir, `
 		rg match_row_0000 big.txt /dev/null
