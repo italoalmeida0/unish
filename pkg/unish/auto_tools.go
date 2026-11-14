@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -229,7 +231,7 @@ func cmdSponge(ctx context.Context, hc interp.HandlerContext, args []string) err
 	if isNullDevPath(pos[0]) || isToolDevNull(pos[0]) {
 		return nil
 	}
-	if pw, ok, perr := openProcSubstOut(pos[0]); ok {
+	if pw, ok, perr := openProcSubstOut(ctx, pos[0]); ok {
 		if perr != nil {
 			_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], perr)
 			return exitError{1}
@@ -398,6 +400,10 @@ func cmdFlock(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			_, _ = fmt.Fprintf(hc.Stderr, "flock: bad file descriptor: %s\n", lockTarget)
 			return exitError{2}
 		}
+		if (CapabilityHookFromContext(ctx) != nil || !standaloneCLIMode.Load()) && stdioOSFile(fd, hc) == nil {
+			_, _ = fmt.Fprintf(hc.Stderr, "flock: bad file descriptor: %d\n", fd)
+			return exitError{1}
+		}
 		tryLock, doUnlock, err := resolveFlockFD(fd, hc)
 		if err != nil {
 			_, _ = fmt.Fprintf(hc.Stderr, "flock: %v\n", err)
@@ -542,6 +548,89 @@ func acquireFlockWithDeadline(
 	}
 }
 
+func flockOpenHandler() interp.OpenHandlerFunc {
+	return func(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+		if isWriteOnlyDevNull(path, flag) {
+			return sharedDevNull, nil
+		}
+		mc := interp.HandlerCtx(ctx)
+		f, err := fsOpenFile(ctx, mc.Dir, "open", path, flag, perm)
+		if err != nil {
+			var pe *os.PathError
+			if !errors.As(err, &pe) {
+				return nil, &os.PathError{Op: "open", Path: path, Err: err}
+			}
+			return nil, err
+		}
+		return f, nil
+	}
+}
+
+func flockReadDirHandler() interp.ReadDirHandlerFunc2 {
+	return func(ctx context.Context, path string) ([]fs.DirEntry, error) {
+		mc := interp.HandlerCtx(ctx)
+		return fsReadDir(ctx, mc.Dir, "glob", path)
+	}
+}
+
+func flockStatHandler() interp.StatHandlerFunc {
+	return func(ctx context.Context, path string, followSymlinks bool) (fs.FileInfo, error) {
+		mc := interp.HandlerCtx(ctx)
+		if !followSymlinks {
+			return fsLstat(ctx, mc.Dir, "stat", path)
+		}
+		return fsStat(ctx, mc.Dir, "stat", path)
+	}
+}
+
+func flockAccessHandler() interp.AccessHandlerFunc {
+	defAccess := interp.DefaultAccessHandler()
+	return func(ctx context.Context, path string, mode interp.AccessMode) error {
+		mc := interp.HandlerCtx(ctx)
+		fi, err := fsStat(ctx, mc.Dir, "access", path)
+		if err != nil {
+			return err
+		}
+		if CapabilityHookFromContext(ctx) != nil {
+			if mode&interp.AccessRead != 0 {
+				if _, err := checkFS(ctx, mc.Dir, "access", path, OpRead); err != nil {
+					return err
+				}
+			}
+			if mode&interp.AccessWrite != 0 {
+				if _, err := checkFS(ctx, mc.Dir, "access", path, OpWrite); err != nil {
+					return err
+				}
+			}
+			if mode&interp.AccessExec != 0 {
+				if fi.IsDir() {
+					if _, err := checkChdir(ctx, mc.Dir, "access", path); err != nil {
+						return err
+					}
+				} else {
+					if _, err := checkExec(ctx, "access", path, []string{path}, mc.Dir); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		if runtime.GOOS == "windows" {
+			m := fi.Mode()
+			if mode&interp.AccessRead != 0 && m&0o400 == 0 {
+				return os.ErrPermission
+			}
+			if mode&interp.AccessWrite != 0 && m&0o200 == 0 {
+				return os.ErrPermission
+			}
+			if mode&interp.AccessExec != 0 && m&0o100 == 0 {
+				return os.ErrPermission
+			}
+			return nil
+		}
+		return defAccess(ctx, resolveHostPath(mc.Dir, path), mode)
+	}
+}
+
 func runFlockShellCommand(ctx context.Context, hc interp.HandlerContext, src string) error {
 	if strings.TrimSpace(src) == "" {
 		return nil
@@ -556,15 +645,18 @@ func runFlockShellCommand(ctx context.Context, hc interp.HandlerContext, src str
 		interp.Env(hc.Env),
 		interp.StdIO(hc.Stdin, hc.Stdout, hc.Stderr),
 		interp.CallHandler(callOverride),
-		interp.OpenHandler(shellOpenHandler()),
-		interp.ExecHandlers(extraHandler),
+		interp.OpenHandler(flockOpenHandler()),
+		interp.ReadDirHandler2(flockReadDirHandler()),
+		interp.StatHandler(flockStatHandler()),
+		interp.AccessHandler(flockAccessHandler()),
+		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
 	if err != nil {
 		_, _ = fmt.Fprintf(hc.Stderr, "flock: %v\n", err)
 		return exitError{1}
 	}
-	if err := r.Run(ctx, prog); err != nil {
+	if err := r.Run(withProcSubstScope(ctx, hc), prog); err != nil {
 		if code, ok := subcommandExitCode(err); ok {
 			return exitError{code}
 		}
@@ -1165,7 +1257,7 @@ seekDone:
 			return nil
 		}
 		perm := os.FileMode(0o644)
-		if !isActiveProcSubstPath(outArg) {
+		if !isActiveProcSubstPath(ctx, outArg) {
 			if fi, err := fsStat(ctx, hc.Dir, "xxd", outArg); err == nil {
 				perm = fi.Mode().Perm()
 			} else if !os.IsNotExist(err) {
@@ -1406,7 +1498,7 @@ func xxdRevert(
 
 	// Canonical hexdump revert: parse "<hex-offset>: <grouped hex>  <ascii>"
 	var out []byte
-	if outToFile && seekOff != 0 && !isNullDevPath(outArg) && !isToolDevNull(outArg) && !isActiveProcSubstPath(outArg) {
+	if outToFile && seekOff != 0 && !isNullDevPath(outArg) && !isToolDevNull(outArg) && !isActiveProcSubstPath(ctx, outArg) {
 		if existing, err := fsReadFile(ctx, hc.Dir, "xxd", outArg); err == nil {
 			out = existing
 		} else if !os.IsNotExist(err) {
@@ -1509,7 +1601,7 @@ func xxdWriteReverted(ctx context.Context, hc interp.HandlerContext, outToFile b
 			return nil
 		}
 		perm := os.FileMode(0o644)
-		if !isActiveProcSubstPath(outArg) {
+		if !isActiveProcSubstPath(ctx, outArg) {
 			if fi, err := fsStat(ctx, hc.Dir, "xxd", outArg); err == nil {
 				perm = fi.Mode().Perm()
 			} else if !os.IsNotExist(err) {

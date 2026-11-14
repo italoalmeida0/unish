@@ -246,7 +246,7 @@ func cmdRg(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	hasDirTarget := false
 	if !searchStdinOnly {
 		for _, t := range targets {
-			if t == "-" || t == "/dev/stdin" || isActiveProcSubstPath(t) {
+			if t == "-" || t == "/dev/stdin" || isActiveProcSubstPath(ctx, t) {
 				continue
 			}
 			if fi, serr := fsStat(ctx, hc.Dir, "rg", t); serr == nil && fi.IsDir() {
@@ -1477,7 +1477,7 @@ func walkRgTarget(
 		emit(target, os.DevNull, filepath.ToSlash(target), false, true)
 		return
 	}
-	if isActiveProcSubstPath(target) {
+	if isActiveProcSubstPath(ctx, target) {
 		emit(target, target, filepath.ToSlash(target), false, true)
 		return
 	}

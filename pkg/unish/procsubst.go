@@ -20,6 +20,7 @@ import (
 	"context"
 	"io"
 	"os"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -62,10 +63,150 @@ func winProcSubstRegister(st *winProcSubst) {
 	winProcSubstRegistry.mu.Unlock()
 }
 
-func winProcSubstLookup(name string) *winProcSubst {
+type procSubstScopeKey struct{}
+
+func procSubstScopeFromHC(hc interp.HandlerContext) uintptr {
+	rv := reflect.ValueOf(hc)
+	if !rv.IsValid() || rv.Kind() != reflect.Struct {
+		return 0
+	}
+	rf := rv.FieldByName("runner")
+	if !rf.IsValid() || rf.Kind() != reflect.Pointer || rf.IsNil() {
+		return 0
+	}
+	pf := rf.Elem().FieldByName("procSubsts")
+	if !pf.IsValid() || pf.Kind() != reflect.Pointer || pf.IsNil() {
+		return 0
+	}
+	return pf.Pointer()
+}
+
+func procSubstRunnerScope(ctx context.Context) (scope uintptr) {
+	if ctx == nil {
+		return 0
+	}
+	if id, ok := ctx.Value(procSubstScopeKey{}).(uintptr); ok && id != 0 {
+		return id
+	}
+	defer func() {
+		if recover() != nil {
+			scope = 0
+		}
+	}()
+	return procSubstScopeFromHC(interp.HandlerCtx(ctx))
+}
+
+func procSubstEntryScope(ctx context.Context, h CapabilityHook) uintptr {
+	if h == nil || reflect.TypeOf(h).Comparable() {
+		return 0
+	}
+	return procSubstRunnerScope(ctx)
+}
+
+func withProcSubstScope(ctx context.Context, hc interp.HandlerContext) context.Context {
+	h := CapabilityHookFromContext(ctx)
+	if h == nil || reflect.TypeOf(h).Comparable() {
+		return ctx
+	}
+	if scope := procSubstScopeFromHC(hc); scope != 0 {
+		return context.WithValue(ctx, procSubstScopeKey{}, scope)
+	}
+	return ctx
+}
+
+// sameProcSubstOwner reports whether a process-substitution entry created under
+// (entryHook, entryScope) may be consumed without checkFS by ctx.
+// When reqHook is nil (unjailed consumer), any active procsubst in this process
+// is permitted. When reqHook is non-nil (jailed consumer), entryHook must be
+// non-nil and match reqHook's identity, safely handling non-comparable hook
+// concrete types (including closures) without panicking or cross-session leaks.
+func sameProcSubstOwner(entryHook CapabilityHook, entryScope uintptr, ctx context.Context) bool {
+	reqHook := CapabilityHookFromContext(ctx)
+	if reqHook == nil {
+		return true
+	}
+	if entryHook == nil {
+		return false
+	}
+	t1 := reflect.TypeOf(entryHook)
+	t2 := reflect.TypeOf(reqHook)
+	if t1 != t2 {
+		return false
+	}
+	if t1.Comparable() {
+		return entryHook == reqHook
+	}
+	reqScope := procSubstRunnerScope(ctx)
+	if entryScope == 0 || reqScope == 0 || entryScope != reqScope {
+		return false
+	}
+	return sameNonComparableValue(reflect.ValueOf(entryHook), reflect.ValueOf(reqHook))
+}
+
+func sameNonComparableValue(v1, v2 reflect.Value) bool {
+	if !v1.IsValid() || !v2.IsValid() || v1.Type() != v2.Type() {
+		return false
+	}
+	switch v1.Kind() {
+	case reflect.Func, reflect.Map:
+		if v1.IsNil() || v2.IsNil() {
+			return v1.IsNil() && v2.IsNil()
+		}
+		return v1.Pointer() == v2.Pointer()
+	case reflect.Slice:
+		if v1.IsNil() || v2.IsNil() {
+			return v1.IsNil() && v2.IsNil()
+		}
+		return v1.Len() == v2.Len() && v1.Pointer() == v2.Pointer()
+	case reflect.Struct:
+		for i := 0; i < v1.NumField(); i++ {
+			f1, f2 := v1.Field(i), v2.Field(i)
+			if f1.Type().Comparable() && f1.CanInterface() && f2.CanInterface() {
+				if f1.Interface() != f2.Interface() {
+					return false
+				}
+				continue
+			}
+			if !sameNonComparableValue(f1, f2) {
+				return false
+			}
+		}
+		return true
+	case reflect.Array:
+		for i := 0; i < v1.Len(); i++ {
+			if !sameNonComparableValue(v1.Index(i), v2.Index(i)) {
+				return false
+			}
+		}
+		return true
+	case reflect.Interface:
+		if v1.IsNil() || v2.IsNil() {
+			return v1.IsNil() && v2.IsNil()
+		}
+		e1, e2 := v1.Elem(), v2.Elem()
+		if e1.Type() != e2.Type() {
+			return false
+		}
+		if e1.Type().Comparable() && e1.CanInterface() && e2.CanInterface() {
+			return e1.Interface() == e2.Interface()
+		}
+		return sameNonComparableValue(e1, e2)
+	default:
+		return false
+	}
+}
+
+func winProcSubstLookup(ctx context.Context, name string) *winProcSubst {
 	winProcSubstRegistry.mu.Lock()
-	defer winProcSubstRegistry.mu.Unlock()
-	return winProcSubstRegistry.m[name]
+	st := winProcSubstRegistry.m[name]
+	winProcSubstRegistry.mu.Unlock()
+	if st == nil {
+		return nil
+	}
+	if !sameProcSubstOwner(st.hook, st.scope, ctx) {
+		return nil
+	}
+	return st
 }
 
 func winProcSubstRemove(name string) {
@@ -74,25 +215,38 @@ func winProcSubstRemove(name string) {
 	winProcSubstRegistry.mu.Unlock()
 }
 
+type unixProcSubst struct {
+	op           syntax.ProcOperator
+	hook         CapabilityHook
+	scope        uintptr
+	openConsumer func(ctx context.Context, flag int) (io.ReadWriteCloser, error)
+}
+
 // unixProcSubstRegistry tracks active POSIX FIFO paths created by procSubstHandler
 // so builtins using fsOpenShellFile/fsReadShellFile can open runtime IPC pipes
-// without tripping workspace-only CapabilityHook jails.
+// belonging to their own CapabilityHook without tripping workspace-only jails.
 var unixProcSubstRegistry = struct {
 	mu sync.Mutex
-	m  map[string]syntax.ProcOperator
-}{m: map[string]syntax.ProcOperator{}}
+	m  map[string]*unixProcSubst
+}{m: map[string]*unixProcSubst{}}
 
-func unixProcSubstRegister(path string, op syntax.ProcOperator) {
+func unixProcSubstRegister(path string, st *unixProcSubst) {
 	unixProcSubstRegistry.mu.Lock()
-	unixProcSubstRegistry.m[path] = op
+	unixProcSubstRegistry.m[path] = st
 	unixProcSubstRegistry.mu.Unlock()
 }
 
-func unixProcSubstLookup(path string) (syntax.ProcOperator, bool) {
+func unixProcSubstLookup(ctx context.Context, path string) (*unixProcSubst, bool) {
 	unixProcSubstRegistry.mu.Lock()
-	op, ok := unixProcSubstRegistry.m[path]
+	st, ok := unixProcSubstRegistry.m[path]
 	unixProcSubstRegistry.mu.Unlock()
-	return op, ok
+	if !ok || st == nil {
+		return nil, false
+	}
+	if !sameProcSubstOwner(st.hook, st.scope, ctx) {
+		return nil, false
+	}
+	return st, true
 }
 
 func unixProcSubstRemove(path string) {
@@ -102,15 +256,15 @@ func unixProcSubstRemove(path string) {
 }
 
 // isActiveProcSubstPath reports whether rawPath is a live process-substitution
-// IPC path synthesized by procSubstHandler in this process.
-func isActiveProcSubstPath(rawPath string) bool {
+// IPC path synthesized by procSubstHandler for ctx's CapabilityHook.
+func isActiveProcSubstPath(ctx context.Context, rawPath string) bool {
 	if rawPath == "" {
 		return false
 	}
-	if winProcSubstLookup(rawPath) != nil {
+	if winProcSubstLookup(ctx, rawPath) != nil {
 		return true
 	}
-	_, ok := unixProcSubstLookup(rawPath)
+	_, ok := unixProcSubstLookup(ctx, rawPath)
 	return ok
 }
 
@@ -124,7 +278,7 @@ func waitProcSubstProducerCtx(ctx context.Context, path string) {
 	if !strings.Contains(path, "unish-procsub-") {
 		return
 	}
-	if st := winProcSubstLookup(path); st != nil && st.op == syntax.CmdIn {
+	if st := winProcSubstLookup(ctx, path); st != nil && st.op == syntax.CmdIn {
 		// Bounded: a dead producer must not hang the consumer
 		// forever (30s backstop; producers are local commands).
 		select {
@@ -139,6 +293,8 @@ func waitProcSubstProducerCtx(ctx context.Context, path string) {
 type winProcSubst struct {
 	name         string
 	op           syntax.ProcOperator
+	hook         CapabilityHook
+	scope        uintptr
 	producerDone chan struct{}
 	consumerDone chan struct{}
 	prodOnce     sync.Once
@@ -252,13 +408,20 @@ func (f *countedFile) Close() error {
 // procSubstHandler dispatches to the temp-file implementation on Windows
 // and to mvdan/sh's default (FIFO-based) implementation elsewhere.
 func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.ProcSubstFile, error) {
+	entryHook := CapabilityHookFromContext(ctx)
+	entryScope := procSubstEntryScope(ctx, entryHook)
 	if runtime.GOOS != "windows" {
 		psf, err := interp.DefaultProcSubstHandler()(ctx, op)
 		if err != nil || psf == nil {
 			return psf, err
 		}
 		fifoPath := psf.Path
-		unixProcSubstRegister(fifoPath, op)
+		unixProcSubstRegister(fifoPath, &unixProcSubst{
+			op:           op,
+			hook:         entryHook,
+			scope:        entryScope,
+			openConsumer: psf.OpenConsumer,
+		})
 		origCleanup := psf.Cleanup
 		psf.Cleanup = func() error {
 			defer unixProcSubstRemove(fifoPath)
@@ -278,6 +441,8 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 	st := &winProcSubst{
 		name:         name,
 		op:           op,
+		hook:         entryHook,
+		scope:        entryScope,
 		producerDone: make(chan struct{}),
 		consumerDone: make(chan struct{}),
 	}
@@ -365,7 +530,7 @@ func openShellFile(path string) (io.ReadWriteCloser, error) {
 	// hc.Stdin through devStdinReader instead of openShellFile, so this
 	// is only reached on unix (real /dev/stdin) or odd spellings —
 	// keep the direct open so the true OS error surfaces.
-	if st := winProcSubstLookup(path); st != nil && st.op == syntax.CmdIn {
+	if st := winProcSubstLookup(context.Background(), path); st != nil && st.op == syntax.CmdIn {
 		select {
 		case <-st.producerDone:
 		case <-time.After(30 * time.Second):
@@ -409,7 +574,7 @@ func readShellFile(path string) ([]byte, error) {
 // on ordinary files, and allows active `<(cmd)` runtime IPC paths created by
 // procSubstHandler even when os.TempDir() is outside the workspace jail.
 func fsOpenShellFile(ctx context.Context, dir, cmdName, rawPath string) (io.ReadWriteCloser, error) {
-	if st := winProcSubstLookup(rawPath); st != nil && st.op == syntax.CmdIn {
+	if st := winProcSubstLookup(ctx, rawPath); st != nil && st.op == syntax.CmdIn {
 		select {
 		case <-st.producerDone:
 		case <-ctx.Done():
@@ -423,7 +588,10 @@ func fsOpenShellFile(ctx context.Context, dir, cmdName, rawPath string) (io.Read
 		st.consumerOpen()
 		return &refcountedFileShim{File: f, st: st}, nil
 	}
-	if op, ok := unixProcSubstLookup(rawPath); ok && op == syntax.CmdIn {
+	if st, ok := unixProcSubstLookup(ctx, rawPath); ok && st.op == syntax.CmdIn {
+		if st.openConsumer != nil {
+			return st.openConsumer(ctx, os.O_RDONLY)
+		}
 		return os.Open(rawPath)
 	}
 	p, err := checkFS(ctx, dir, cmdName, rawPath, OpRead)
@@ -445,9 +613,9 @@ func fsReadShellFile(ctx context.Context, dir, cmdName, rawPath string) ([]byte,
 }
 
 // openProcSubstOut opens a `>(cmd)` process-substitution output sink when
-// rawPath is an active CmdOut IPC path synthesized by procSubstHandler.
-func openProcSubstOut(rawPath string) (io.WriteCloser, bool, error) {
-	if st := winProcSubstLookup(rawPath); st != nil && st.op == syntax.CmdOut {
+// rawPath is an active CmdOut IPC path synthesized by procSubstHandler for ctx's hook.
+func openProcSubstOut(ctx context.Context, rawPath string) (io.WriteCloser, bool, error) {
+	if st := winProcSubstLookup(ctx, rawPath); st != nil && st.op == syntax.CmdOut {
 		w, err := openFileRetry(rawPath, os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			st.finishConsumer()
@@ -456,7 +624,11 @@ func openProcSubstOut(rawPath string) (io.WriteCloser, bool, error) {
 		st.consumerOpen()
 		return &countedFile{File: w, onClose: st.consumerWriterClose}, true, nil
 	}
-	if op, ok := unixProcSubstLookup(rawPath); ok && op == syntax.CmdOut {
+	if st, ok := unixProcSubstLookup(ctx, rawPath); ok && st.op == syntax.CmdOut {
+		if st.openConsumer != nil {
+			w, err := st.openConsumer(ctx, os.O_WRONLY)
+			return w, true, err
+		}
 		w, err := os.OpenFile(rawPath, os.O_WRONLY, 0o600)
 		return w, true, err
 	}

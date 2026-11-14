@@ -154,7 +154,7 @@ func cmdPatch(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		patchData = nil
 	} else {
 		pDir := baseDir
-		if !isActiveProcSubstPath(opts.inputFile) && opts.workDir != "" {
+		if !isActiveProcSubstPath(ctx, opts.inputFile) && opts.workDir != "" {
 			if _, serr := fsStat(ctx, baseDir, "patch", opts.inputFile); serr != nil {
 				if errors.Is(serr, os.ErrPermission) {
 					fmt.Fprintf(hc.Stderr, "patch: **** Can't open patch file %s : %v\n", opts.inputFile, serr)
@@ -1171,7 +1171,7 @@ func fsAtomicWriteFile(ctx context.Context, dir, cmdName, rawPath string, data [
 	if isNullDevPath(rawPath) || isToolDevNull(rawPath) {
 		return nil
 	}
-	if pw, ok, perr := openProcSubstOut(rawPath); ok {
+	if pw, ok, perr := openProcSubstOut(ctx, rawPath); ok {
 		if perr != nil {
 			return perr
 		}
@@ -1198,6 +1198,26 @@ func fsAtomicWriteFile(ctx context.Context, dir, cmdName, rawPath string, data [
 	parentDir := filepath.Dir(targetPath)
 	if err := fsMkdirAll(ctx, "", cmdName, parentDir, 0o755); err != nil {
 		return err
+	}
+	if CapabilityHookFromContext(ctx) != nil {
+		if _, derr := checkFSNoFollowLeaf(ctx, "", cmdName, filepath.Join(parentDir, ".unish-atomic-probe"), OpDelete); derr != nil {
+			if errors.Is(derr, context.Canceled) || errors.Is(derr, context.DeadlineExceeded) {
+				return derr
+			}
+			if runtime.GOOS == "windows" {
+				if dfi, serr := fsStat(ctx, "", cmdName, targetPath); serr == nil && dfi.Mode()&0o200 == 0 {
+					_ = fsChmod(ctx, "", cmdName, targetPath, 0o666)
+					defer func() { _ = fsChmod(ctx, "", cmdName, targetPath, perm) }()
+				}
+			}
+			if werr := fsWriteFile(ctx, dir, cmdName, rawPath, data, perm); werr != nil {
+				return werr
+			}
+			if runtime.GOOS != "windows" && perm != 0 {
+				_ = fsChmod(ctx, "", cmdName, targetPath, perm)
+			}
+			return nil
+		}
 	}
 	tmp, err := fsCreateTemp(ctx, "", cmdName, parentDir, ".unish-atomic-*")
 	if err != nil {
@@ -1229,13 +1249,6 @@ func fsAtomicWriteFile(ctx context.Context, dir, cmdName, rawPath string, data [
 		}
 	}
 	if err := fsRename(ctx, "", cmdName, tmpName, targetPath); err != nil {
-		if errors.Is(err, os.ErrPermission) {
-			// If a policy allows OpWrite on targetPath/parentDir while denying OpDelete
-			// on the ephemeral temp file, fall back to direct fsWriteFile after removing temp.
-			if werr := fsWriteFile(ctx, dir, cmdName, rawPath, data, perm); werr == nil {
-				return nil
-			}
-		}
 		return err
 	}
 	if runtime.GOOS != "windows" && perm != 0 {

@@ -97,7 +97,7 @@ func tarOpenWriter(ctx context.Context, hc interp.HandlerContext, archiveRaw str
 	var f io.Closer
 	raw := hc.Stdout
 	if archiveRaw != "-" {
-		if pw, ok, perr := openProcSubstOut(archiveRaw); ok {
+		if pw, ok, perr := openProcSubstOut(ctx, archiveRaw); ok {
 			if perr != nil {
 				return nil, nil, nil, perr
 			}
@@ -204,7 +204,7 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archiveRaw, base s
 		return exitError{1}
 	}
 	var archFi os.FileInfo
-	if archiveRaw != "-" && !isActiveProcSubstPath(archiveRaw) {
+	if archiveRaw != "-" && !isActiveProcSubstPath(ctx, archiveRaw) {
 		archFi, _ = fsStat(ctx, hc.Dir, "tar", archiveRaw)
 	}
 	code := 0
@@ -925,7 +925,7 @@ func gzipRun(ctx context.Context, hc interp.HandlerContext, name string, args []
 			}
 			continue
 		}
-		if !isActiveProcSubstPath(p) {
+		if !isActiveProcSubstPath(ctx, p) {
 			sfi, serr := fsStat(ctx, hc.Dir, name, p)
 			if serr != nil {
 				fmt.Fprintf(hc.Stderr, "%s: %v\n", name, serr)

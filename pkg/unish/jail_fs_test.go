@@ -6,10 +6,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -913,5 +915,445 @@ flock -n session.lock -c 'cat unpacked/tree/sub/data.txt'
 	afterWD, err := os.Getwd()
 	if err != nil || afterWD != origWD {
 		t.Fatalf("process cwd changed after concurrent sessions: got %q, want %q", afterWD, origWD)
+	}
+}
+
+func TestJailFS_FlockShellHandlersAndNumericFD(t *testing.T) {
+	base := t.TempDir()
+	ws := filepath.Join(base, "ws")
+	outside := filepath.Join(base, "outside")
+	if err := os.MkdirAll(filepath.Join(ws, "sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(outside, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	secretPath := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(secretPath, []byte("FLOCK_OUTSIDE_SECRET\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "inside.txt"), []byte("inside_ok\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(ws, "script.sh"), []byte("#!/bin/sh\necho hi\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	hook := newFSPolicyHook(t, ws)
+	ctx := WithCapabilityHook(context.Background(), hook)
+
+	// 1. Glob expansion inside `flock -c` must enforce OpList via flockReadDirHandler.
+	out, _, rc := runJailedScript(t, ctx, ws, nil, `flock -n app.lock -c 'echo ../outside/*'`)
+	if rc != 0 {
+		t.Fatalf("flock -c unexpanded glob exited %d", rc)
+	}
+	if got := strings.TrimSpace(out); got != "../outside/*" {
+		t.Fatalf("flock -c leaked outside directory listing via glob: got %q, want literal %q", got, "../outside/*")
+	}
+
+	// 2. [[ -f / -e / -r / -w ]] and redirections inside `flock -c` must enforce OpStat / OpRead / OpWrite.
+	escapedChecks := []string{
+		`flock -n app.lock -c '[[ -e ../outside/secret.txt ]]'`,
+		`flock -n app.lock -c '[[ -f ../outside/secret.txt ]]'`,
+		`flock -n app.lock -c '[[ -r ../outside/secret.txt ]]'`,
+		`flock -n app.lock -c '[[ -w ../outside/secret.txt ]]'`,
+		`flock -n app.lock -c 'cd ../outside'`,
+		`flock -n app.lock -c 'echo pwn > ../outside/pwn.txt'`,
+		`flock -n app.lock -c 'read line < ../outside/secret.txt && printf "%s" "$line"'`,
+	}
+	for _, sc := range escapedChecks {
+		o, _, code := runJailedScript(t, ctx, ws, nil, sc)
+		if code == 0 {
+			t.Fatalf("expected flock -c escape check to fail, succeeded: %s (stdout=%q)", sc, o)
+		}
+		if strings.Contains(o, "FLOCK_OUTSIDE_SECRET") {
+			t.Fatalf("flock -c leaked secret on %s: %q", sc, o)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(outside, "pwn.txt")); !os.IsNotExist(err) {
+		t.Fatalf("flock -c redirection wrote outside jail: err=%v", err)
+	}
+
+	// 3. Inside-workspace glob, stat, read, and `cd subdir` work even when OpExec is denied,
+	// while external exec and [[ -x file ]] inside `flock -c` are blocked by OpExec.
+	hook.setDenyOp(OpExec, true)
+	out, stderr, rc := runJailedScript(t, ctx, ws, nil, `flock -n app.lock -c '[[ -f inside.txt && -r inside.txt ]] && cd sub && [[ -d . ]] && echo sub_ok'`)
+	if rc != 0 || strings.TrimSpace(out) != "sub_ok" {
+		t.Fatalf("flock -c legitimate workspace ops failed under OpExec deny: rc=%d out=%q stderr=%q", rc, out, stderr)
+	}
+	if _, _, code := runJailedScript(t, ctx, ws, nil, `flock -n app.lock -c '[[ -x script.sh ]]'`); code == 0 {
+		t.Fatalf("expected [[ -x script.sh ]] inside flock -c to fail when OpExec is denied")
+	}
+	extBin := findHostExternalBin(t)
+	if _, _, code := runJailedScript(t, ctx, ws, nil, fmt.Sprintf(`flock -n app.lock %s version`, extBin)); code != 126 {
+		t.Fatalf("expected flock external subcommand %s to exit 126 when OpExec is denied, got %d", extBin, code)
+	}
+	if _, _, code := runJailedScript(t, ctx, ws, nil, fmt.Sprintf(`flock -n app.lock -c 'xargs %s < inside.txt'`, extBin)); code == 0 {
+		t.Fatalf("expected xargs %s inside flock -c to fail when OpExec is denied", extBin)
+	}
+	hook.setDenyOp(OpExec, false)
+
+	// 4. Numeric FD mode (`flock <fd>`): hold a real open host *os.File outside the jail
+	// and verify neither jailed sessions nor embedded library sessions can probe/lock/unlock it.
+	hostFile, err := os.CreateTemp(outside, "host-open-fd-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer hostFile.Close()
+	hostFD := int(hostFile.Fd())
+
+	for _, tc := range []struct {
+		name string
+		ctx  context.Context
+		cmd  string
+	}{
+		{"jailed_host_fd_lock", ctx, fmt.Sprintf("flock -n %d", hostFD)},
+		{"jailed_host_fd_shared", ctx, fmt.Sprintf("flock -s -n %d", hostFD)},
+		{"jailed_host_fd_unlock", ctx, fmt.Sprintf("flock -u %d", hostFD)},
+		{"jailed_fd9", ctx, "flock -n 9"},
+		{"embedded_unjailed_host_fd_lock", context.Background(), fmt.Sprintf("flock -n %d", hostFD)},
+		{"embedded_unjailed_host_fd_unlock", context.Background(), fmt.Sprintf("flock -u %d", hostFD)},
+		{"embedded_unjailed_fd9", context.Background(), "flock -n 9"},
+	} {
+		_, errOut, code := runJailedScript(t, tc.ctx, ws, nil, tc.cmd)
+		if code != 1 {
+			t.Fatalf("%s (%q): got exit code %d, want 1 (stderr=%q)", tc.name, tc.cmd, code, errOut)
+		}
+		if !strings.Contains(strings.ToLower(errOut), "bad file descriptor") {
+			t.Fatalf("%s (%q): expected bad file descriptor diagnostic, got %q", tc.name, tc.cmd, errOut)
+		}
+	}
+}
+
+// nonComparableClosureHook is a value-receiver CapabilityHook containing a closure,
+// a map, and a slice so reflect.TypeOf(h).Comparable() is guaranteed false.
+type nonComparableClosureHook struct {
+	check func(context.Context, AccessRequest) error
+	tags  map[string]bool
+	rules []string
+}
+
+func makeNonComparableClosureHook(t *testing.T, root string) nonComparableClosureHook {
+	t.Helper()
+	base := newTestJailHook(t, root)
+	return nonComparableClosureHook{
+		check: func(ctx context.Context, req AccessRequest) error {
+			return base.CheckAccess(ctx, req)
+		},
+		tags:  map[string]bool{"jailed": true},
+		rules: []string{root},
+	}
+}
+
+func (h nonComparableClosureHook) CheckAccess(ctx context.Context, req AccessRequest) error {
+	return h.check(ctx, req)
+}
+
+func (h nonComparableClosureHook) DialContext(ctx context.Context, cmdName, network, address string) (net.Conn, error) {
+	return nil, &AccessDenialError{Op: OpNetConnect, Target: address, Reason: "network disabled"}
+}
+
+func (h nonComparableClosureHook) Listen(ctx context.Context, cmdName, network, address string) (net.Listener, error) {
+	return nil, &AccessDenialError{Op: OpNetListen, Target: address, Reason: "listen disabled"}
+}
+
+func (h nonComparableClosureHook) ListenPacket(ctx context.Context, cmdName, network, address string) (net.PacketConn, error) {
+	return nil, &AccessDenialError{Op: OpNetListen, Target: address, Reason: "listen disabled"}
+}
+
+func waitForPublishedPath(t *testing.T, file string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(file); err == nil && len(strings.TrimSpace(string(b))) > 0 {
+			return strings.TrimSpace(string(b))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for published procsubst path in %s", file)
+	return ""
+}
+
+func TestJailFS_ProcSubstCrossSessionIsolationAndNonComparableHooks(t *testing.T) {
+	base := t.TempDir()
+	wsA := filepath.Join(base, "wsA")
+	wsB := filepath.Join(base, "wsB")
+	wsUnjailed := filepath.Join(base, "wsUnjailed")
+	for _, d := range []string{wsA, wsB, wsUnjailed} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(wsB, "dummy.txt"), []byte("dummy\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(wsB, "b_in.txt"), []byte("evil_hex_source\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hookA := newFSPolicyHook(t, wsA)
+	hookB := newFSPolicyHook(t, wsB)
+	ctxA := WithCapabilityHook(context.Background(), hookA)
+	ctxB := WithCapabilityHook(context.Background(), hookB)
+
+	// 1. Cross-hook `<(...)` (CmdIn) isolation: Session A holds `<(...)` alive while Session B probes it.
+	doneA := make(chan struct{})
+	var outA, errA string
+	var rcA int
+	go func() {
+		defer close(doneA)
+		outA, errA, rcA = runJailedScript(t, ctxA, wsA, nil, `
+hold_in() {
+	local p="$1"
+	printf '%s\n' "$p" > ps_in.tmp
+	mv ps_in.tmp ps_in.txt
+	until [[ -f release_in.flag ]]; do
+		sleep 0.01
+	done
+	xxd -p "$p" > self_in.hex
+}
+hold_in <(printf 'TENANT_A_SECRET')
+`)
+	}()
+
+	procInA := waitForPublishedPath(t, filepath.Join(wsA, "ps_in.txt"))
+	if !isActiveProcSubstPath(ctxA, procInA) {
+		t.Fatalf("expected procInA %q to be active for ctxA", procInA)
+	}
+	if isActiveProcSubstPath(ctxB, procInA) {
+		t.Fatalf("procInA %q must NOT be active for ctxB", procInA)
+	}
+
+	// Session B attempts to read Session A's live `<(...)` path through every procsubst-aware builtin.
+	for _, cmd := range []string{
+		`xxd -p "$PS_TARGET"`,
+		`column "$PS_TARGET"`,
+		`rg '' "$PS_TARGET"`,
+		`patch -i "$PS_TARGET" dummy.txt`,
+		`tar -tf "$PS_TARGET"`,
+	} {
+		bOut, _, bRC := runJailedScript(t, ctxB, wsB, []string{"PS_TARGET=" + procInA}, cmd)
+		if bRC == 0 {
+			t.Fatalf("Session B unexpectedly succeeded reading Session A procsubst via %q (out=%q)", cmd, bOut)
+		}
+		if strings.Contains(bOut, "TENANT_A_SECRET") || strings.Contains(strings.ToLower(bOut), "54454e414e54") {
+			t.Fatalf("Session B leaked Session A procsubst content via %q: %q", cmd, bOut)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(wsA, "release_in.flag"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	<-doneA
+	if rcA != 0 {
+		t.Fatalf("Session A CmdIn holder failed: rc=%d out=%q stderr=%q", rcA, outA, errA)
+	}
+	hexA, err := os.ReadFile(filepath.Join(wsA, "self_in.hex"))
+	if err != nil || !strings.Contains(strings.ToLower(string(hexA)), "54454e414e545f415f534543524554") {
+		t.Fatalf("Session A failed to consume its own procsubst: hex=%q err=%v", string(hexA), err)
+	}
+
+	// 2. Cross-hook `>(...)` (CmdOut) isolation: Session A holds `>(...)` alive while Session B tries to inject into it.
+	doneOutA := make(chan struct{})
+	var errOutA string
+	var rcOutA int
+	go func() {
+		defer close(doneOutA)
+		_, errOutA, rcOutA = runJailedScript(t, ctxA, wsA, nil, `
+hold_out() {
+	local p="$1"
+	printf '%s\n' "$p" > ps_out.tmp
+	mv ps_out.tmp ps_out.txt
+	until [[ -f release_out.flag ]]; do
+		sleep 0.01
+	done
+	printf 'LEGIT_FROM_A\n' | sponge "$p"
+}
+hold_out >(sponge sink_a.txt)
+wait
+`)
+	}()
+
+	procOutA := waitForPublishedPath(t, filepath.Join(wsA, "ps_out.txt"))
+	for _, cmd := range []string{
+		`printf 'INJECTED_BY_B\n' | sponge "$PS_TARGET"`,
+		`xxd -p b_in.txt "$PS_TARGET"`,
+	} {
+		_, _, bRC := runJailedScript(t, ctxB, wsB, []string{"PS_TARGET=" + procOutA}, cmd)
+		if bRC == 0 {
+			t.Fatalf("Session B unexpectedly wrote to Session A CmdOut procsubst via %q", cmd)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(wsA, "release_out.flag"), []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	<-doneOutA
+	if rcOutA != 0 {
+		t.Fatalf("Session A CmdOut holder failed: rc=%d stderr=%q", rcOutA, errOutA)
+	}
+	sinkBytes, err := os.ReadFile(filepath.Join(wsA, "sink_a.txt"))
+	if err != nil || strings.TrimSpace(string(sinkBytes)) != "LEGIT_FROM_A" {
+		t.Fatalf("unexpected sink_a.txt content=%q err=%v", string(sinkBytes), err)
+	}
+
+	// 3. Unjailed session's `<(...)` path MUST NOT be readable by a jailed session.
+	doneUnjailed := make(chan struct{})
+	go func() {
+		defer close(doneUnjailed)
+		_, _, _ = runJailedScript(t, context.Background(), wsUnjailed, nil, `
+hold_u() {
+	local p="$1"
+	printf '%s\n' "$p" > ps_u.tmp
+	mv ps_u.tmp ps_u.txt
+	until [[ -f release_u.flag ]]; do
+		sleep 0.01
+	done
+	xxd -p "$p" >/dev/null
+}
+hold_u <(printf 'UNJAILED_HOST_SECRET')
+`)
+	}()
+	procUnjailed := waitForPublishedPath(t, filepath.Join(wsUnjailed, "ps_u.txt"))
+	if isActiveProcSubstPath(ctxB, procUnjailed) {
+		t.Fatalf("unjailed procsubst %q must NOT be treated as active for jailed ctxB", procUnjailed)
+	}
+	if bOut, _, bRC := runJailedScript(t, ctxB, wsB, []string{"PS_TARGET=" + procUnjailed}, `xxd -p "$PS_TARGET"`); bRC == 0 || strings.Contains(strings.ToLower(bOut), "554e4a41494c4544") {
+		t.Fatalf("jailed Session B accessed unjailed procsubst: rc=%d out=%q", bRC, bOut)
+	}
+	_ = os.WriteFile(filepath.Join(wsUnjailed, "release_u.flag"), []byte("ok"), 0o644)
+	<-doneUnjailed
+
+	// 4. Non-comparable CapabilityHook concrete type (closure + map + slice):
+	// must NOT panic, must work within its own session (including flock -c), and must isolate across two closures!
+	ncHookA := makeNonComparableClosureHook(t, wsA)
+	ncHookB := makeNonComparableClosureHook(t, wsB)
+	if reflect.TypeOf(ncHookA).Comparable() {
+		t.Fatalf("expected nonComparableClosureHook to be non-comparable")
+	}
+	ncCtxA := WithCapabilityHook(context.Background(), ncHookA)
+	ncCtxB := WithCapabilityHook(context.Background(), ncHookB)
+
+	ncOut, ncErr, ncRC := runJailedScript(t, ncCtxA, wsA, nil, `
+set -e
+xxd -p <(printf 'NC_OK') > nc.hex
+printf 'NC_SINK\n' | sponge >(sponge nc_sink.txt)
+wait
+flock -n nc.lock -c 'xxd -p <(printf "FLOCK_NC")'
+`)
+	if ncRC != 0 {
+		t.Fatalf("non-comparable hook procsubst failed: rc=%d out=%q stderr=%q", ncRC, ncOut, ncErr)
+	}
+	if !strings.Contains(strings.ToLower(ncOut), "464c4f434b5f4e43") {
+		t.Fatalf("unexpected flock -c procsubst output under non-comparable hook: %q", ncOut)
+	}
+
+	doneNCA := make(chan struct{})
+	go func() {
+		defer close(doneNCA)
+		_, _, _ = runJailedScript(t, ncCtxA, wsA, nil, `
+hold_nc() {
+	local p="$1"
+	printf '%s\n' "$p" > ps_nc.tmp
+	mv ps_nc.tmp ps_nc.txt
+	until [[ -f release_nc.flag ]]; do
+		sleep 0.01
+	done
+	xxd -p "$p" >/dev/null
+}
+hold_nc <(printf 'NC_CLOSURE_SECRET_A')
+`)
+	}()
+	procNCA := waitForPublishedPath(t, filepath.Join(wsA, "ps_nc.txt"))
+	if bOut, _, bRC := runJailedScript(t, ncCtxB, wsB, []string{"PS_TARGET=" + procNCA}, `xxd -p "$PS_TARGET"`); bRC == 0 || strings.Contains(strings.ToLower(bOut), "4e435f434c4f53555245") {
+		t.Fatalf("ncCtxB bypassed closure hook isolation to read ncCtxA procsubst: rc=%d out=%q", bRC, bOut)
+	}
+	_ = os.WriteFile(filepath.Join(wsA, "release_nc.flag"), []byte("ok"), 0o644)
+	<-doneNCA
+}
+
+type customErrDeleteDenyHook struct {
+	base *testJailHook
+}
+
+func (h *customErrDeleteDenyHook) CheckAccess(ctx context.Context, req AccessRequest) error {
+	if req.Op == OpDelete {
+		// Deliberately does NOT wrap os.ErrPermission to ensure fsAtomicWriteFile still avoids temp orphans.
+		return errors.New("custom policy: delete not permitted")
+	}
+	return h.base.CheckAccess(ctx, req)
+}
+
+func (h *customErrDeleteDenyHook) DialContext(ctx context.Context, cmdName, network, address string) (net.Conn, error) {
+	return h.base.DialContext(ctx, cmdName, network, address)
+}
+
+func (h *customErrDeleteDenyHook) Listen(ctx context.Context, cmdName, network, address string) (net.Listener, error) {
+	return h.base.Listen(ctx, cmdName, network, address)
+}
+
+func (h *customErrDeleteDenyHook) ListenPacket(ctx context.Context, cmdName, network, address string) (net.PacketConn, error) {
+	return h.base.ListenPacket(ctx, cmdName, network, address)
+}
+
+func TestJailFS_AtomicWriteDeleteDeniedNoOrphanTempFiles(t *testing.T) {
+	ws := t.TempDir()
+	if err := os.WriteFile(filepath.Join(ws, "doc.txt"), []byte("old_line\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	hook := newFSPolicyHook(t, ws)
+	hook.setDenyOp(OpDelete, true) // OpWrite allowed, OpDelete denied!
+	ctx := WithCapabilityHook(context.Background(), hook)
+
+	script := `
+set -e
+patch doc.txt <<'EOF'
+--- doc.txt
++++ doc.txt
+@@ -1 +1 @@
+-old_line
++new_line
+EOF
+printf 'sponge_first\n' | sponge sp.txt
+printf 'sponge_second\n' | sponge -a sp.txt
+xxd -p sp.txt sp.hex
+xxd -r -p sp.hex sp_rt.txt
+`
+	out, stderr, rc := runJailedScript(t, ctx, ws, nil, script)
+	if rc != 0 {
+		t.Fatalf("atomic writes with OpDelete denied failed: rc=%d out=%q stderr=%q", rc, out, stderr)
+	}
+
+	gotDoc, err := os.ReadFile(filepath.Join(ws, "doc.txt"))
+	if err != nil || string(gotDoc) != "new_line\n" {
+		t.Fatalf("doc.txt = %q (err=%v), want %q", string(gotDoc), err, "new_line\n")
+	}
+	gotRT, err := os.ReadFile(filepath.Join(ws, "sp_rt.txt"))
+	if err != nil || string(gotRT) != "sponge_first\nsponge_second\n" {
+		t.Fatalf("sp_rt.txt = %q (err=%v)", string(gotRT), err)
+	}
+
+	// Also verify custom non-ErrPermission OpDelete denial leaves zero orphan temp files.
+	customCtx := WithCapabilityHook(context.Background(), &customErrDeleteDenyHook{base: newTestJailHook(t, ws)})
+	if _, cErr, cRC := runJailedScript(t, customCtx, ws, nil, `printf 'custom_ok\n' | sponge custom.txt`); cRC != 0 {
+		t.Fatalf("custom delete-deny hook sponge failed: rc=%d stderr=%q", cRC, cErr)
+	}
+
+	var orphans []string
+	err = filepath.WalkDir(ws, func(path string, d fs.DirEntry, werr error) error {
+		if werr != nil {
+			return werr
+		}
+		if strings.HasPrefix(d.Name(), ".unish-atomic-") {
+			orphans = append(orphans, path)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(orphans) > 0 {
+		t.Fatalf("found orphan .unish-atomic-* temp files when OpDelete is denied: %v", orphans)
 	}
 }
