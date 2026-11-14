@@ -587,10 +587,6 @@ func flockAccessHandler() interp.AccessHandlerFunc {
 	defAccess := interp.DefaultAccessHandler()
 	return func(ctx context.Context, path string, mode interp.AccessMode) error {
 		mc := interp.HandlerCtx(ctx)
-		fi, err := fsStat(ctx, mc.Dir, "access", path)
-		if err != nil {
-			return err
-		}
 		if CapabilityHookFromContext(ctx) != nil {
 			if mode&interp.AccessRead != 0 {
 				if _, err := checkFS(ctx, mc.Dir, "access", path, OpRead); err != nil {
@@ -602,19 +598,17 @@ func flockAccessHandler() interp.AccessHandlerFunc {
 					return err
 				}
 			}
-			if mode&interp.AccessExec != 0 {
-				if fi.IsDir() {
-					if _, err := checkChdir(ctx, mc.Dir, "access", path); err != nil {
-						return err
-					}
-				} else {
-					if _, err := checkExec(ctx, "access", path, []string{path}, mc.Dir); err != nil {
-						return err
-					}
+			if (mode&interp.AccessExec != 0 || mode == 0) && runtime.GOOS != "windows" {
+				if _, err := checkFS(ctx, mc.Dir, "access", path, OpStat); err != nil {
+					return err
 				}
 			}
 		}
 		if runtime.GOOS == "windows" {
+			fi, err := fsStat(ctx, mc.Dir, "access", path)
+			if err != nil {
+				return err
+			}
 			m := fi.Mode()
 			if mode&interp.AccessRead != 0 && m&0o400 == 0 {
 				return os.ErrPermission

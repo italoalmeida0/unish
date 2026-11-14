@@ -974,15 +974,20 @@ func TestJailFS_FlockShellHandlersAndNumericFD(t *testing.T) {
 		t.Fatalf("flock -c redirection wrote outside jail: err=%v", err)
 	}
 
-	// 3. Inside-workspace glob, stat, read, and `cd subdir` work even when OpExec is denied,
-	// while external exec and [[ -x file ]] inside `flock -c` are blocked by OpExec.
+	// 3. Inside-workspace glob, stat, read, [[ -x ]], and `cd subdir` work even when OpExec is denied
+	// (without recording spurious OpExec denials on [[ -x ]]), while external exec is blocked by OpExec
+	// and [[ -x ../outside/... ]] is blocked by OpStat.
 	hook.setDenyOp(OpExec, true)
-	out, stderr, rc := runJailedScript(t, ctx, ws, nil, `flock -n app.lock -c '[[ -f inside.txt && -r inside.txt ]] && cd sub && [[ -d . ]] && echo sub_ok'`)
+	execTestExpr := "[[ -x sub ]]"
+	if runtime.GOOS != "windows" {
+		execTestExpr = "[[ -x script.sh && -x sub ]]"
+	}
+	out, stderr, rc := runJailedScript(t, ctx, ws, nil, fmt.Sprintf(`flock -n app.lock -c '[[ -f inside.txt && -r inside.txt ]] && %s && cd sub && [[ -d . ]] && echo sub_ok'`, execTestExpr))
 	if rc != 0 || strings.TrimSpace(out) != "sub_ok" {
 		t.Fatalf("flock -c legitimate workspace ops failed under OpExec deny: rc=%d out=%q stderr=%q", rc, out, stderr)
 	}
-	if _, _, code := runJailedScript(t, ctx, ws, nil, `flock -n app.lock -c '[[ -x script.sh ]]'`); code == 0 {
-		t.Fatalf("expected [[ -x script.sh ]] inside flock -c to fail when OpExec is denied")
+	if _, _, code := runJailedScript(t, ctx, ws, nil, `flock -n app.lock -c '[[ -x ../outside/secret.txt ]]'`); code == 0 {
+		t.Fatalf("expected [[ -x ../outside/secret.txt ]] inside flock -c to fail")
 	}
 	extBin := findHostExternalBin(t)
 	if _, _, code := runJailedScript(t, ctx, ws, nil, fmt.Sprintf(`flock -n app.lock %s version`, extBin)); code != 126 {

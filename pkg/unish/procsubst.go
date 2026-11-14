@@ -196,7 +196,11 @@ func sameNonComparableValue(v1, v2 reflect.Value) bool {
 	}
 }
 
-func winProcSubstLookup(ctx context.Context, name string) *winProcSubst {
+func winProcSubstLookup(name string) *winProcSubst {
+	return winProcSubstLookupCtx(context.Background(), name)
+}
+
+func winProcSubstLookupCtx(ctx context.Context, name string) *winProcSubst {
 	winProcSubstRegistry.mu.Lock()
 	st := winProcSubstRegistry.m[name]
 	winProcSubstRegistry.mu.Unlock()
@@ -261,7 +265,7 @@ func isActiveProcSubstPath(ctx context.Context, rawPath string) bool {
 	if rawPath == "" {
 		return false
 	}
-	if winProcSubstLookup(ctx, rawPath) != nil {
+	if winProcSubstLookupCtx(ctx, rawPath) != nil {
 		return true
 	}
 	_, ok := unixProcSubstLookup(ctx, rawPath)
@@ -278,7 +282,7 @@ func waitProcSubstProducerCtx(ctx context.Context, path string) {
 	if !strings.Contains(path, "unish-procsub-") {
 		return
 	}
-	if st := winProcSubstLookup(ctx, path); st != nil && st.op == syntax.CmdIn {
+	if st := winProcSubstLookupCtx(ctx, path); st != nil && st.op == syntax.CmdIn {
 		// Bounded: a dead producer must not hang the consumer
 		// forever (30s backstop; producers are local commands).
 		select {
@@ -530,7 +534,7 @@ func openShellFile(path string) (io.ReadWriteCloser, error) {
 	// hc.Stdin through devStdinReader instead of openShellFile, so this
 	// is only reached on unix (real /dev/stdin) or odd spellings —
 	// keep the direct open so the true OS error surfaces.
-	if st := winProcSubstLookup(context.Background(), path); st != nil && st.op == syntax.CmdIn {
+	if st := winProcSubstLookup(path); st != nil && st.op == syntax.CmdIn {
 		select {
 		case <-st.producerDone:
 		case <-time.After(30 * time.Second):
@@ -574,7 +578,7 @@ func readShellFile(path string) ([]byte, error) {
 // on ordinary files, and allows active `<(cmd)` runtime IPC paths created by
 // procSubstHandler even when os.TempDir() is outside the workspace jail.
 func fsOpenShellFile(ctx context.Context, dir, cmdName, rawPath string) (io.ReadWriteCloser, error) {
-	if st := winProcSubstLookup(ctx, rawPath); st != nil && st.op == syntax.CmdIn {
+	if st := winProcSubstLookupCtx(ctx, rawPath); st != nil && st.op == syntax.CmdIn {
 		select {
 		case <-st.producerDone:
 		case <-ctx.Done():
@@ -615,7 +619,7 @@ func fsReadShellFile(ctx context.Context, dir, cmdName, rawPath string) ([]byte,
 // openProcSubstOut opens a `>(cmd)` process-substitution output sink when
 // rawPath is an active CmdOut IPC path synthesized by procSubstHandler for ctx's hook.
 func openProcSubstOut(ctx context.Context, rawPath string) (io.WriteCloser, bool, error) {
-	if st := winProcSubstLookup(ctx, rawPath); st != nil && st.op == syntax.CmdOut {
+	if st := winProcSubstLookupCtx(ctx, rawPath); st != nil && st.op == syntax.CmdOut {
 		w, err := openFileRetry(rawPath, os.O_WRONLY|os.O_TRUNC, 0o600)
 		if err != nil {
 			st.finishConsumer()
