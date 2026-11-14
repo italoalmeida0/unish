@@ -614,7 +614,12 @@ func contextMemoKey(req AccessRequest) string {
 		return fmt.Sprintf("proc|%d|%s", req.PID, req.Signal)
 	default:
 		realP, _ := canonicalizeForCheck(resolveHostPath("", req.Path))
-		return string(req.Op) + "|" + normalizeMatchPath(realP)
+		key := string(req.Op) + "|" + normalizeMatchPath(realP)
+		if req.TargetPath != "" {
+			realT, _ := canonicalizeForCheck(resolveHostPath("", req.TargetPath))
+			key += "->" + normalizeMatchPath(realT)
+		}
+		return key
 	}
 }
 
@@ -697,9 +702,14 @@ func sessionGrantKeysForRequest(req AccessRequest) []string {
 		return []string{"proc|" + strings.ToLower(req.Signal)}
 	default:
 		realP, lexP := canonicalizeForCheck(resolveHostPath("", req.Path))
-		out := []string{string(req.Op) + "|" + normalizeMatchPath(realP)}
+		suffix := ""
+		if req.TargetPath != "" {
+			realT, _ := canonicalizeForCheck(resolveHostPath("", req.TargetPath))
+			suffix = "->" + normalizeMatchPath(realT)
+		}
+		out := []string{string(req.Op) + "|" + normalizeMatchPath(realP) + suffix}
 		if nl := normalizeMatchPath(lexP); nl != "" && nl != normalizeMatchPath(realP) {
-			out = append(out, string(req.Op)+"|"+nl)
+			out = append(out, string(req.Op)+"|"+nl+suffix)
 		}
 		return out
 	}
@@ -761,15 +771,6 @@ func (j *Jail) evaluateFS(req AccessRequest) (Decision, string) {
 		cands = append(cands, nl)
 	}
 
-	// If OpLink carries a TargetPath, evaluate policy on TargetPath as OpWrite
-	// too if it violates a deny rule or root boundary.
-	if req.TargetPath != "" {
-		decT, reasonT := j.evaluateSingleFSPath(OpWrite, req.TargetPath)
-		if decT == DecisionDeny {
-			return DecisionDeny, reasonT
-		}
-	}
-
 	// Evaluate both real canonical path and lexical path; strictest decision wins
 	// (Deny > Ask > Allow) so neither symlink escape outside roots nor symlink
 	// alias of a denied workspace file can bypass policy.
@@ -784,12 +785,24 @@ func (j *Jail) evaluateFS(req AccessRequest) (Decision, string) {
 			first = false
 		}
 	}
-	return bestDec, bestReason
-}
 
-func (j *Jail) evaluateSingleFSPath(op AccessOp, raw string) (Decision, string) {
-	realPath, _ := canonicalizeForCheck(resolveHostPath("", raw))
-	return j.evaluateNormalizedFS(op, normalizeMatchPath(realPath))
+	// If OpLink carries a TargetPath, evaluate both realPath and lexPath for
+	// TargetPath as OpWrite and fold into bestDec via decisionSeverity.
+	if req.TargetPath != "" {
+		tReal, tLex := canonicalizeForCheck(resolveHostPath("", req.TargetPath))
+		tCands := []string{normalizeMatchPath(tReal)}
+		if tnl := normalizeMatchPath(tLex); tnl != "" && tnl != tCands[0] {
+			tCands = append(tCands, tnl)
+		}
+		for _, tc := range tCands {
+			decT, reasonT := j.evaluateNormalizedFS(OpWrite, tc)
+			if decisionSeverity(decT) > decisionSeverity(bestDec) {
+				bestDec = decT
+				bestReason = reasonT
+			}
+		}
+	}
+	return bestDec, bestReason
 }
 
 func decisionSeverity(d Decision) int {
@@ -959,13 +972,13 @@ func (j *Jail) evaluateNet(req AccessRequest) (Decision, string) {
 	if hasAddr && !matchedIPRule {
 		if isUnspecifiedOrThisNetAddr(addr) {
 			if req.Op == OpNetConnect {
-				if j.netDefault == DecisionAllow && !j.blockPrivateLAN && j.allowLoopback && !matchedHostRule {
+				if j.isUnrestrictedNetOp(req.Op, matchedHostRule) {
 					return DecisionAllow, ""
 				}
 				return DecisionDeny, fmt.Sprintf("unspecified/local-network IP %s blocked by network policy", addr.String())
 			}
-			// OpNetListen: hostname rules must never rebind to wildcard 0.0.0.0 / ::.
-			if matchedHostRule && host != "" && !isIPLiteralPattern(host) {
+			// OpNetListen: non-IP hostnames must never rebind to wildcard 0.0.0.0 / ::.
+			if host != "" && !isIPLiteralPattern(host) && !j.isUnrestrictedNetOp(req.Op, matchedHostRule) {
 				return DecisionDeny, fmt.Sprintf("DNS rebinding to unspecified IP %s blocked", addr.String())
 			}
 		} else if isLoopbackAddr(addr) {
@@ -976,11 +989,8 @@ func (j *Jail) evaluateNet(req AccessRequest) (Decision, string) {
 				if j.blockPrivateLAN || (req.Op == OpNetConnect && j.netDefault == DecisionAllow) || (req.Op == OpNetListen && j.allowListen == DecisionAllow) {
 					return DecisionDeny, fmt.Sprintf("loopback IP %s blocked by network policy", addr.String())
 				}
-			} else if req.Op == OpNetConnect {
-				if matchedHostRule && isRemoteHostname {
-					return DecisionDeny, fmt.Sprintf("DNS rebinding to loopback IP %s blocked", addr.String())
-				}
-				return DecisionAllow, ""
+			} else if isRemoteHostname && !j.isUnrestrictedNetOp(req.Op, matchedHostRule) {
+				return DecisionDeny, fmt.Sprintf("DNS rebinding to loopback IP %s blocked", addr.String())
 			}
 		} else if j.blockPrivateLAN && isPrivateOrLinkLocalLAN(addr) {
 			return DecisionDeny, fmt.Sprintf("private or link-local IP %s blocked by BlockPrivateLAN", addr.String())
@@ -991,8 +1001,9 @@ func (j *Jail) evaluateNet(req AccessRequest) (Decision, string) {
 		return ruleDec, ruleReason
 	}
 
-	// 3. Built-in AllowLoopback check when IP is verified loopback (never 0.0.0.0 / ::).
-	if j.allowLoopback && hasAddr && isLoopbackAddr(addr) {
+	// 3. Built-in AllowLoopback check when IP is verified loopback (never 0.0.0.0 / ::)
+	// and target is not a remote hostname.
+	if j.allowLoopback && hasAddr && isLoopbackAddr(addr) && !isRemoteHostname {
 		if req.Op == OpNetConnect {
 			return DecisionAllow, ""
 		}
@@ -1007,6 +1018,19 @@ func (j *Jail) evaluateNet(req AccessRequest) (Decision, string) {
 		return j.allowListen, "network listen disabled by jail"
 	}
 	return j.netDefault, "outbound network access disabled by jail"
+}
+
+func (j *Jail) isUnrestrictedNetOp(op AccessOp, matchedHostRule bool) bool {
+	if j.blockPrivateLAN || !j.allowLoopback || matchedHostRule {
+		return false
+	}
+	if op == OpNetConnect {
+		return j.netDefault == DecisionAllow
+	}
+	if op == OpNetListen {
+		return j.allowListen == DecisionAllow
+	}
+	return false
 }
 
 // DialContext enforces network policy with DNS-rebinding & TOCTOU defense:
@@ -1067,9 +1091,9 @@ func (j *Jail) DialContext(ctx context.Context, cmdName, network, address string
 		return j.rawDial(ctx, network, net.JoinHostPort(host, strconv.Itoa(port)))
 	}
 
-	// Case 2: Hostname. If static policy unconditionally denies with zero DNS
-	// rules/approver/loopback, fail immediately without leaking a DNS query.
-	if j.canShortCircuitHostDeny(baseProto, host, port) {
+	// Case 2: Hostname. If static policy unconditionally denies with zero
+	// matching host/CIDR rules, fail immediately without leaking a DNS query.
+	if j.canShortCircuitHostDeny(OpNetConnect, baseProto, host, port) {
 		err := j.CheckAccess(ctx, AccessRequest{
 			Op:      OpNetConnect,
 			Command: cmdName,
@@ -1182,8 +1206,14 @@ func (j *Jail) isHardIPBlock(req AccessRequest) bool {
 	if j.blockPrivateLAN && isPrivateOrLinkLocalLAN(addr) {
 		return true
 	}
-	if !j.allowLoopback && isLoopbackAddr(addr) {
-		return true
+	if isLoopbackAddr(addr) {
+		if !j.allowLoopback {
+			return true
+		}
+		host := normalizeHostname(req.Host)
+		if host != "" && host != "localhost" && !isIPLiteralPattern(host) {
+			return true
+		}
 	}
 	for i := range j.netRules {
 		r := &j.netRules[i]
@@ -1194,16 +1224,11 @@ func (j *Jail) isHardIPBlock(req AccessRequest) bool {
 	return false
 }
 
-func (j *Jail) canShortCircuitHostDeny(proto, host string, port int) bool {
-	j.mu.Lock()
-	hasApprover := j.approver != nil
-	hasGrants := len(j.sessionGrants) > 0
-	j.mu.Unlock()
-
+func (j *Jail) canShortCircuitHostDeny(op AccessOp, proto, host string, port int) bool {
 	normHost := normalizeHostname(host)
 	for i := range j.netRules {
 		r := &j.netRules[i]
-		if !r.matchesOpProtoPort(OpNetConnect, proto, port) {
+		if !r.matchesOpProtoPort(op, proto, port) {
 			continue
 		}
 		if r.raw.Decision == DecisionDeny && !r.hasPrefix && r.hostPattern != "" {
@@ -1212,10 +1237,34 @@ func (j *Jail) canShortCircuitHostDeny(proto, host string, port int) bool {
 			}
 		}
 	}
-	if hasApprover || hasGrants || j.allowLoopback || j.netDefault != DecisionDeny {
+
+	opDefault := j.netDefault
+	if op == OpNetListen {
+		opDefault = j.allowListen
+	}
+	if opDefault != DecisionDeny {
 		return false
 	}
-	return len(j.netRules) == 0
+
+	// AllowLoopback only requires resolving literal "localhost" (never remote
+	// hostnames or "*.localhost", since Windows queries external DNS for "*.localhost").
+	if j.allowLoopback && normHost == "localhost" {
+		return false
+	}
+
+	for i := range j.netRules {
+		r := &j.netRules[i]
+		if r.raw.Decision == DecisionDeny || !r.matchesOpProtoPort(op, proto, port) {
+			continue
+		}
+		if r.hostPattern == "" || isIPLiteralPattern(r.hostPattern) {
+			return false
+		}
+		if matchHostPattern(r.hostPattern, normHost, netip.Addr{}, false) {
+			return false
+		}
+	}
+	return true
 }
 
 func (j *Jail) rawDial(ctx context.Context, network, addr string) (net.Conn, error) {
@@ -1340,7 +1389,20 @@ func (j *Jail) resolveAndCheckListenTargets(ctx context.Context, cmdName, networ
 		return []string{net.JoinHostPort(host, strconv.Itoa(port))}, nil
 	}
 
-	// Hostname: resolve upfront so DNS cannot rebind to 0.0.0.0/:: or an
+	// Hostname: if static policy unconditionally denies with zero matching
+	// host/CIDR rules, fail immediately without leaking a DNS query.
+	if j.canShortCircuitHostDeny(OpNetListen, baseProto, host, port) {
+		err := j.CheckAccess(ctx, AccessRequest{
+			Op:      OpNetListen,
+			Command: cmdName,
+			Proto:   baseProto,
+			Host:    host,
+			Port:    port,
+		})
+		return nil, err
+	}
+
+	// Otherwise resolve upfront so DNS cannot rebind to 0.0.0.0/:: or an
 	// unpermitted interface between policy check and socket bind.
 	lookup := j.lookupIPAddr
 	if lookup == nil {
