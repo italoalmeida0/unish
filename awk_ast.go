@@ -89,6 +89,7 @@ const (
 	awkFnSrand
 	awkFnClose
 	awkFnFflush
+	awkFnSystem
 	awkFnSystime
 	awkFnStrftime
 )
@@ -139,6 +140,8 @@ func resolveAwkBuiltinFunc(name string) awkBuiltinFuncID {
 		return awkFnClose
 	case "fflush":
 		return awkFnFflush
+	case "system":
+		return awkFnSystem
 	case "systime":
 		return awkFnSystime
 	case "strftime":
@@ -155,6 +158,7 @@ const (
 	awkRedirNone awkRedirOp = iota
 	awkRedirTrunc
 	awkRedirAppend
+	awkRedirPipe
 )
 
 // awkProgram is a parsed and pre-compiled AWK program.
@@ -335,8 +339,9 @@ type awkCallExpr struct {
 }
 
 type awkGetlineExpr struct {
-	target awkExpr // nil means $0
-	file   awkExpr // nil means current input stream
+	target  awkExpr // nil means $0
+	file    awkExpr // non-nil for `getline [target] < file`
+	pipeCmd awkExpr // non-nil for `cmd | getline [target]`
 }
 
 func (*awkNumExpr) awkExprNode()     {}

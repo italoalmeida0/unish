@@ -127,6 +127,8 @@ func (vm *awkVM) evalBuiltinCall(e *awkCallExpr) awkVal {
 		return vm.builtinClose(e.args)
 	case awkFnFflush:
 		return vm.builtinFflush(e.args)
+	case awkFnSystem:
+		return vm.builtinSystem(e.args)
 	case awkFnSystime:
 		if len(e.args) != 0 {
 			vm.failf("systime() takes 0 arguments")
@@ -620,6 +622,23 @@ func (vm *awkVM) builtinClose(args []awkExpr) awkVal {
 		return awkVal{}
 	}
 	name := vm.toStr(v)
+	if op, ok := vm.outPipes[name]; ok {
+		_ = op.bw.Flush()
+		_ = op.pw.Close()
+		code := <-op.done
+		delete(vm.outPipes, name)
+		return awkNumVal(float64(code))
+	}
+	if ip, ok := vm.inPipes[name]; ok {
+		_ = ip.pr.Close()
+		if vm.ctx.Err() != nil {
+			ip.cancel()
+		}
+		code := <-ip.done
+		ip.cancel()
+		delete(vm.inPipes, name)
+		return awkNumVal(float64(code))
+	}
 	closed := false
 	if out, ok := vm.outFiles[name]; ok {
 		_ = out.bw.Flush()
@@ -642,6 +661,27 @@ func (vm *awkVM) builtinClose(args []awkExpr) awkVal {
 	return awkNumVal(-1)
 }
 
+func (vm *awkVM) builtinSystem(args []awkExpr) awkVal {
+	if len(args) != 1 {
+		vm.failf("system() requires 1 argument")
+		return awkVal{}
+	}
+	v := vm.evalExpr(args[0])
+	if vm.ctrl != ctrlNone {
+		return awkVal{}
+	}
+	_ = vm.stdout.Flush()
+	for _, out := range vm.outFiles {
+		_ = out.bw.Flush()
+	}
+	cmd := vm.toStr(v)
+	if cmd == "" {
+		return awkNumVal(0)
+	}
+	code := runAwkShellCmd(vm.ctx, vm.hc, cmd, nil, vm.stdoutRaw, vm.stderrRaw)
+	return awkNumVal(float64(code))
+}
+
 func (vm *awkVM) builtinFflush(args []awkExpr) awkVal {
 	if len(args) > 1 {
 		vm.failf("fflush() takes at most 1 argument")
@@ -651,6 +691,9 @@ func (vm *awkVM) builtinFflush(args []awkExpr) awkVal {
 		_ = vm.stdout.Flush()
 		for _, out := range vm.outFiles {
 			_ = out.bw.Flush()
+		}
+		for _, op := range vm.outPipes {
+			_ = op.bw.Flush()
 		}
 		return awkNumVal(0)
 	}
@@ -663,6 +706,9 @@ func (vm *awkVM) builtinFflush(args []awkExpr) awkVal {
 		_ = vm.stdout.Flush()
 		for _, out := range vm.outFiles {
 			_ = out.bw.Flush()
+		}
+		for _, op := range vm.outPipes {
+			_ = op.bw.Flush()
 		}
 		return awkNumVal(0)
 	}
@@ -677,6 +723,12 @@ func (vm *awkVM) builtinFflush(args []awkExpr) awkVal {
 	}
 	if out, ok := vm.outFiles[name]; ok {
 		if err := out.bw.Flush(); err != nil {
+			return awkNumVal(-1)
+		}
+		return awkNumVal(0)
+	}
+	if op, ok := vm.outPipes[name]; ok {
+		if err := op.bw.Flush(); err != nil {
 			return awkNumVal(-1)
 		}
 		return awkNumVal(0)
@@ -862,7 +914,16 @@ func awkSprintf(format string, args []awkVal) (string, error) {
 		case awkStr, awkStrNum:
 			return v.str
 		case awkNum:
-			if v.num >= -9007199254740992 && v.num <= 9007199254740992 && math.Trunc(v.num) == v.num {
+			if math.IsNaN(v.num) {
+				return "nan"
+			}
+			if math.IsInf(v.num, 1) {
+				return "+inf"
+			}
+			if math.IsInf(v.num, -1) {
+				return "-inf"
+			}
+			if v.num >= -9223372036854775808.0 && v.num < 9223372036854775808.0 && math.Trunc(v.num) == v.num {
 				return strconv.FormatInt(int64(v.num), 10)
 			}
 			return strconv.FormatFloat(v.num, 'g', 6, 64)
@@ -1023,6 +1084,33 @@ func awkSprintf(format string, args []awkVal) (string, error) {
 			sb.WriteString(fmt.Sprintf(buildGoSpec(verb), uv))
 
 		case 'f', 'F', 'e', 'E', 'g', 'G', 'a', 'A':
+			f := toNumArg(val)
+			if math.IsNaN(f) || math.IsInf(f, 0) {
+				var tok string
+				switch {
+				case math.IsNaN(f):
+					tok = "nan"
+				case math.IsInf(f, 1):
+					tok = "+inf"
+				default:
+					tok = "-inf"
+				}
+				if verb == 'F' || verb == 'E' || verb == 'G' || verb == 'A' {
+					tok = strings.ToUpper(tok)
+				}
+				if widthStr != "" {
+					w, _ := strconv.Atoi(widthStr)
+					if pad := w - len(tok); pad > 0 {
+						if leftAlign {
+							tok = tok + strings.Repeat(" ", pad)
+						} else {
+							tok = strings.Repeat(" ", pad) + tok
+						}
+					}
+				}
+				sb.WriteString(tok)
+				break
+			}
 			goVerb := verb
 			if goVerb == 'F' {
 				goVerb = 'f'
@@ -1033,7 +1121,7 @@ func awkSprintf(format string, args []awkVal) (string, error) {
 			if goVerb == 'A' {
 				goVerb = 'X'
 			}
-			sb.WriteString(fmt.Sprintf(buildGoSpec(goVerb), toNumArg(val)))
+			sb.WriteString(fmt.Sprintf(buildGoSpec(goVerb), f))
 
 		case 'c':
 			var chStr string

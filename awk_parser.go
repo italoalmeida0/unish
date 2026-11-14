@@ -668,6 +668,14 @@ parseRedir:
 		if err != nil {
 			return nil, err
 		}
+	} else if p.cur().kind == awkTokPipe {
+		p.advance()
+		redirOp = awkRedirPipe
+		var err error
+		redirTarget, err = p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &awkPrintStmt{
@@ -680,7 +688,7 @@ parseRedir:
 
 func (p *awkParser) isPrintEndOrRedir() bool {
 	switch p.cur().kind {
-	case awkTokNewline, awkTokSemi, awkTokRBrace, awkTokRParen, awkTokEOF, awkTokElse, awkTokGT, awkTokAppend:
+	case awkTokNewline, awkTokSemi, awkTokRBrace, awkTokRParen, awkTokEOF, awkTokElse, awkTokGT, awkTokAppend, awkTokPipe:
 		return true
 	default:
 		return false
@@ -879,7 +887,7 @@ func (p *awkParser) parseMatchExpr() (awkExpr, error) {
 }
 
 func (p *awkParser) parseRelExpr() (awkExpr, error) {
-	left, err := p.parseConcatExpr()
+	left, err := p.parsePipeGetlineExpr()
 	if err != nil {
 		return nil, err
 	}
@@ -891,7 +899,7 @@ func (p *awkParser) parseRelExpr() (awkExpr, error) {
 		}
 		if k == awkTokLT || k == awkTokLE || k == awkTokGT || k == awkTokGE || k == awkTokEQ || k == awkTokNE {
 			op := p.advance().kind
-			right, err := p.parseConcatExpr()
+			right, err := p.parsePipeGetlineExpr()
 			if err != nil {
 				return nil, err
 			}
@@ -901,6 +909,33 @@ func (p *awkParser) parseRelExpr() (awkExpr, error) {
 		break
 	}
 	return left, nil
+}
+
+// parsePipeGetlineExpr parses `concatExpr ('|' 'getline' [lvalue])?`, binding
+// tighter than relational comparisons so `while ("cmd" | getline l > 0)` works.
+func (p *awkParser) parsePipeGetlineExpr() (awkExpr, error) {
+	expr, err := p.parseConcatExpr()
+	if err != nil {
+		return nil, err
+	}
+	if p.cur().kind == awkTokPipe && p.peek(1).kind == awkTokGetline {
+		p.advance() // '|'
+		p.advance() // 'getline'
+		var target awkExpr
+		switch p.cur().kind {
+		case awkTokIdent, awkTokDollar:
+			lval, err := p.parseFieldOrPrimary(false)
+			if err != nil {
+				return nil, err
+			}
+			if !isAwkLValue(lval) {
+				return nil, fmt.Errorf("line %d: invalid target for getline", p.cur().line)
+			}
+			target = lval
+		}
+		return &awkGetlineExpr{pipeCmd: expr, target: target}, nil
+	}
+	return expr, nil
 }
 
 func (p *awkParser) parseConcatExpr() (awkExpr, error) {

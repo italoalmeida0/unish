@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -13,10 +14,12 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"unicode/utf8"
 
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 type awkKind uint8
@@ -275,15 +278,46 @@ type awkRecordReader struct {
 	eof    bool
 }
 
+type awkOutPipe struct {
+	bw   *bufio.Writer
+	pw   *io.PipeWriter
+	done chan int
+}
+
+type awkInPipe struct {
+	rr     *awkRecordReader
+	pr     *io.PipeReader
+	cancel context.CancelFunc
+	done   chan int
+}
+
+type awkSyncWriter struct {
+	mu sync.Mutex
+	w  io.Writer
+}
+
+func (sw *awkSyncWriter) Write(p []byte) (int, error) {
+	if sw == nil || sw.w == nil {
+		return len(p), nil
+	}
+	sw.mu.Lock()
+	defer sw.mu.Unlock()
+	return sw.w.Write(p)
+}
+
 type awkVM struct {
 	ctx  context.Context
 	hc   interp.HandlerContext
 	prog *awkProgram
 
-	// Buffered stdout & managed file streams
-	stdout   *bufio.Writer
-	outFiles map[string]*awkOutStream
-	inFiles  map[string]*awkRecordReader
+	// Buffered stdout & managed file/pipe streams
+	stdoutRaw io.Writer
+	stderrRaw io.Writer
+	stdout    *bufio.Writer
+	outFiles  map[string]*awkOutStream
+	inFiles   map[string]*awkRecordReader
+	outPipes  map[string]*awkOutPipe
+	inPipes   map[string]*awkInPipe
 
 	// Built-in scalar variables (fast direct fields)
 	fs       string
@@ -341,13 +375,19 @@ type awkVM struct {
 
 func newAwkVM(ctx context.Context, hc interp.HandlerContext, prog *awkProgram, argv0 string, fileArgs []string) *awkVM {
 	seed := int64(1)
+	stdoutSync := &awkSyncWriter{w: hc.Stdout}
+	stderrSync := &awkSyncWriter{w: hc.Stderr}
 	vm := &awkVM{
 		ctx:         ctx,
 		hc:          hc,
 		prog:        prog,
-		stdout:      bufio.NewWriterSize(hc.Stdout, 64*1024),
+		stdoutRaw:   stdoutSync,
+		stderrRaw:   stderrSync,
+		stdout:      bufio.NewWriterSize(stdoutSync, 64*1024),
 		outFiles:    make(map[string]*awkOutStream),
 		inFiles:     make(map[string]*awkRecordReader),
+		outPipes:    make(map[string]*awkOutPipe),
+		inPipes:     make(map[string]*awkInPipe),
 		fs:          " ",
 		rs:          "\n",
 		ofs:         " ",
@@ -417,7 +457,69 @@ func (vm *awkVM) closeAllFiles() error {
 		}
 		delete(vm.inFiles, name)
 	}
+	for cmd, p := range vm.outPipes {
+		_ = p.bw.Flush()
+		_ = p.pw.Close()
+		<-p.done
+		delete(vm.outPipes, cmd)
+	}
+	for cmd, ip := range vm.inPipes {
+		_ = ip.pr.Close()
+		if vm.ctx.Err() != nil {
+			ip.cancel()
+		}
+		<-ip.done
+		ip.cancel()
+		delete(vm.inPipes, cmd)
+	}
 	return firstErr
+}
+
+func runAwkShellCmd(ctx context.Context, hc interp.HandlerContext, cmd string, stdin io.Reader, stdout, stderr io.Writer) int {
+	prog, err := syntax.NewParser().Parse(strings.NewReader(cmd), "")
+	if err != nil {
+		if stderr != nil {
+			fmt.Fprintf(stderr, "sh: %v\n", err)
+		}
+		return 2
+	}
+	if stdin == nil {
+		stdin = strings.NewReader("")
+	}
+	if hc.Env == nil {
+		hc.Env = expand.ListEnviron()
+	}
+	r, err := interp.New(
+		interp.Dir(hc.Dir),
+		interp.Env(expand.ListEnviron(shellExecEnv(hc)...)),
+		interp.StdIO(stdin, stdout, stderr),
+		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
+		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ProcSubstHandler(procSubstHandler),
+	)
+	if err != nil {
+		return 1
+	}
+	runErr := r.Run(ctx, prog)
+	if runErr == nil {
+		return 0
+	}
+	var st interp.ExitStatus
+	if errors.As(runErr, &st) {
+		return int(st)
+	}
+	var ee exitError
+	if errors.As(runErr, &ee) {
+		return ee.code
+	}
+	if errors.Is(runErr, context.DeadlineExceeded) || ctx.Err() == context.DeadlineExceeded {
+		return 124
+	}
+	if errors.Is(runErr, context.Canceled) || ctx.Err() == context.Canceled {
+		return 130
+	}
+	return 1
 }
 
 func (vm *awkVM) failf(format string, args ...any) {
@@ -494,8 +596,8 @@ func (vm *awkVM) formatVal(v awkVal, numFmt string) string {
 		if math.IsInf(n, -1) {
 			return "-inf"
 		}
-		// POSIX exact integer rule: exact integers always format as decimal integer!
-		if n >= -9007199254740992 && n <= 9007199254740992 && math.Trunc(n) == n {
+		// POSIX/gawk exact integer rule: exact integers fitting in int64 always format as decimal integer!
+		if n >= -9223372036854775808.0 && n < 9223372036854775808.0 && math.Trunc(n) == n {
 			return strconv.FormatInt(int64(n), 10)
 		}
 		if numFmt == "%.6g" {
@@ -980,6 +1082,11 @@ func (vm *awkVM) getBuiltinVar(id awkBuiltinVarID) awkVal {
 func (vm *awkVM) setBuiltinVar(id awkBuiltinVarID, v awkVal) {
 	switch id {
 	case awkVarFS:
+		// POSIX AWK: changing FS does NOT retroactively re-split an already-read
+		// current record; materialize current fields with the old FS first!
+		if !vm.fieldsSplit && (vm.nr > 0 || vm.line != "") {
+			vm.ensureFields()
+		}
 		vm.fs = vm.toStr(v)
 		vm.fsRe = nil
 	case awkVarRS:
@@ -1582,8 +1689,15 @@ func (vm *awkVM) evalGetline(e *awkGetlineExpr) awkVal {
 		return awkVal{}
 	}
 	var rr *awkRecordReader
-	fromFile := e.file != nil
-	if fromFile {
+	externalSource := e.file != nil || e.pipeCmd != nil
+	if e.pipeCmd != nil {
+		cv := vm.evalExpr(e.pipeCmd)
+		if vm.ctrl != ctrlNone {
+			return awkVal{}
+		}
+		cmdStr := vm.toStr(cv)
+		rr = vm.getInPipe(cmdStr)
+	} else if e.file != nil {
 		fv := vm.evalExpr(e.file)
 		if vm.ctrl != ctrlNone {
 			return awkVal{}
@@ -1614,7 +1728,7 @@ func (vm *awkVM) evalGetline(e *awkGetlineExpr) awkVal {
 		return awkNumVal(0)
 	}
 
-	if !fromFile {
+	if !externalSource {
 		vm.nr++
 		vm.fnr++
 	}
@@ -1708,7 +1822,7 @@ func (vm *awkVM) getOutStream(name string, appendMode bool) (*bufio.Writer, io.W
 		return vm.stdout, nil, nil
 	}
 	if name == "/dev/stderr" {
-		return nil, vm.hc.Stderr, nil
+		return nil, vm.stderrRaw, nil
 	}
 	if out, ok := vm.outFiles[name]; ok {
 		return out.bw, nil, nil
@@ -1733,6 +1847,41 @@ func (vm *awkVM) getOutStream(name string, appendMode bool) (*bufio.Writer, io.W
 	bw := bufio.NewWriterSize(f, 32*1024)
 	vm.outFiles[name] = &awkOutStream{bw: bw, closer: f}
 	return bw, nil, nil
+}
+
+func (vm *awkVM) getInPipe(cmd string) *awkRecordReader {
+	if ip, ok := vm.inPipes[cmd]; ok {
+		return ip.rr
+	}
+	_ = vm.stdout.Flush()
+	pctx, cancel := context.WithCancel(vm.ctx)
+	pr, pw := io.Pipe()
+	done := make(chan int, 1)
+	go func() {
+		code := runAwkShellCmd(pctx, vm.hc, cmd, nil, pw, vm.stderrRaw)
+		_ = pw.Close()
+		done <- code
+	}()
+	rr := newAwkRecordReader(pr, pr)
+	vm.inPipes[cmd] = &awkInPipe{rr: rr, pr: pr, cancel: cancel, done: done}
+	return rr
+}
+
+func (vm *awkVM) getOutPipe(cmd string) *bufio.Writer {
+	if op, ok := vm.outPipes[cmd]; ok {
+		return op.bw
+	}
+	_ = vm.stdout.Flush()
+	pr, pw := io.Pipe()
+	done := make(chan int, 1)
+	go func() {
+		code := runAwkShellCmd(vm.ctx, vm.hc, cmd, pr, vm.stdoutRaw, vm.stderrRaw)
+		_ = pr.Close()
+		done <- code
+	}()
+	bw := bufio.NewWriterSize(pw, 32*1024)
+	vm.outPipes[cmd] = &awkOutPipe{bw: bw, pw: pw, done: done}
+	return bw
 }
 
 // ---------- Statement Execution ----------
@@ -1989,11 +2138,15 @@ func (vm *awkVM) execPrint(s *awkPrintStmt) {
 			return
 		}
 		targetName := vm.toStr(tv)
-		var err error
-		bw, rawW, err = vm.getOutStream(targetName, s.redirOp == awkRedirAppend)
-		if err != nil {
-			vm.failf("cannot open %q for output: %v", targetName, err)
-			return
+		if s.redirOp == awkRedirPipe {
+			bw = vm.getOutPipe(targetName)
+		} else {
+			var err error
+			bw, rawW, err = vm.getOutStream(targetName, s.redirOp == awkRedirAppend)
+			if err != nil {
+				vm.failf("cannot open %q for output: %v", targetName, err)
+				return
+			}
 		}
 	}
 
@@ -2005,7 +2158,9 @@ func (vm *awkVM) execPrint(s *awkPrintStmt) {
 	}
 	if werr != nil {
 		if isPipeClosed(werr) {
-			vm.ctrl = ctrlPipeClosed
+			if s.redirOp != awkRedirPipe {
+				vm.ctrl = ctrlPipeClosed
+			}
 			return
 		}
 		vm.failf("write error: %v", werr)

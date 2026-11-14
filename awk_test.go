@@ -449,6 +449,12 @@ func TestAwkDifferentialParityWithGawk(t *testing.T) {
 		`BEGIN { FS = "" } NR == 1 { print NF, $1, $2, $5 }`,
 		`{ $5 = "tail"; print NF, "<" $0 ">"; NF = 2; print NF, "<" $0 ">" }`,
 		`BEGIN { exit 9 } END { print "in-end"; exit }`,
+		`NR == 1 { $0 = "a,b c,d"; FS = ","; print "r1", $1, $2 } NR == 2 { $0 = "a,b c,d"; print "r2", $1, $2 }`,
+		`BEGIN { print 1e16, 1e18, 2^62, 2^53+2, (2^62) "" }`,
+		`BEGIN { printf "before "; rc = system("echo mid"); print "after", rc }`,
+		`BEGIN { printf "c\na\nb\n" | "sort"; rc = close("sort"); print "rc=" rc }`,
+		`BEGIN { cmd = "printf '10\n20\n30\n'"; while ((cmd | getline v) > 0) s += v; print s, close(cmd) }`,
+		`BEGIN { inf = 1e300*1e300; printf "%s %s %g %G [%8f]\n", inf, -inf, inf, inf, inf }`,
 	}
 
 	for idx, prog := range programs {
@@ -459,6 +465,10 @@ func TestAwkDifferentialParityWithGawk(t *testing.T) {
 			// Run external GNU gawk via -f so Windows MSYS2 argv escaping never mangles backslashes
 			cmd := exec.Command(gawkBin, "-f", progPath)
 			cmd.Dir = dir
+			if runtime.GOOS == "windows" {
+				// Ensure external gawk finds POSIX coreutils (e.g. sort) ahead of C:\Windows\System32
+				cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gawkBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+			}
 			cmd.Stdin = strings.NewReader(sampleInput)
 			var gOut, gErr bytes.Buffer
 			cmd.Stdout = &gOut
@@ -533,6 +543,79 @@ func TestAwkCancellationAndBrokenPipe(t *testing.T) {
 	out, se, err = runParityScript(t, dir, `awk '{ print NR, NF, length($1), $2 }' long.txt`)
 	if exitCode(err) != 0 || out != "1 2 153600 END_TOK\n2 2 5 line\n" {
 		t.Fatalf("long line failed: out=%q rc=%d se=%q", out, exitCode(err), se)
+	}
+}
+
+func TestAwkPipesSystemFSAndLargeInts(t *testing.T) {
+	dir := t.TempDir()
+
+	cases := []struct {
+		name   string
+		script string
+		want   string
+		wantRC int
+	}{
+		{
+			name:   "print pipe to sort closed on implicit exit",
+			script: `printf 'cherry\napple\nbanana\n' | awk '{ print | "sort" }'`,
+			want:   "apple\nbanana\ncherry\n",
+		},
+		{
+			name:   "printf pipe with explicit close and reopen",
+			script: `awk 'BEGIN { printf "%s\n%s\n", "z", "a" | "sort"; rc1 = close("sort"); print "mid", rc1; print "m" | "sort"; rc2 = close("sort"); print "end", rc2 }'`,
+			want:   "a\nz\nmid 0\nm\nend 0\n",
+		},
+		{
+			name:   "cmd pipe into getline target and $0 without bumping NR",
+			script: `awk 'BEGIN { "echo alpha beta" | getline; close("echo alpha beta"); print $2, NR; cmd = "seq 4"; while ((cmd | getline l) > 0) sum += l; rc = close(cmd); print sum, rc }'`,
+			want:   "beta 0\n10 0\n",
+		},
+		{
+			name:   "unparenthesized cmd | getline binds tighter than comparison",
+			script: `awk 'BEGIN { while ("seq 3" | getline x > 0) out = out x ","; close("seq 3"); print out }'`,
+			want:   "1,2,3,\n",
+		},
+		{
+			name:   "early close on streaming input pipe does not hang",
+			script: `awk 'BEGIN { "yes" | getline first; close("yes"); print "got:" first }'`,
+			want:   "got:y\n",
+		},
+		{
+			name:   "system and close exit codes and stdout flush ordering",
+			script: `awk 'BEGIN { printf "before "; rc1 = system("echo mid"); print "hi" | "exit 5"; rc2 = close("exit 5"); "exit 3" | getline x; rc3 = close("exit 3"); rc4 = system("exit 7"); print "after", rc1, rc2, rc3, rc4 }'`,
+			want:   "before mid\nafter 0 5 3 7\n",
+		},
+		{
+			name:   "FS assignment mid-record preserves current record fields",
+			script: `printf 'a,b\nc,d\n' | awk '{ FS = ","; print $1 }'`,
+			want:   "a,b\nc\n",
+		},
+		{
+			name:   "FS assignment followed by $0=$0 re-splits with new FS",
+			script: `printf 'a,b\n' | awk '{ FS = ","; $0 = $0; print $1, $2 }'`,
+			want:   "a b\n",
+		},
+		{
+			name:   "exact integers above 2^53 up to int64 in OFMT and CONVFMT",
+			script: `echo 435423839299999999 | awk '{ print 1e16, 1e18, 2^62, 2^53+2, (2^62) "", $1+0 }'`,
+			want:   "10000000000000000 1000000000000000000 4611686018427387904 9007199254740994 4611686018427387904 435423839300000000\n",
+		},
+		{
+			name:   "printf %s and float verbs on Inf and NaN",
+			script: `awk 'BEGIN { inf = 1e300*1e300; nan = log(-1); printf "%s %s %s %g %G [%6f]\n", inf, -inf, nan, inf, nan, inf }'`,
+			want:   "+inf -inf nan +inf NAN [  +inf]\n",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out, se, err := runTimedScript(t, dir, 5*time.Second, tc.script)
+			rc := exitCode(err)
+			if rc != tc.wantRC || out != tc.want {
+				t.Fatalf("script: %s\n  got  (rc=%d): %q (stderr=%q)\n  want (rc=%d): %q",
+					tc.script, rc, out, se, tc.wantRC, tc.want)
+			}
+		})
 	}
 }
 
