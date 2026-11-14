@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -18,13 +19,53 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
+var runnerCompletionHooks sync.Map // map[*interp.Runner]CapabilityHook
+
+func registerRunnerCompletionHook(r *interp.Runner, h CapabilityHook) {
+	if r == nil {
+		return
+	}
+	if h == nil {
+		runnerCompletionHooks.Delete(r)
+		return
+	}
+	runnerCompletionHooks.Store(r, h)
+}
+
+func unregisterRunnerCompletionHook(r *interp.Runner) {
+	if r != nil {
+		runnerCompletionHooks.Delete(r)
+	}
+}
+
+func completionContextForRunner(ctx context.Context, r *interp.Runner) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if CapabilityHookFromContext(ctx) != nil || r == nil {
+		return ctx
+	}
+	if v, ok := runnerCompletionHooks.Load(r); ok {
+		if h, ok2 := v.(CapabilityHook); ok2 && h != nil {
+			return WithCapabilityHook(ctx, h)
+		}
+	}
+	return ctx
+}
+
 // completeWord returns (replacement, alternatives) for the word under
 // the cursor (pos is a rune index into line). replacement is "" when
 // ambiguous (caller rings bell / shows alternatives on second Tab).
 func completeWord(line string, pos int, r *interp.Runner, hcArgs func() []string) (string, []string) {
+	return completeWordCtx(context.Background(), line, pos, r, hcArgs)
+}
+
+func completeWordCtx(ctx context.Context, line string, pos int, r *interp.Runner, hcArgs func() []string) (string, []string) {
+	_ = hcArgs
+	ctx = completionContextForRunner(ctx, r)
 	rr := []rune(line)
 	wordStart, word := wordAt(line, pos)
-	cands := candidatesFor(word, isCommandPos(rr, wordStart), r)
+	cands := candidatesForCtx(ctx, word, isCommandPos(rr, wordStart), r)
 	if len(cands) == 0 {
 		return "", nil
 	}
@@ -114,6 +155,11 @@ func commonPrefix(ss []string) string {
 // candidatesFor lists completions for word; firstWord enables command
 // names (builtins, PATH), otherwise files + variables.
 func candidatesFor(word string, firstWord bool, r *interp.Runner) []string {
+	return candidatesForCtx(completionContextForRunner(context.Background(), r), word, firstWord, r)
+}
+
+func candidatesForCtx(ctx context.Context, word string, firstWord bool, r *interp.Runner) []string {
+	ctx = completionContextForRunner(ctx, r)
 	var out []string
 	seen := map[string]bool{}
 	add := func(s string) {
@@ -153,12 +199,12 @@ func candidatesFor(word string, firstWord bool, r *interp.Runner) []string {
 			}
 		}
 		// PATH executables.
-		for _, n := range pathCommands(word, r) {
+		for _, n := range pathCommandsCtx(ctx, word, r) {
 			add(n)
 		}
 	}
 	// File paths always (commands take args; later words are files).
-	for _, n := range fileMatchesWithRunner(word, r) {
+	for _, n := range fileMatchesWithRunnerCtx(ctx, word, r) {
 		add(n)
 	}
 	sort.Strings(out)
@@ -259,10 +305,19 @@ func shellVarNames(r *interp.Runner) []string {
 }
 
 func pathCommands(prefix string, r *interp.Runner) []string {
+	return pathCommandsCtx(completionContextForRunner(context.Background(), r), prefix, r)
+}
+
+func pathCommandsCtx(ctx context.Context, prefix string, r *interp.Runner) []string {
+	ctx = completionContextForRunner(ctx, r)
 	path := ""
-	if r != nil && r.Vars != nil {
-		if v, ok := r.Vars["PATH"]; ok && v.IsSet() {
-			path = v.Str
+	rDir := ""
+	if r != nil {
+		rDir = r.Dir
+		if r.Vars != nil {
+			if v, ok := r.Vars["PATH"]; ok && v.IsSet() {
+				path = v.Str
+			}
 		}
 	}
 	if path == "" {
@@ -277,7 +332,7 @@ func pathCommands(prefix string, r *interp.Runner) []string {
 		if dir == "" {
 			continue
 		}
-		ents, err := os.ReadDir(dir)
+		ents, err := fsReadDir(ctx, rDir, "complete", dir)
 		if err != nil {
 			continue
 		}
@@ -320,6 +375,11 @@ func fileMatches(word string) []string {
 // fileMatchesWithRunner completes word as a path relative to r.Dir
 // (handles ~/ and dir/ prefix, escaped spaces, and appends / to dirs).
 func fileMatchesWithRunner(word string, r *interp.Runner) []string {
+	return fileMatchesWithRunnerCtx(completionContextForRunner(context.Background(), r), word, r)
+}
+
+func fileMatchesWithRunnerCtx(ctx context.Context, word string, r *interp.Runner) []string {
+	ctx = completionContextForRunner(ctx, r)
 	rawWord := unescapeCompWord(word)
 	dir, base := ".", rawWord
 	if i := strings.LastIndexAny(rawWord, "/\\"); i >= 0 {
@@ -328,20 +388,24 @@ func fileMatchesWithRunner(word string, r *interp.Runner) []string {
 			dir = "/"
 		}
 	}
+	rDir := ""
+	if r != nil {
+		rDir = r.Dir
+	}
 	// ~ expansion and Runner.Dir resolution for completion scan.
 	scanDir := dir
 	if strings.HasPrefix(dir, "~/") || strings.HasPrefix(dir, "~\\") || dir == "~" {
 		if h, err := os.UserHomeDir(); err == nil && h != "" {
 			scanDir = h + dir[1:]
 		}
-	} else if !filepath.IsAbs(scanDir) && r != nil && r.Dir != "" {
+	} else if !filepath.IsAbs(scanDir) && rDir != "" {
 		if scanDir == "." {
-			scanDir = r.Dir
+			scanDir = rDir
 		} else {
-			scanDir = filepath.Join(r.Dir, scanDir)
+			scanDir = filepath.Join(rDir, scanDir)
 		}
 	}
-	ents, err := os.ReadDir(scanDir)
+	ents, err := fsReadDir(ctx, rDir, "complete", scanDir)
 	if err != nil {
 		return nil
 	}
@@ -357,7 +421,7 @@ func fileMatchesWithRunner(word string, r *interp.Runner) []string {
 		}
 		isDir := e.IsDir()
 		if !isDir && e.Type()&os.ModeSymlink != 0 {
-			if fi, err := os.Stat(filepath.Join(scanDir, n)); err == nil && fi.IsDir() {
+			if fi, err := fsStat(ctx, rDir, "complete", filepath.Join(scanDir, n)); err == nil && fi.IsDir() {
 				isDir = true
 			}
 		}

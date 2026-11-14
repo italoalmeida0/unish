@@ -1,13 +1,17 @@
 package unish
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net"
+	"net/netip"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 
 	"mvdan.cc/sh/v3/interp"
@@ -19,6 +23,225 @@ func versionString(ver string) string {
 		return "dev"
 	}
 	return ver
+}
+
+type repeatableFlag []string
+
+func (r *repeatableFlag) String() string {
+	if r == nil {
+		return ""
+	}
+	return strings.Join(*r, ",")
+}
+
+func (r *repeatableFlag) Set(val string) error {
+	*r = append(*r, val)
+	return nil
+}
+
+type cliJailFlags struct {
+	jailRoots  repeatableFlag
+	allowRead  repeatableFlag
+	allowWrite repeatableFlag
+	denyPaths  repeatableFlag
+	outside    string
+	netMode    string
+	allowNet   repeatableFlag
+	execMode   string
+	allowExec  repeatableFlag
+}
+
+func (f *cliJailFlags) anySet() bool {
+	return len(f.jailRoots) > 0 ||
+		len(f.allowRead) > 0 ||
+		len(f.allowWrite) > 0 ||
+		len(f.denyPaths) > 0 ||
+		f.outside != "" ||
+		f.netMode != "" ||
+		len(f.allowNet) > 0 ||
+		f.execMode != "" ||
+		len(f.allowExec) > 0
+}
+
+func buildCLIJail(jf cliJailFlags, harnessMode bool) (*Jail, error) {
+	if !jf.anySet() {
+		return nil, nil
+	}
+
+	cfg := DefaultJailConfig(jf.jailRoots...)
+
+	hasExplicitRootScope := len(jf.jailRoots) > 0 ||
+		len(jf.allowRead) > 0 ||
+		len(jf.allowWrite) > 0 ||
+		jf.outside != ""
+	if !hasExplicitRootScope {
+		cfg.OutsideAction = DecisionAllow
+	}
+
+	for _, p := range jf.allowRead {
+		if hasGlobMeta(p) {
+			cfg.Rules = append(cfg.Rules, PathRule{
+				Pattern:  p,
+				Ops:      []AccessOp{OpRead, OpList, OpStat, OpChdir},
+				Decision: DecisionAllow,
+			})
+		} else {
+			cfg.ReadOnlyRoots = append(cfg.ReadOnlyRoots, p)
+		}
+	}
+
+	for _, p := range jf.allowWrite {
+		if hasGlobMeta(p) {
+			cfg.Rules = append(cfg.Rules, PathRule{
+				Pattern:  p,
+				Decision: DecisionAllow,
+			})
+		} else {
+			cfg.Roots = append(cfg.Roots, p)
+		}
+	}
+
+	for _, p := range jf.denyPaths {
+		cfg.Rules = append(cfg.Rules, PathRule{
+			Pattern:  p,
+			Decision: DecisionDeny,
+		})
+	}
+
+	if jf.outside != "" {
+		switch strings.ToLower(strings.TrimSpace(jf.outside)) {
+		case "deny":
+			cfg.OutsideAction = DecisionDeny
+		case "ask":
+			cfg.OutsideAction = DecisionAsk
+		case "allow":
+			cfg.OutsideAction = DecisionAllow
+		default:
+			return nil, fmt.Errorf("invalid --outside mode %q (expected deny, ask, or allow)", jf.outside)
+		}
+	}
+
+	if jf.netMode != "" {
+		switch strings.ToLower(strings.TrimSpace(jf.netMode)) {
+		case "deny":
+			cfg.Net.Default = DecisionDeny
+			cfg.Net.AllowLoopback = false
+			cfg.Net.BlockPrivateLAN = true
+			cfg.Net.AllowListen = DecisionDeny
+		case "loopback":
+			cfg.Net.Default = DecisionDeny
+			cfg.Net.AllowLoopback = true
+			cfg.Net.BlockPrivateLAN = true
+			cfg.Net.AllowListen = DecisionDeny
+		case "ask":
+			cfg.Net.Default = DecisionAsk
+			cfg.Net.AllowLoopback = false
+			cfg.Net.BlockPrivateLAN = true
+			cfg.Net.AllowListen = DecisionAsk
+		case "allow":
+			cfg.Net.Default = DecisionAllow
+			cfg.Net.AllowLoopback = true
+			cfg.Net.BlockPrivateLAN = false
+			cfg.Net.AllowListen = DecisionAllow
+		default:
+			return nil, fmt.Errorf("invalid --net mode %q (expected deny, loopback, ask, or allow)", jf.netMode)
+		}
+	}
+
+	for _, spec := range jf.allowNet {
+		nr, err := parseAllowNetSpec(spec)
+		if err != nil {
+			return nil, err
+		}
+		cfg.Net.Rules = append(cfg.Net.Rules, nr)
+	}
+
+	if jf.execMode != "" {
+		switch strings.ToLower(strings.TrimSpace(jf.execMode)) {
+		case "builtins", "deny":
+			cfg.Exec.ExecDefault = DecisionDeny
+		case "ask":
+			cfg.Exec.ExecDefault = DecisionAsk
+		case "allow":
+			cfg.Exec.ExecDefault = DecisionAllow
+		default:
+			return nil, fmt.Errorf("invalid --exec-mode %q (expected builtins, ask, or allow)", jf.execMode)
+		}
+	}
+
+	cfg.Exec.AllowBinaries = append(cfg.Exec.AllowBinaries, jf.allowExec...)
+
+	// In non-harness interactive terminal runs, install a TTY prompt approver so
+	// --outside ask / --net ask / --exec-mode ask work interactively on a TTY
+	// while still failing closed when stdin is non-interactive.
+	if !harnessMode && termIsTTY(os.Stdin) && termIsTTY(os.Stderr) {
+		cfg.Approver = cliTTYApprover
+	}
+
+	return NewJail(cfg)
+}
+
+func parseAllowNetSpec(raw string) (NetRule, error) {
+	spec := strings.TrimSpace(raw)
+	if spec == "" {
+		return NetRule{}, fmt.Errorf("empty --allow-net pattern")
+	}
+	if _, err := netip.ParsePrefix(spec); err == nil {
+		return NetRule{
+			CIDR:     spec,
+			Decision: DecisionAllow,
+		}, nil
+	}
+	if host, portSpec, err := net.SplitHostPort(spec); err == nil {
+		nr := NetRule{
+			Decision: DecisionAllow,
+		}
+		if _, pErr := netip.ParsePrefix(host); pErr == nil {
+			nr.CIDR = host
+		} else {
+			nr.HostPattern = host
+		}
+		if portSpec != "" && portSpec != "*" {
+			if loStr, hiStr, hasRange := strings.Cut(portSpec, "-"); hasRange {
+				lo, err1 := strconv.Atoi(strings.TrimSpace(loStr))
+				hi, err2 := strconv.Atoi(strings.TrimSpace(hiStr))
+				if err1 != nil || err2 != nil || lo < 0 || hi > 65535 || lo > hi {
+					return NetRule{}, fmt.Errorf("invalid --allow-net port range %q", raw)
+				}
+				nr.PortRange = [2]int{lo, hi}
+			} else {
+				p, err := strconv.Atoi(portSpec)
+				if err != nil || p < 0 || p > 65535 {
+					return NetRule{}, fmt.Errorf("invalid --allow-net port in %q", raw)
+				}
+				nr.Ports = []int{p}
+			}
+		}
+		return nr, nil
+	}
+	return NetRule{
+		HostPattern: spec,
+		Decision:    DecisionAllow,
+	}, nil
+}
+
+func cliTTYApprover(ctx context.Context, req AccessRequest) (Decision, error) {
+	if ctx.Err() != nil {
+		return DecisionDeny, ctx.Err()
+	}
+	fmt.Fprintf(os.Stderr, "[unish jail] allow %s on %s? [y=once / s=session / N=deny]: ", req.Op, requestTarget(req))
+	line, err := bufio.NewReader(os.Stdin).ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return DecisionDeny, nil
+	}
+	switch strings.ToLower(strings.TrimSpace(line)) {
+	case "y", "yes", "allow":
+		return DecisionAllow, nil
+	case "s", "session", "always", "allow_session":
+		return DecisionAllowSession, nil
+	default:
+		return DecisionDeny, nil
+	}
 }
 
 // RunCLI executes the standalone unish command-line interface using a fresh
@@ -39,6 +262,18 @@ func RunCLI(version string, args []string) int {
 	fs := flag.NewFlagSet(progName, flag.ContinueOnError)
 	command := fs.String("c", "", "entire bash command to run")
 	interactiveFlag := fs.Bool("i", false, "force interactive shell")
+	harnessFlag := fs.Bool("harness", false, "run persistent JSONL AI-agent harness server over stdio")
+
+	var jf cliJailFlags
+	fs.Var(&jf.jailRoots, "jail", "add allowed read/write jail root directory (repeatable)")
+	fs.Var(&jf.allowRead, "allow-read", "add allowed read-only path or glob (repeatable)")
+	fs.Var(&jf.allowWrite, "allow-write", "add allowed writable path or glob (repeatable)")
+	fs.Var(&jf.denyPaths, "deny-path", "deny access to matching path or glob (repeatable)")
+	fs.StringVar(&jf.outside, "outside", "", "policy for paths outside jail roots: deny, ask, or allow")
+	fs.StringVar(&jf.netMode, "net", "", "network policy: deny, loopback, ask, or allow")
+	fs.Var(&jf.allowNet, "allow-net", "allow network access to host[:port] or CIDR (repeatable)")
+	fs.StringVar(&jf.execMode, "exec-mode", "", "external binary policy: builtins, ask, or allow")
+	fs.Var(&jf.allowExec, "allow-exec", "allow executing named or absolute external binary (repeatable)")
 
 	showVersion := false
 	fs.BoolFunc("version", "print version and exit", func(string) error {
@@ -65,13 +300,46 @@ func RunCLI(version string, args []string) int {
 		return 0
 	}
 
+	hasCommandFlag := false
+	fs.Visit(func(f *flag.Flag) {
+		if f.Name == "c" {
+			hasCommandFlag = true
+		}
+	})
+
+	jail, err := buildCLIJail(jf, *harnessFlag)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "unish:", err)
+		return 2
+	}
+
+	if *harnessFlag {
+		var sessOpts []SessionOption
+		if jail != nil {
+			sessOpts = append(sessOpts, WithJail(jail))
+		}
+		if err := RunHarness(context.Background(), os.Stdin, os.Stdout, sessOpts...); err != nil {
+			fmt.Fprintln(os.Stderr, "unish --harness:", err)
+			return 1
+		}
+		return 0
+	}
+
 	var src, name string
 	var params []string
 	if *interactiveFlag {
 		return runInteractive()
 	}
+
+	startDir := ""
+	if jail != nil {
+		if resolvedDir, derr := resolveInitialSessionDir("", jail); derr == nil {
+			startDir = resolvedDir
+		}
+	}
+
 	switch {
-	case fs.NFlag() > 0:
+	case hasCommandFlag:
 		src = *command
 		if len(fs.Args()) > 0 {
 			name = fs.Args()[0]
@@ -85,8 +353,19 @@ func RunCLI(version string, args []string) int {
 	default:
 		rest := fs.Args()
 		if len(rest) > 0 {
-			data, err := os.ReadFile(rest[0])
-			if err != nil {
+			var data []byte
+			var rerr error
+			if jail != nil {
+				jctx := WithCapabilityHook(context.Background(), jail)
+				data, rerr = fsReadFile(jctx, startDir, "unish", rest[0])
+			} else {
+				data, rerr = os.ReadFile(rest[0])
+			}
+			if rerr != nil {
+				if errors.Is(rerr, os.ErrPermission) {
+					fmt.Fprintf(os.Stderr, "bash: %s: %v\n", rest[0], rerr)
+					return 126
+				}
 				fmt.Fprintf(os.Stderr, "bash: %s: No such file or directory\n", rest[0])
 				return 127
 			}
@@ -128,16 +407,47 @@ func RunCLI(version string, args []string) int {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	if jail != nil {
+		ctx = WithCapabilityHook(ctx, jail)
+	}
 
-	runnerOpts := []interp.RunnerOption{
-		interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
-		interp.CallHandler(callOverride),
-		interp.OpenHandler(shellOpenHandler()),
-		interp.ExecHandlers(
-			trackExec,
-			extraHandler,
-		),
-		interp.ProcSubstHandler(procSubstHandler),
+	var runnerOpts []interp.RunnerOption
+	if jail == nil {
+		runnerOpts = []interp.RunnerOption{
+			interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
+			interp.CallHandler(callOverride),
+			interp.OpenHandler(shellOpenHandler()),
+			interp.ExecHandlers(
+				trackExec,
+				extraHandler,
+			),
+			interp.ProcSubstHandler(procSubstHandler),
+		}
+	} else {
+		cliSess := &Session{
+			jail:       jail,
+			hook:       jail,
+			inheritEnv: true,
+		}
+		cliSess.umask.Store(shellUmask.Load())
+		if startDir != "" {
+			cliSess.storeCwd(startDir)
+			runnerOpts = append(runnerOpts, interp.Dir(startDir))
+		}
+		runnerOpts = append(runnerOpts,
+			interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
+			interp.OpenHandler(cliSess.openHandler),
+			interp.ReadDirHandler2(cliSess.readDirHandler),
+			interp.StatHandler(cliSess.statHandler),
+			interp.AccessHandler(cliSess.accessHandler),
+			interp.CallHandler(cliSess.callHandler),
+			interp.ExecHandlers(
+				cliSess.execMiddleware,
+				trackExec,
+				extraHandler,
+			),
+			interp.ProcSubstHandler(procSubstHandler),
+		)
 	}
 	if len(params) > 0 {
 		runnerOpts = append(runnerOpts, interp.Params(append([]string{"--"}, params...)...))
@@ -146,6 +456,10 @@ func RunCLI(version string, args []string) int {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "bash:", err)
 		return 1
+	}
+	if jail != nil {
+		registerRunnerCompletionHook(r, jail)
+		defer unregisterRunnerCompletionHook(r)
 	}
 
 	// Let kill enqueue signals for this runner's own traps.
