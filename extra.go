@@ -124,13 +124,35 @@ func init() {
 		{"shasum", cmdShasum},
 		{"mktemp", cmdMktemp},
 		{"find", cmdFind},
+		{"awk", cmdAwk},
+		{"gawk", cmdAwk},
+		{"jq", cmdJq},
+		{"rg", cmdRg},
+		{"patch", cmdPatch},
+		{"bc", cmdBc},
+		{"sponge", cmdSponge},
+		{"flock", cmdFlock},
+		{"column", cmdColumn},
+		{"xxd", cmdXxd},
 	}
 	extraRegistryMu.Lock()
 	if len(extraCommands) == 0 {
 		extraCommands = make([]extraCmd, len(base), len(base)+48)
 		copy(extraCommands, base)
 	} else {
-		extraCommands = append(base, extraCommands...)
+		seen := make(map[string]struct{}, len(base)+len(extraCommands))
+		merged := make([]extraCmd, 0, len(base)+len(extraCommands))
+		for _, c := range base {
+			seen[c.name] = struct{}{}
+			merged = append(merged, c)
+		}
+		for _, c := range extraCommands {
+			if _, ok := seen[c.name]; !ok {
+				seen[c.name] = struct{}{}
+				merged = append(merged, c)
+			}
+		}
+		extraCommands = merged
 	}
 	rebuildExtraRegistryLocked()
 	extraRegistryMu.Unlock()
@@ -366,6 +388,24 @@ var (
 	lsColorMode = "never" // --color[=WHEN]: never/always/auto
 )
 
+func toolOptForCmd(cmd string) *toolOptParser {
+	switch cmd {
+	case "rg":
+		return &rgOptTable
+	case "patch":
+		return &patchOpts
+	case "sponge":
+		return &spongeOpts
+	case "flock":
+		return &flockOpts
+	case "column":
+		return &columnOpts
+	case "xxd":
+		return &xxdOpts
+	}
+	return nil
+}
+
 // hasVersionFlag reports whether args passes --version as an actual option to
 // args[0], stopping at "--", skipping values of value-taking flags, ignoring
 // builtins like echo/true/false, and stopping before subcommands of wrappers.
@@ -388,11 +428,13 @@ func hasVersionFlag(args []string) bool {
 	}
 	cmd := args[0]
 	switch cmd {
-	case "echo", "true", "false":
+	case "echo", "true", "false", "jq":
 		return false
 	}
 	spec, hasSpec := flagSpecs[cmd]
-	isWrapper := cmd == "env" || cmd == "timeout" || cmd == "nice" || cmd == "nohup" || cmd == "watch" || cmd == "xargs"
+	tp := toolOptForCmd(cmd)
+	isAwk := cmd == "awk" || cmd == "gawk"
+	isWrapper := cmd == "env" || cmd == "timeout" || cmd == "nice" || cmd == "nohup" || cmd == "watch" || cmd == "xargs" || cmd == "flock"
 	positionals := 0
 	for i := 1; i < len(args); i++ {
 		a := args[i]
@@ -406,10 +448,21 @@ func hasVersionFlag(args []string) bool {
 			continue
 		}
 		if strings.HasPrefix(a, "--") && len(a) > 2 {
-			if strings.IndexByte(a, '=') < 0 && hasSpec {
-				if short, known := spec.long[a[2:]]; known {
-					if (len(short) == 1 && strings.IndexByte(spec.values, short[0]) >= 0) ||
-						(len(short) > 1 && !spec.longBools[short]) {
+			if strings.IndexByte(a, '=') < 0 {
+				if hasSpec {
+					if short, known := spec.long[a[2:]]; known {
+						if (len(short) == 1 && strings.IndexByte(spec.values, short[0]) >= 0) ||
+							(len(short) > 1 && !spec.longBools[short]) {
+							i++
+						}
+					}
+				} else if tp != nil {
+					if idx := tp.find(a[2:], 0); idx >= 0 && tp.opts[idx].arg {
+						i++
+					}
+				} else if isAwk {
+					switch a[2:] {
+					case "field-separator", "assign", "file", "source":
 						i++
 					}
 				}
@@ -432,11 +485,46 @@ func hasVersionFlag(args []string) bool {
 						break
 					}
 				}
+			} else if tp != nil {
+				if tp.dashLong {
+					if name, _, hasVal := strings.Cut(a[1:], "="); !hasVal {
+						if idx := tp.find(name, 0); idx >= 0 {
+							if tp.opts[idx].arg {
+								i++
+							}
+							continue
+						}
+					}
+				}
+				for j := 1; j < len(a); j++ {
+					idx := tp.find("", a[j])
+					if idx < 0 {
+						break
+					}
+					if tp.opts[idx].arg {
+						if j == len(a)-1 {
+							i++
+						}
+						break
+					}
+				}
+			} else if isAwk {
+				for j := 1; j < len(a); j++ {
+					switch a[j] {
+					case 'b', 'c', 'P', 'S':
+						continue
+					case 'F', 'v', 'f', 'e', 'W':
+						if j == len(a)-1 {
+							i++
+						}
+					}
+					break
+				}
 			}
 			continue
 		}
 		positionals++
-		if isWrapper {
+		if isWrapper || isAwk {
 			if cmd == "timeout" && positionals == 1 {
 				continue // duration operand before subcommand
 			}
