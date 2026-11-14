@@ -9,10 +9,13 @@ import (
 	"unsafe"
 )
 
+var (
+	modNtdll          = syscall.NewLazyDLL("ntdll.dll")
+	procRtlGetVersion = modNtdll.NewProc("RtlGetVersion")
+)
+
 // windowsBuildNumber returns e.g. "10.0.26100" via RtlGetVersion.
 func windowsBuildNumber() (string, error) {
-	ntdll := syscall.NewLazyDLL("ntdll.dll")
-	rtl := ntdll.NewProc("RtlGetVersion")
 	type vs struct {
 		size, major, minor, build uint32
 		platform                  uint32
@@ -24,7 +27,8 @@ func windowsBuildNumber() (string, error) {
 	}
 	var v vs
 	v.size = uint32(unsafe.Sizeof(v))
-	r, _, _ := rtl.Call(uintptr(unsafe.Pointer(&v)))
+	r, _, _ := procRtlGetVersion.Call(uintptr(unsafe.Pointer(&v)))
+	runtime.KeepAlive(&v)
 	if r != 0 {
 		return "", fmt.Errorf("RtlGetVersion: %d", r)
 	}

@@ -4,7 +4,6 @@ package main
 
 import (
 	"fmt"
-	"net"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -24,7 +23,7 @@ func diskUsage(path string) (total, free, avail int64, fstype, mount string) {
 	if err := syscall.Statfs(p, &st); err != nil {
 		return 0, 0, 0, "", path
 	}
-	bsize := int64(st.Bsize)
+	bsize := fsBlockSize(&st)
 	return int64(st.Blocks) * bsize, int64(st.Bfree) * bsize, int64(st.Bavail) * bsize, fstypeName(int64(st.Type)), p
 }
 
@@ -55,7 +54,7 @@ func blocksOf(fi os.FileInfo) int64 {
 
 func deviceOf(path string) string {
 	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
+	if err := syscall.Lstat(path, &st); err != nil {
 		return "0h/0d"
 	}
 	dev := uint64(st.Dev)
@@ -64,7 +63,7 @@ func deviceOf(path string) string {
 
 func inodeOf(path string) int64 {
 	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err != nil {
+	if err := syscall.Lstat(path, &st); err != nil {
 		return 0
 	}
 	return int64(st.Ino)
@@ -72,7 +71,7 @@ func inodeOf(path string) int64 {
 
 func linksOf(path string, fi os.FileInfo) int {
 	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err == nil {
+	if err := syscall.Lstat(path, &st); err == nil {
 		return int(st.Nlink)
 	}
 	if fi.IsDir() {
@@ -83,7 +82,7 @@ func linksOf(path string, fi os.FileInfo) int {
 
 func uidOf(path string) int {
 	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err == nil {
+	if err := syscall.Lstat(path, &st); err == nil {
 		return int(st.Uid)
 	}
 	return os.Getuid()
@@ -91,7 +90,7 @@ func uidOf(path string) int {
 
 func gidOf(path string) int {
 	var st syscall.Stat_t
-	if err := syscall.Stat(path, &st); err == nil {
+	if err := syscall.Lstat(path, &st); err == nil {
 		return int(st.Gid)
 	}
 	return os.Getgid()
@@ -115,6 +114,9 @@ type memStat struct {
 }
 
 func memInfo() memStat {
+	if m, ok := osMemInfo(); ok {
+		return m
+	}
 	var m memStat
 	data, err := os.ReadFile("/proc/meminfo")
 	if err != nil {
@@ -150,9 +152,10 @@ func memInfo() memStat {
 	return m
 }
 
-
-
 func loadAvg() (float64, float64, float64) {
+	if l1, l5, l15, ok := osLoadAvg(); ok {
+		return l1, l5, l15
+	}
 	data, err := os.ReadFile("/proc/loadavg")
 	if err != nil {
 		return 0, 0, 0
@@ -187,20 +190,38 @@ func identity() (uid int, user string, gid int, group string) {
 	return idUID, idUser, idGID, idGroup
 }
 
-func ttyName() string { return "" }
+func ttyNameFd(fd int) string {
+	if dst, err := os.Readlink(fmt.Sprintf("/proc/self/fd/%d", fd)); err == nil && strings.HasPrefix(dst, "/") {
+		return dst
+	}
+	return ""
+}
+
+func ttyName() string {
+	return ttyNameFd(int(os.Stdin.Fd()))
+}
 
 func syncDisks() {
 	syscall.Sync()
 }
 
-func currentNice() int { return 0 }
-
-func setNice(n int) {
-	_, _ = syscall.Getpriority(syscall.PRIO_PROCESS, 0)
-	syscall.Setpriority(syscall.PRIO_PROCESS, 0, n)
+func currentNice() int {
+	p, err := syscall.Getpriority(syscall.PRIO_PROCESS, 0)
+	if err != nil {
+		return 0
+	}
+	if runtime.GOOS == "linux" {
+		// Linux raw SYS_GETPRIORITY returns 20 - nice (1..40).
+		return 20 - p
+	}
+	return p
 }
 
-
+func setProcNice(pid, n int) {
+	if pid > 0 {
+		_ = syscall.Setpriority(syscall.PRIO_PROCESS, pid, n)
+	}
+}
 
 var tcpStates = map[string]string{
 	"01": "ESTAB", "02": "SYN-SENT", "03": "SYN-RECV", "04": "FIN-WAIT-1",
@@ -253,27 +274,27 @@ func listSockets(protos []string) ([]sockInfo, error) {
 			}
 			lines := strings.Split(string(data), "\n")
 			for _, line := range lines[1:] {
-				f := strings.Fields(line)
-				if len(f) < 10 {
+				fields := strings.Fields(line)
+				if len(fields) < 10 {
 					continue
 				}
-				state := tcpStates[f[3]]
+				state := tcpStates[fields[3]]
 				if proto == "udp" {
 					state = "UNCONN"
 				} else if state == "" {
-					state = f[3]
+					state = fields[3]
 				}
-				local := netAddr(f[1])
-				peer := netAddr(f[2])
+				local := parseProcNetAddr(fields[1])
+				peer := parseProcNetAddr(fields[2])
 				var txq, rxq int64
-				if len(f) > 4 {
-					qq := strings.Split(f[4], ":")
+				if len(fields) > 4 {
+					qq := strings.Split(fields[4], ":")
 					if len(qq) == 2 {
 						txq, _ = strconv.ParseInt(qq[0], 16, 64)
 						rxq, _ = strconv.ParseInt(qq[1], 16, 64)
 					}
 				}
-				inode := f[9]
+				inode := fields[9]
 				var pid int
 				var procName string
 				if info, ok := inodeMap[inode]; ok {
@@ -288,42 +309,6 @@ func listSockets(protos []string) ([]sockInfo, error) {
 		}
 	}
 	return out, nil
-}
-
-func netAddr(hex string) string {
-	parts := strings.Split(hex, ":")
-	if len(parts) != 2 {
-		return hex
-	}
-	port, _ := strconv.ParseInt(parts[1], 16, 64)
-	ipHex := parts[0]
-	if len(ipHex) == 8 {
-		var b [4]byte
-		for i := 0; i < 4; i++ {
-			v, _ := strconv.ParseUint(ipHex[i*2:i*2+2], 16, 8)
-			b[3-i] = byte(v)
-		}
-		return fmt.Sprintf("%d.%d.%d.%d:%d", b[0], b[1], b[2], b[3], port)
-	}
-	if ip, err := parseIPv6Hex(ipHex); err == nil {
-		return fmt.Sprintf("[%s]:%d", ip, port)
-	}
-	return hex
-}
-
-func parseIPv6Hex(s string) (string, error) {
-	if len(s) != 32 {
-		return "", fmt.Errorf("bad")
-	}
-	var b [16]byte
-	for i := 0; i < 16; i++ {
-		v, err := strconv.ParseUint(s[i*2:i*2+2], 16, 8)
-		if err != nil {
-			return "", err
-		}
-		b[i] = byte(v)
-	}
-	return net.IP(b[:]).String(), nil
 }
 
 var _ = runtime.GOOS

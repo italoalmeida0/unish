@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,25 +15,46 @@ import (
 )
 
 var (
-	modKernel32            = syscall.NewLazyDLL("kernel32.dll")
-	procGetDiskFreeSpaceEx = modKernel32.NewProc("GetDiskFreeSpaceExW")
-	procGlobalMemoryStatus = modKernel32.NewProc("GlobalMemoryStatusEx")
-	procGetTickCount64     = modKernel32.NewProc("GetTickCount64")
+	modKernel32             = syscall.NewLazyDLL("kernel32.dll")
+	procGetDiskFreeSpaceEx  = modKernel32.NewProc("GetDiskFreeSpaceExW")
+	procGlobalMemoryStatus  = modKernel32.NewProc("GlobalMemoryStatusEx")
+	procGetTickCount64      = modKernel32.NewProc("GetTickCount64")
+	procK32GetProcessMemory = modKernel32.NewProc("K32GetProcessMemoryInfo")
 )
 
 func diskUsage(path string) (total, free, avail int64, fstype, mount string) {
-	vol := filepath.VolumeName(path)
+	absPath := path
+	if a, err := filepath.Abs(path); err == nil {
+		absPath = a
+	}
+	dir := absPath
+	if fi, err := os.Stat(absPath); err == nil && !fi.IsDir() {
+		dir = filepath.Dir(absPath)
+	}
+	vol := filepath.VolumeName(dir)
 	if vol == "" {
 		vol = "C:"
 	}
 	root := vol + `\`
+	queryDir := dir
+	if queryDir == "" {
+		queryDir = root
+	}
+	utf16Dir, err := syscall.UTF16PtrFromString(queryDir)
+	if err != nil {
+		return 0, 0, 0, "", root
+	}
 	var freeB, totalB, availB uint64
 	r, _, _ := procGetDiskFreeSpaceEx.Call(
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(root))),
+		uintptr(unsafe.Pointer(utf16Dir)),
 		uintptr(unsafe.Pointer(&availB)),
 		uintptr(unsafe.Pointer(&totalB)),
 		uintptr(unsafe.Pointer(&freeB)),
 	)
+	runtime.KeepAlive(utf16Dir)
+	runtime.KeepAlive(&availB)
+	runtime.KeepAlive(&totalB)
+	runtime.KeepAlive(&freeB)
 	if r == 0 {
 		return 0, 0, 0, "", root
 	}
@@ -103,6 +125,7 @@ func memInfo() memStat {
 	var st memoryStatusEx
 	st.length = uint32(unsafe.Sizeof(st))
 	r, _, _ := procGlobalMemoryStatus.Call(uintptr(unsafe.Pointer(&st)))
+	runtime.KeepAlive(&st)
 	if r == 0 {
 		return m
 	}
@@ -144,6 +167,11 @@ func identity() (uid int, user string, gid int, group string) {
 	return 0, idUser, 0, "group"
 }
 
+func ttyNameFd(fd int) string {
+	_ = fd
+	return ""
+}
+
 func ttyName() string { return "" }
 
 func syncDisks() {
@@ -151,8 +179,8 @@ func syncDisks() {
 
 func currentNice() int { return 0 }
 
-func setNice(n int) {
-	_ = n
+func setProcNice(pid, n int) {
+	_, _ = pid, n
 }
 
 const (
@@ -186,7 +214,7 @@ var (
 
 func listProcs() ([]procInfo, error) {
 	snap, _, _ := procCreateSnapshot.Call(uintptr(th32csSnapProcess), 0)
-	if snap == invalidHandleValue {
+	if snap == invalidHandleValue || snap == 0 {
 		return nil, fmt.Errorf("snapshot failed")
 	}
 	defer procCloseHandle.Call(snap)
@@ -196,13 +224,17 @@ func listProcs() ([]procInfo, error) {
 	r, _, _ := procProcess32First.Call(snap, uintptr(unsafe.Pointer(&pe)))
 	for r != 0 {
 		name := syscall.UTF16ToString(pe.exeFile[:])
+		pid := pe.processID
+		ppid := pe.parentProcessID
 		out = append(out, procInfo{
-			pid: int(pe.processID), ppid: int(pe.parentProcessID),
-			user: "?", cpu: -1, memPct: -1, vszKB: -1, rssKB: procRSS(pe.processID),
+			pid: int(pid), ppid: int(ppid),
+			user: "?", comm: name,
+			cpu: -1, memPct: -1, vszKB: -1, rssKB: procRSS(pid),
 			tty: "?", stat: "?", start: "?", time: "00:00:00", cmd: name,
 		})
 		r, _, _ = procProcess32Next.Call(snap, uintptr(unsafe.Pointer(&pe)))
 	}
+	runtime.KeepAlive(&pe)
 	return out, nil
 }
 
@@ -220,15 +252,34 @@ type processMemoryCounters struct {
 }
 
 func procRSS(pid uint32) int64 {
-	const processQueryInfo = 0x0400
-	h, _, _ := procOpenProcess.Call(uintptr(processQueryInfo), 0, uintptr(pid))
+	if pid == 0 {
+		return -1
+	}
+	const (
+		processQueryInfo        = 0x0400
+		processQueryLimitedInfo = 0x1000
+		processVMRead           = 0x0010
+	)
+	h, _, _ := procOpenProcess.Call(uintptr(processQueryLimitedInfo|processVMRead), 0, uintptr(pid))
+	if h == 0 {
+		h, _, _ = procOpenProcess.Call(uintptr(processQueryLimitedInfo), 0, uintptr(pid))
+	}
+	if h == 0 {
+		h, _, _ = procOpenProcess.Call(uintptr(processQueryInfo|processVMRead), 0, uintptr(pid))
+	}
 	if h == 0 {
 		return -1
 	}
 	defer procCloseHandle.Call(h)
 	var pmc processMemoryCounters
 	pmc.cb = uint32(unsafe.Sizeof(pmc))
-	r, _, _ := procGetProcessMemory.Call(h, uintptr(unsafe.Pointer(&pmc)), uintptr(pmc.cb))
+	var r uintptr
+	if procK32GetProcessMemory.Find() == nil {
+		r, _, _ = procK32GetProcessMemory.Call(h, uintptr(unsafe.Pointer(&pmc)), uintptr(pmc.cb))
+	} else {
+		r, _, _ = procGetProcessMemory.Call(h, uintptr(unsafe.Pointer(&pmc)), uintptr(pmc.cb))
+	}
+	runtime.KeepAlive(&pmc)
 	if r == 0 {
 		return -1
 	}

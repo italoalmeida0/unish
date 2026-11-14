@@ -7,8 +7,24 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 )
+
+func fsBlockSize(st *syscall.Statfs_t) int64 {
+	if st.Frsize > 0 {
+		return int64(st.Frsize)
+	}
+	return int64(st.Bsize)
+}
+
+func osMemInfo() (memStat, bool) {
+	return memStat{}, false
+}
+
+func osLoadAvg() (float64, float64, float64, bool) {
+	return 0, 0, 0, false
+}
 
 func listProcs() ([]procInfo, error) {
 	entries, err := os.ReadDir("/proc")
@@ -16,44 +32,46 @@ func listProcs() ([]procInfo, error) {
 		return nil, err
 	}
 	var out []procInfo
-	clkTck := int64(100)
 	var uptime float64
 	if data, err := os.ReadFile("/proc/uptime"); err == nil {
 		fmt.Sscanf(string(data), "%f", &uptime)
 	}
+	pageSize := os.Getpagesize()
+	uidCache := make(map[uint32]string, 8)
 	for _, e := range entries {
 		pid, err := strconv.Atoi(e.Name())
 		if err != nil {
 			continue
 		}
-		p := procInfo{pid: pid, user: "?", tty: "?", stat: "?", start: "?", time: "00:00:00", cpu: -1, memPct: -1, vszKB: -1, rssKB: -1}
-		if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid)); err == nil {
-			s := string(data)
-			ri := strings.LastIndexByte(s, ')')
-			if ri > 0 {
-				rest := strings.Fields(s[ri+1:])
-				if len(rest) > 20 {
-					p.ppid, _ = strconv.Atoi(rest[1])
-					p.stat = rest[0]
-					utime, _ := strconv.ParseInt(rest[11], 10, 64)
-					stime, _ := strconv.ParseInt(rest[12], 10, 64)
-					startTicks, _ := strconv.ParseInt(rest[19], 10, 64)
-					vsz, _ := strconv.ParseInt(rest[20], 10, 64)
-					rss, _ := strconv.ParseInt(rest[21], 10, 64)
-					p.vszKB = vsz / 1024
-					p.rssKB = rss * 4096 / 1024
-					totalTicks := utime + stime
-					elapsed := uptime - float64(startTicks)/float64(clkTck)
-					if elapsed > 0 {
-						p.cpu = float64(totalTicks) / float64(clkTck) / elapsed * 100
-					}
-					mins := (utime + stime) / clkTck / 60
-					secs := (utime + stime) / clkTck % 60
-					p.time = fmt.Sprintf("%02d:%02d:%02d", mins/60, mins%60, secs)
-				}
+		procDir := fmt.Sprintf("/proc/%d", pid)
+		p := procInfo{
+			pid: pid, user: "?", tty: "?", stat: "?",
+			start: "?", time: "00:00:00",
+			cpu: -1, memPct: -1, vszKB: -1, rssKB: -1,
+		}
+		var st syscall.Stat_t
+		if err := syscall.Stat(procDir, &st); err == nil {
+			u, ok := uidCache[st.Uid]
+			if !ok {
+				u = lookupUserName(int(st.Uid))
+				uidCache[st.Uid] = u
+			}
+			if u != "" {
+				p.user = u
 			}
 		}
-		if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid)); err == nil && len(data) > 0 {
+		if data, err := os.ReadFile(procDir + "/stat"); err == nil {
+			if comm, statCh, ppid, cpu, vszKB, rssKB, cpuTime, ok := parseProcStat(string(data), uptime, pageSize); ok {
+				p.comm = comm
+				p.stat = statCh
+				p.ppid = ppid
+				p.cpu = cpu
+				p.vszKB = vszKB
+				p.rssKB = rssKB
+				p.time = cpuTime
+			}
+		}
+		if data, err := os.ReadFile(procDir + "/cmdline"); err == nil && len(data) > 0 {
 			parts := strings.Split(string(data), "\x00")
 			var cmd []string
 			for _, x := range parts {
@@ -61,9 +79,21 @@ func listProcs() ([]procInfo, error) {
 					cmd = append(cmd, x)
 				}
 			}
-			p.cmd = strings.Join(cmd, " ")
-		} else if data, err := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid)); err == nil {
-			p.cmd = "[" + strings.TrimSpace(string(data)) + "]"
+			if len(cmd) > 0 {
+				p.cmd = strings.Join(cmd, " ")
+				base0 := baseNameAnySlash(cmd[0])
+				if p.comm == "" || (len(p.comm) == 15 && strings.HasPrefix(base0, p.comm)) {
+					p.comm = base0
+				}
+			}
+		}
+		if p.comm == "" {
+			if data, err := os.ReadFile(procDir + "/comm"); err == nil {
+				p.comm = strings.TrimSpace(string(data))
+			}
+		}
+		if p.cmd == "" && p.comm != "" {
+			p.cmd = "[" + p.comm + "]"
 		}
 		if p.cmd == "" {
 			continue
@@ -78,12 +108,8 @@ func bootTime() time.Time {
 	if err != nil {
 		return time.Now()
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		if strings.HasPrefix(line, "btime ") {
-			if v, err := strconv.ParseInt(strings.Fields(line)[1], 10, 64); err == nil {
-				return time.Unix(v, 0)
-			}
-		}
+	if v, ok := parseProcBtime(string(data)); ok {
+		return time.Unix(v, 0)
 	}
 	return time.Now()
 }

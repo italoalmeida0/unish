@@ -2,12 +2,16 @@ package main
 
 import (
 	"context"
+	"encoding/binary"
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -58,8 +62,14 @@ func cmdDf(_ context.Context, hc interp.HandlerContext, args []string) error {
 		mount                  string
 	}
 	var rows []row
+	exitStatus := 0
 	for _, p := range paths {
 		full := resolve(hc.Dir, p)
+		if _, err := os.Stat(full); err != nil {
+			fmt.Fprintf(hc.Stderr, "df: %s: No such file or directory\n", p)
+			exitStatus = 1
+			continue
+		}
 		total, free, avail, fstype, mount := diskUsage(full)
 		used := total - free
 		if used < 0 {
@@ -68,23 +78,28 @@ func cmdDf(_ context.Context, hc interp.HandlerContext, args []string) error {
 		_ = fstype
 		rows = append(rows, row{total: total, used: used, avail: avail, mount: mount})
 	}
-	if *human {
-		fmt.Fprintln(hc.Stdout, "Filesystem      Size  Used Avail Use% Mounted on")
-	} else {
-		fmt.Fprintln(hc.Stdout, "Filesystem     1K-blocks     Used Available Use% Mounted on")
-	}
-	for _, r := range rows {
-		pct := 0
-		if r.total > 0 {
-			pct = int(r.used * 100 / r.total)
-		}
+	if len(rows) > 0 {
 		if *human {
-			fmt.Fprintf(hc.Stdout, "%-15s %4s  %4s %4s %3d%% %s\n",
-				"fs", dfHuman(r.total), dfHuman(r.used), dfHuman(r.avail), pct, filepath.ToSlash(r.mount))
+			fmt.Fprintln(hc.Stdout, "Filesystem      Size  Used Avail Use% Mounted on")
 		} else {
-			fmt.Fprintf(hc.Stdout, "%-15s %10d %8d %9d %3d%% %s\n",
-				"fs", r.total/1024, r.used/1024, r.avail/1024, pct, filepath.ToSlash(r.mount))
+			fmt.Fprintln(hc.Stdout, "Filesystem     1K-blocks     Used Available Use% Mounted on")
 		}
+		for _, r := range rows {
+			pct := 0
+			if r.total > 0 {
+				pct = int(r.used * 100 / r.total)
+			}
+			if *human {
+				fmt.Fprintf(hc.Stdout, "%-15s %4s  %4s %4s %3d%% %s\n",
+					"fs", dfHuman(r.total), dfHuman(r.used), dfHuman(r.avail), pct, filepath.ToSlash(r.mount))
+			} else {
+				fmt.Fprintf(hc.Stdout, "%-15s %10d %8d %9d %3d%% %s\n",
+					"fs", r.total/1024, r.used/1024, r.avail/1024, pct, filepath.ToSlash(r.mount))
+			}
+		}
+	}
+	if exitStatus != 0 {
+		return exitError{exitStatus}
 	}
 	return nil
 }
@@ -109,6 +124,7 @@ func dfHuman(n int64) string {
 type procInfo struct {
 	pid, ppid int
 	user      string
+	comm      string
 	cpu       float64
 	memPct    float64
 	vszKB     int64
@@ -121,14 +137,14 @@ type procInfo struct {
 }
 
 func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
-	fs := newFlagSet("ps", hc.Stderr)
 	bsd := false
 	full := false
 	var oformat string
 	var pids []int
+	hasPidFilter := false
 	for i := 0; i < len(args[1:]); i++ {
 		a := args[1:][i]
-		if a == "aux" {
+		if a == "aux" || a == "ax" {
 			bsd = true
 			continue
 		}
@@ -154,6 +170,7 @@ func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
 					}
 					j = len(t)
 				case 'p':
+					hasPidFilter = true
 					if j == len(t)-1 {
 						if i+1 < len(args[1:]) {
 							i++
@@ -164,76 +181,85 @@ func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
 					}
 					j = len(t)
 				default:
-					if c == 'f' || c == 'u' || c == 'l' {
+					if c == 'f' || c == 'l' {
 						full = true
+					} else if c == 'u' {
+						bsd = true
 					}
 				}
 			}
 		}
 	}
-	_ = fs
-	if oformat != "" {
-		// GNU: -o overrides every other output mode.
-		procs, err := listProcs()
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "ps:", err)
-			return exitError{1}
-		}
-		sort.Slice(procs, func(i, j int) bool { return procs[i].pid < procs[j].pid })
-		if len(pids) > 0 {
-			want := map[int]bool{}
-			for _, p := range pids {
-				want[p] = true
-			}
-			kept := procs[:0]
-			for _, p := range procs {
-				if want[p.pid] {
-					kept = append(kept, p)
-				}
-			}
-			procs = kept
-		}
-		return psPrintFormat(procs, oformat)
-	}
-	if bsd && !full {
-		full = false
-	}
+
 	procs, err := listProcs()
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "ps:", err)
 		return exitError{1}
 	}
 	sort.Slice(procs, func(i, j int) bool { return procs[i].pid < procs[j].pid })
-	if !full {
-		// GNU `ps` / `ps -e` default format lists "PID TTY TIME CMD".
-		// With no args GNU shows only the session; with -e/-a/-A it
-		// shows every process. unish is single-process for builtins,
-		// so plain `ps` reports self; -e lists all known processes.
-		if len(args) == 1 {
-			fmt.Fprintln(hc.Stdout, "    PID TTY          TIME CMD")
-			me := os.Getpid()
-			fmt.Fprintf(hc.Stdout, "%7d %-12s %8s %s\n", me, "?", "00:00:00", "unish")
-			return nil
+	if hasPidFilter {
+		want := make(map[int]bool, len(pids))
+		for _, p := range pids {
+			want[p] = true
 		}
-		fmt.Fprintln(hc.Stdout, "    PID TTY          TIME CMD")
+		kept := procs[:0]
 		for _, p := range procs {
-			fmt.Fprintf(hc.Stdout, "%7d %-12s %8s %s\n", p.pid, p.tty, p.time, p.cmd)
+			if want[p.pid] {
+				kept = append(kept, p)
+			}
+		}
+		procs = kept
+	}
+
+	if oformat != "" {
+		// GNU: -o overrides every other output mode.
+		if err := psPrintFormat(hc, procs, oformat); err != nil {
+			return err
+		}
+		if hasPidFilter && len(procs) == 0 {
+			return exitError{1}
 		}
 		return nil
 	}
+
+	if bsd {
+		fmt.Fprintln(hc.Stdout, "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND")
+		for _, p := range procs {
+			fmt.Fprintf(hc.Stdout, "%-12s %5d %4s %4s %6s %5s %-8s %-4s %-7s %8s %s\n",
+				p.user, p.pid, pctStr(p.cpu), pctStr(p.memPct),
+				kbStr(p.vszKB), kbStr(p.rssKB), p.tty, p.stat, p.start, p.time, p.cmd)
+		}
+		if hasPidFilter && len(procs) == 0 {
+			return exitError{1}
+		}
+		return nil
+	}
+
 	if full {
 		fmt.Fprintln(hc.Stdout, "UID          PID    PPID  C STIME TTY          TIME CMD")
 		for _, p := range procs {
 			fmt.Fprintf(hc.Stdout, "%-12s %5d %5d  - %s %-12s %s %s\n",
 				p.user, p.pid, p.ppid, p.start, p.tty, p.time, p.cmd)
 		}
+		if hasPidFilter && len(procs) == 0 {
+			return exitError{1}
+		}
 		return nil
 	}
-	fmt.Fprintln(hc.Stdout, "USER         PID %CPU %MEM    VSZ   RSS TTY      STAT START   TIME COMMAND")
+
+	// GNU `ps` / `ps -e` default format lists "PID TTY TIME CMD".
+	if len(args) == 1 && !hasPidFilter {
+		fmt.Fprintln(hc.Stdout, "    PID TTY          TIME CMD")
+		me := os.Getpid()
+		fmt.Fprintf(hc.Stdout, "%7d %-12s %8s %s\n", me, "?", "00:00:00", "unish")
+		return nil
+	}
+	fmt.Fprintln(hc.Stdout, "    PID TTY          TIME CMD")
 	for _, p := range procs {
-		fmt.Fprintf(hc.Stdout, "%-12s %5d %4s %4s %6s %5s %-8s %-4s %-7s %8s %s\n",
-			p.user, p.pid, pctStr(p.cpu), pctStr(p.memPct),
-			kbStr(p.vszKB), kbStr(p.rssKB), p.tty, p.stat, p.start, p.time, p.cmd)
+		fmt.Fprintf(hc.Stdout, "%7d %-12s %8s %s\n", p.pid, p.tty, p.time, p.cmd)
+	}
+	if hasPidFilter && len(procs) == 0 {
+		return exitError{1}
 	}
 	return nil
 }
@@ -251,9 +277,8 @@ func psParsePids(s string) []int {
 	return out
 }
 
-// psPrintFormat prints the GNU ps -o column selection: comma or space
-// separated field names, with the familiar headers and widths.
-func psPrintFormat(procs []procInfo, oformat string) error {
+// psPrintFormat prints the GNU ps -o column selection to hc.Stdout / hc.Stderr.
+func psPrintFormat(hc interp.HandlerContext, procs []procInfo, oformat string) error {
 	type col struct {
 		head  string
 		get   func(procInfo) string
@@ -261,20 +286,11 @@ func psPrintFormat(procs []procInfo, oformat string) error {
 		wide  int
 	}
 	fields := map[string]col{
-		"pid":  {"PID", func(p procInfo) string { return strconv.Itoa(p.pid) }, true, 7},
-		"ppid": {"PPID", func(p procInfo) string { return strconv.Itoa(p.ppid) }, true, 7},
-		"user": {"USER", func(p procInfo) string { return p.user }, false, 8},
-		"uid":  {"USER", func(p procInfo) string { return p.user }, false, 8},
-		"comm": {"COMMAND", func(p procInfo) string {
-			c := p.cmd
-			if i := strings.IndexByte(c, ' '); i >= 0 {
-				c = c[:i]
-			}
-			if i := strings.LastIndexAny(c, `/\`); i >= 0 {
-				c = c[i+1:]
-			}
-			return c
-		}, false, 0},
+		"pid":     {"PID", func(p procInfo) string { return strconv.Itoa(p.pid) }, true, 7},
+		"ppid":    {"PPID", func(p procInfo) string { return strconv.Itoa(p.ppid) }, true, 7},
+		"user":    {"USER", func(p procInfo) string { return p.user }, false, 8},
+		"uid":     {"USER", func(p procInfo) string { return p.user }, false, 8},
+		"comm":    {"COMMAND", procCmdName, false, 0},
 		"args":    {"COMMAND", func(p procInfo) string { return p.cmd }, false, 0},
 		"cmd":     {"COMMAND", func(p procInfo) string { return p.cmd }, false, 0},
 		"command": {"COMMAND", func(p procInfo) string { return p.cmd }, false, 0},
@@ -302,7 +318,7 @@ func psPrintFormat(procs []procInfo, oformat string) error {
 	}) {
 		c, ok := fields[strings.ToLower(name)]
 		if !ok {
-			fmt.Fprintf(os.Stderr, "ps: unknown field name: %s\n", name)
+			fmt.Fprintf(hc.Stderr, "ps: unknown field name: %s\n", name)
 			return exitError{1}
 		}
 		sel = append(sel, c)
@@ -323,7 +339,7 @@ func psPrintFormat(procs []procInfo, oformat string) error {
 			sb.WriteString(c.head)
 		}
 	}
-	fmt.Fprintln(os.Stdout, sb.String())
+	fmt.Fprintln(hc.Stdout, sb.String())
 	for _, p := range procs {
 		sb.Reset()
 		for i, c := range sel {
@@ -339,7 +355,7 @@ func psPrintFormat(procs []procInfo, oformat string) error {
 				sb.WriteString(v)
 			}
 		}
-		fmt.Fprintln(os.Stdout, sb.String())
+		fmt.Fprintln(hc.Stdout, sb.String())
 	}
 	return nil
 }
@@ -374,21 +390,29 @@ func cmdFree(_ context.Context, hc interp.HandlerContext, args []string) error {
 	} else if *giga {
 		div = 1024 * 1024 * 1024
 	}
+	used := mi.total - mi.free - mi.cached - mi.buffers
+	if used < 0 {
+		used = 0
+	}
+	swapUsed := mi.swapTotal - mi.swapFree
+	if swapUsed < 0 {
+		swapUsed = 0
+	}
 	fmt.Fprintln(hc.Stdout, "               total        used        free      shared  buff/cache   available")
 	if *human {
 		fmt.Fprintf(hc.Stdout, "Mem: %11s %11s %11s %11s %11s %11s\n",
-			freeHuman(mi.total), freeHuman(mi.total-mi.free-mi.cached-mi.buffers),
+			freeHuman(mi.total), freeHuman(used),
 			freeHuman(mi.free), freeHuman(mi.shared),
 			freeHuman(mi.cached+mi.buffers), freeHuman(mi.avail))
 		fmt.Fprintf(hc.Stdout, "Swap:%11s %11s %11s\n",
-			freeHuman(mi.swapTotal), freeHuman(mi.swapTotal-mi.swapFree), freeHuman(mi.swapFree))
+			freeHuman(mi.swapTotal), freeHuman(swapUsed), freeHuman(mi.swapFree))
 		return nil
 	}
 	fmt.Fprintf(hc.Stdout, "Mem: %11d %11d %11d %11d %11d %11d\n",
-		mi.total/div, (mi.total-mi.free-mi.cached-mi.buffers)/div, mi.free/div,
+		mi.total/div, used/div, mi.free/div,
 		mi.shared/div, (mi.cached+mi.buffers)/div, mi.avail/div)
 	fmt.Fprintf(hc.Stdout, "Swap:%11d %11d %11d\n",
-		mi.swapTotal/div, (mi.swapTotal-mi.swapFree)/div, mi.swapFree/div)
+		mi.swapTotal/div, swapUsed/div, mi.swapFree/div)
 	return nil
 }
 
@@ -407,6 +431,7 @@ func freeHuman(n int64) string {
 }
 
 func cmdUptime(_ context.Context, hc interp.HandlerContext, args []string) error {
+	_ = args
 	now := time.Now()
 	boot := bootTime()
 	up := now.Sub(boot)
@@ -444,18 +469,97 @@ func fmtDuration(d time.Duration) string {
 	return fmt.Sprintf("%d min", m)
 }
 
-func cmdEnv(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	fs := newFlagSet("env", hc.Stderr)
-	ignore := fs.Bool("i", false, "")
-	if err := fs.Parse(args[1:]); err != nil {
-		return err
+// explicitEnviron carries an exact child environment list set by `env`,
+// preventing nested `env` / `nice` / `nohup` invocations from resurrecting
+// os.Environ() when `env -i` or `env -u` stripped parent variables.
+type explicitEnviron struct {
+	expand.Environ
+	pairs   []string
+	cleared bool
+}
+
+func currentEnvPairs(hc interp.HandlerContext) (pairs []string, cleared bool) {
+	if ee, ok := hc.Env.(explicitEnviron); ok {
+		return slices.Clone(ee.pairs), ee.cleared
 	}
-	rest := fs.Args()
+	return shellExecEnv(hc), false
+}
+
+func cmdEnv(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	ignore := false
+	nullTerm := false
+	var unsets []string
+	idx := 1
+	for idx < len(args) {
+		a := args[idx]
+		if a == "--" {
+			idx++
+			break
+		}
+		if a == "-" {
+			ignore = true
+			idx++
+			continue
+		}
+		if !strings.HasPrefix(a, "-") {
+			break
+		}
+		if strings.HasPrefix(a, "--") {
+			switch {
+			case a == "--ignore-environment":
+				ignore = true
+			case a == "--null":
+				nullTerm = true
+			case a == "--unset":
+				if idx+1 >= len(args) {
+					fmt.Fprintln(hc.Stderr, "env: option '--unset' requires an argument")
+					return exitError{125}
+				}
+				idx++
+				unsets = append(unsets, args[idx])
+			case strings.HasPrefix(a, "--unset="):
+				unsets = append(unsets, strings.TrimPrefix(a, "--unset="))
+			default:
+				fmt.Fprintf(hc.Stderr, "env: unrecognized option '%s'\n", a)
+				return exitError{125}
+			}
+			idx++
+			continue
+		}
+		// Short option cluster (-i, -0, -u NAME / -uNAME).
+		cluster := a[1:]
+		for j := 0; j < len(cluster); j++ {
+			switch cluster[j] {
+			case 'i':
+				ignore = true
+			case '0':
+				nullTerm = true
+			case 'u':
+				if j+1 < len(cluster) {
+					unsets = append(unsets, cluster[j+1:])
+				} else {
+					if idx+1 >= len(args) {
+						fmt.Fprintln(hc.Stderr, "env: option requires an argument -- 'u'")
+						return exitError{125}
+					}
+					idx++
+					unsets = append(unsets, args[idx])
+				}
+				j = len(cluster)
+			default:
+				fmt.Fprintf(hc.Stderr, "env: invalid option -- '%c'\n", cluster[j])
+				return exitError{125}
+			}
+		}
+		idx++
+	}
+
+	rest := args[idx:]
 	var envPairs []string
 	var cmd []string
 	for i, a := range rest {
-		if strings.Contains(a, "=") && !strings.HasPrefix(a, "-") && len(cmd) == 0 {
-			k := a[:strings.IndexByte(a, '=')]
+		if eq := strings.IndexByte(a, '='); eq >= 0 && !strings.HasPrefix(a, "-") {
+			k := a[:eq]
 			if isEnvName(k) {
 				envPairs = append(envPairs, a)
 				continue
@@ -464,36 +568,42 @@ func cmdEnv(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		cmd = rest[i:]
 		break
 	}
-	// Build the child environment explicitly. -i clears it; assignments
-	// are added on top. Never mutate the shell's own environment with
-	// os.Clearenv/os.Setenv: `env` must affect only the command it runs.
-	var childEnv []string
-	if !*ignore {
-		childEnv = shellExecEnv(hc)
+
+	childEnv := []string{}
+	cleared := ignore
+	if !ignore {
+		var prevCleared bool
+		childEnv, prevCleared = currentEnvPairs(hc)
+		cleared = prevCleared
+	}
+	for _, u := range unsets {
+		childEnv = unsetEnvVar(childEnv, u)
 	}
 	for _, kv := range envPairs {
-		k := kv[:strings.IndexByte(kv, '=')]
-		v := kv[strings.IndexByte(kv, '=')+1:]
+		eq := strings.IndexByte(kv, '=')
+		k, v := kv[:eq], kv[eq+1:]
 		childEnv = setEnvVar(childEnv, k, v)
 	}
+
 	if len(cmd) == 0 {
-		// No command: print the environment this env would pass on.
+		sep := "\n"
+		if nullTerm {
+			sep = "\x00"
+		}
 		for _, e := range childEnv {
-			fmt.Fprintln(hc.Stdout, e)
+			fmt.Fprintf(hc.Stdout, "%s%s", e, sep)
 		}
 		return nil
 	}
-	// Run the command with that environment. Builtins of ours get the
-	// same HandlerContext but with a substituted Env, so they see it too.
-	hc.Env = expand.ListEnviron(childEnv...)
-	if extra := lookupExtra(cmd[0]); extra != nil {
-		return extra.main(ctx, hc, splitAttached(cmd[0], cmd))
+
+	hc.Env = explicitEnviron{
+		Environ: expand.ListEnviron(childEnv...),
+		pairs:   childEnv,
+		cleared: cleared,
 	}
-	return interp.DefaultExecHandler(2)(ctx, cmd)
+	return runSysSubcommand(ctx, hc, childEnv, cleared, 0, false, cmd)
 }
 
-// setEnvVar sets name=value in an environment list, replacing any
-// existing entry for name.
 func setEnvVar(env []string, name, value string) []string {
 	prefix := name + "="
 	for i, e := range env {
@@ -503,6 +613,17 @@ func setEnvVar(env []string, name, value string) []string {
 		}
 	}
 	return append(env, prefix+value)
+}
+
+func unsetEnvVar(env []string, name string) []string {
+	prefix := name + "="
+	out := env[:0]
+	for _, e := range env {
+		if !strings.HasPrefix(e, prefix) {
+			out = append(out, e)
+		}
+	}
+	return out
 }
 
 func isEnvName(s string) bool {
@@ -639,6 +760,83 @@ type sockInfo struct {
 	recvQ, sendQ              int64
 	pid                       int
 	procName                  string
+}
+
+func nativeIsLittleEndian() bool {
+	var b [2]byte
+	binary.NativeEndian.PutUint16(b[:], 1)
+	return b[0] == 1
+}
+
+// parseProcNetAddr decodes a hex "IP:PORT" endpoint from Linux /proc/net/{tcp,udp}{,6}.
+func parseProcNetAddr(hex string) string {
+	return parseProcNetAddrEndian(hex, nativeIsLittleEndian())
+}
+
+func parseProcNetAddrEndian(hex string, littleEndian bool) string {
+	parts := strings.Split(hex, ":")
+	if len(parts) != 2 {
+		return hex
+	}
+	port, err := strconv.ParseUint(parts[1], 16, 16)
+	if err != nil {
+		return hex
+	}
+	ipHex := parts[0]
+	if len(ipHex) == 8 {
+		var b [4]byte
+		for i := 0; i < 4; i++ {
+			v, err := strconv.ParseUint(ipHex[i*2:i*2+2], 16, 8)
+			if err != nil {
+				return hex
+			}
+			if littleEndian {
+				b[3-i] = byte(v)
+			} else {
+				b[i] = byte(v)
+			}
+		}
+		return fmt.Sprintf("%d.%d.%d.%d:%d", b[0], b[1], b[2], b[3], port)
+	}
+	if ip, err := parseProcIPv6HexEndian(ipHex, littleEndian); err == nil {
+		return fmt.Sprintf("[%s]:%d", ip, port)
+	}
+	return hex
+}
+
+// parseProcIPv6HexEndian decodes a 32-hex-char IPv6 address from Linux
+// /proc/net/{tcp6,udp6}, where the kernel formats in6_addr as four %08X
+// host-byte-order 32-bit words.
+func parseProcIPv6HexEndian(s string, littleEndian bool) (string, error) {
+	if len(s) != 32 {
+		return "", fmt.Errorf("bad ipv6 hex length")
+	}
+	var b [16]byte
+	for w := 0; w < 4; w++ {
+		for j := 0; j < 4; j++ {
+			idx := w*4 + j
+			v, err := strconv.ParseUint(s[idx*2:idx*2+2], 16, 8)
+			if err != nil {
+				return "", err
+			}
+			if littleEndian {
+				b[w*4+(3-j)] = byte(v)
+			} else {
+				b[idx] = byte(v)
+			}
+		}
+	}
+	isV4Mapped := true
+	for i := 0; i < 10; i++ {
+		if b[i] != 0 {
+			isV4Mapped = false
+			break
+		}
+	}
+	if isV4Mapped && b[10] == 0xff && b[11] == 0xff {
+		return fmt.Sprintf("::ffff:%d.%d.%d.%d", b[12], b[13], b[14], b[15]), nil
+	}
+	return net.IP(b[:]).String(), nil
 }
 
 func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -780,25 +978,35 @@ func cmdArch(_ context.Context, hc interp.HandlerContext, args []string) error {
 }
 
 func cmdTty(_ context.Context, hc interp.HandlerContext, args []string) error {
-	_ = args
-	if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
-		if name := ttyName(); name != "" {
-			fmt.Fprintln(hc.Stdout, name)
-			return nil
+	silent := false
+	for _, a := range args[1:] {
+		if a == "-s" || a == "--silent" || a == "--quiet" {
+			silent = true
 		}
 	}
-	fmt.Fprintln(hc.Stdout, "not a tty")
+	if f, ok := hc.Stdin.(*os.File); ok {
+		fd := int(f.Fd())
+		if term.IsTerminal(fd) {
+			name := ttyNameFd(fd)
+			if name == "" {
+				name = f.Name()
+			}
+			if name != "" {
+				if !silent {
+					fmt.Fprintln(hc.Stdout, name)
+				}
+				return nil
+			}
+		}
+	}
+	if !silent {
+		fmt.Fprintln(hc.Stdout, "not a tty")
+	}
 	return exitError{1}
 }
 
 func cmdLogname(_ context.Context, hc interp.HandlerContext, args []string) error {
 	_ = args
-	// GNU logname prints the utmp login name and fails when there is no
-	// login session (e.g. non-interactive containers), even if $USER or
-	// $LOGNAME is set. unish has no utmp access, so it succeeds only when
-	// LOGNAME is explicitly present AND stdin is a real terminal (closest
-	// observable proxy for an interactive login session; /dev/null is a
-	// character device but never a terminal).
 	loginTTY := term.IsTerminal(int(os.Stdin.Fd()))
 	if v := shellGetenv(hc, "LOGNAME"); v != "" && loginTTY {
 		if i := strings.LastIndexAny(v, `\/`); i >= 0 {
@@ -829,7 +1037,8 @@ func cmdNohup(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		fmt.Fprintln(hc.Stderr, "nohup: missing operand")
 		return exitError{125}
 	}
-	return runNohupNice(ctx, hc, rest)
+	childEnv, cleared := currentEnvPairs(hc)
+	return runSysSubcommand(ctx, hc, childEnv, cleared, 0, false, rest)
 }
 
 func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error {
@@ -838,6 +1047,10 @@ func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error
 	var cmd []string
 	for i := 0; i < len(rest); i++ {
 		a := rest[i]
+		if a == "--" {
+			cmd = rest[i+1:]
+			break
+		}
 		if a == "-n" && i+1 < len(rest) {
 			if v, err := strconv.Atoi(rest[i+1]); err == nil {
 				adjust = v
@@ -845,7 +1058,7 @@ func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error
 			i++
 			continue
 		}
-		if len(a) > 1 && a[0] == '-' && a[1] >= '0' && a[1] <= '9' {
+		if len(a) > 1 && a[0] == '-' && (a[1] >= '0' && a[1] <= '9' || (a[1] == '-' && len(a) > 2)) {
 			if v, err := strconv.Atoi(a[1:]); err == nil {
 				adjust = v
 				continue
@@ -864,17 +1077,90 @@ func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintln(hc.Stdout, currentNice())
 		return nil
 	}
-	setNice(adjust)
-	return runNohupNice(ctx, hc, cmd)
+	childEnv, cleared := currentEnvPairs(hc)
+	return runSysSubcommand(ctx, hc, childEnv, cleared, adjust, true, cmd)
 }
 
-func runNohupNice(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) error {
+func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared bool, name string) (string, error) {
+	if strings.ContainsAny(name, `/\`) || (runtime.GOOS == "windows" && len(name) > 1 && name[1] == ':') {
+		return findExec(hc, name)
+	}
+	var pathVal string
+	hasPath := false
+	for _, kv := range childEnv {
+		if strings.HasPrefix(kv, "PATH=") {
+			pathVal = kv[5:]
+			hasPath = true
+			break
+		}
+	}
+	if !hasPath {
+		if !cleared {
+			pathVal = os.Getenv("PATH")
+		} else if runtime.GOOS != "windows" {
+			pathVal = "/usr/bin:/bin"
+		}
+	}
+	for _, dir := range strings.Split(pathVal, string(os.PathListSeparator)) {
+		if dir == "" {
+			continue
+		}
+		for _, cand := range execCandidates(dir, name) {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				return cand, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("%s: No such file or directory", name)
+}
+
+func runSysSubcommand(ctx context.Context, hc interp.HandlerContext, childEnv []string, cleared bool, niceAdjust int, hasNice bool, cmdArgs []string) error {
 	if extra := lookupExtra(cmdArgs[0]); extra != nil {
 		return extra.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
 	}
-	return interp.DefaultExecHandler(2)(ctx, cmdArgs)
+	if cmdArgs[0] == "printf" {
+		return cmdPrintf(ctx, hc, cmdArgs)
+	}
+	path, err := findSubcommandExec(hc, childEnv, cleared, cmdArgs[0])
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "%v\n", err)
+		return exitError{127}
+	}
+	if childEnv == nil {
+		childEnv = []string{}
+	}
+	c := exec.CommandContext(ctx, path, cmdArgs[1:]...)
+	c.Dir = hc.Dir
+	c.Stdin = hc.Stdin
+	c.Stdout = hc.Stdout
+	c.Stderr = hc.Stderr
+	c.Env = childEnv
+	if err := c.Start(); err != nil {
+		fmt.Fprintf(hc.Stderr, "%v\n", err)
+		if os.IsNotExist(err) {
+			return exitError{127}
+		}
+		return exitError{126}
+	}
+	if hasNice {
+		setProcNice(c.Process.Pid, currentNice()+niceAdjust)
+	}
+	hc.ReportBgStart(c.Process.Pid)
+	j := globalJobs.track(c, cmdArgs)
+	<-j.done
+	if j.err != nil {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if ee, ok := j.err.(*exec.ExitError); ok {
+			if code := signalExitCode(ee); code >= 0 {
+				return exitError{code}
+			}
+			return exitError{ee.ExitCode()}
+		}
+		return j.err
+	}
+	return nil
 }
 
-var _ = runtime.GOOS
-var _ = filepath.Separator
 var _ = io.Discard

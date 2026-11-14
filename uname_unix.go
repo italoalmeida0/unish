@@ -6,11 +6,19 @@ import (
 	"os"
 	"runtime"
 	"strings"
+
+	"golang.org/x/sys/unix"
 )
 
 // kernelRelease reports the real kernel release (uname -r), e.g.
-// "6.18.33.2-microsoft-standard-WSL2" on WSL2.
+// "6.18.33.2-microsoft-standard-WSL2" on Linux or "24.3.0" on Darwin.
 func kernelRelease() string {
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		if s := strings.TrimSpace(unix.ByteSliceToString(uts.Release[:])); s != "" {
+			return s
+		}
+	}
 	if data, err := os.ReadFile("/proc/sys/kernel/osrelease"); err == nil {
 		if s := strings.TrimSpace(string(data)); s != "" {
 			return s
@@ -20,8 +28,14 @@ func kernelRelease() string {
 }
 
 // kernelVersion reports the real kernel version (uname -v), e.g.
-// "#1 SMP PREEMPT_DYNAMIC ...".
+// "#1 SMP PREEMPT_DYNAMIC ..." on Linux or "Darwin Kernel Version ..." on macOS.
 func kernelVersion() string {
+	var uts unix.Utsname
+	if err := unix.Uname(&uts); err == nil {
+		if s := strings.TrimSpace(unix.ByteSliceToString(uts.Version[:])); s != "" {
+			return s
+		}
+	}
 	if data, err := os.ReadFile("/proc/sys/kernel/version"); err == nil {
 		if s := strings.TrimSpace(string(data)); s != "" {
 			return s
