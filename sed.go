@@ -203,6 +203,9 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	if inplaceOn {
 		return sedInplace(ctx, hc, prog, *quiet, *extended, inputs, inplace)
 	}
+	if ok, ferr := sedTryFastStream(ctx, hc, prog, *quiet, inputs); ok {
+		return ferr
+	}
 	r := newSedRunner(ctx, hc, prog, *quiet, *extended, hc.Stdout)
 	stream := &sedStream{ctx: ctx, hc: hc, inputs: inputs}
 	r.runStream(prog, stream)
@@ -1377,15 +1380,464 @@ func isPlainRepl(repl string) bool {
 }
 
 // sedLiteralPat reports whether a BRE/ERE pattern is a plain literal
-// string (no metacharacters and no escapes).
+// string (no metacharacters, escapes, or newlines).
 func sedLiteralPat(pat string) bool {
 	for i := 0; i < len(pat); i++ {
 		switch pat[i] {
-		case '\\', '.', '[', ']', '*', '^', '$', '(', ')', '{', '}', '+', '?', '|':
+		case '\\', '.', '[', ']', '*', '^', '$', '(', ')', '{', '}', '+', '?', '|', '\n':
 			return false
 		}
 	}
 	return pat != ""
+}
+
+type sedFastOp struct {
+	pat    []byte
+	repl   []byte
+	global bool
+}
+
+// sedTryFastStream executes unconditional literal substitution chains
+// (`s/lit/repl/[g]`) directly over 64 KB []byte chunks using SIMD bytes.Index
+// with zero regexp execution and zero per-line string allocations.
+func sedTryFastStream(ctx context.Context, hc interp.HandlerContext, prog []*sedCmd, quiet bool, inputs []string) (bool, error) {
+	if quiet || len(prog) == 0 || hc.Stdout == nil {
+		return false, nil
+	}
+	ops := make([]sedFastOp, 0, len(prog))
+	for _, c := range prog {
+		if c.a1 != nil || c.a2 != nil || c.bang || c.name != 's' || c.sub == nil {
+			return false, nil
+		}
+		sub := c.sub
+		if sub.rePat == "" || !sedLiteralPat(sub.rePat) || sub.nocase || sub.print || sub.write != "" || sub.nth > 1 {
+			return false, nil
+		}
+		var replStr string
+		if sub.plain {
+			replStr = sub.repl
+		} else if !strings.ContainsRune(sub.repl, '\\') {
+			// Only '&' metacharacters: since rePat is a pure literal, every
+			// match equals rePat verbatim.
+			replStr = strings.ReplaceAll(sub.repl, "&", sub.rePat)
+		} else {
+			return false, nil
+		}
+		if len(prog) > 1 && strings.ContainsRune(replStr, '\n') {
+			return false, nil
+		}
+		ops = append(ops, sedFastOp{
+			pat:    []byte(sub.rePat),
+			repl:   []byte(replStr),
+			global: sub.global,
+		})
+	}
+
+	bw := getBufWriter64K(hc.Stdout)
+	defer func() {
+		_ = bw.Flush()
+		putBufWriter64K(bw)
+	}()
+
+	handleWriteErr := func(werr error) (bool, error) {
+		if isPipeClosed(werr) {
+			return true, werr
+		}
+		fmt.Fprintln(hc.Stderr, "sed:", werr)
+		return true, exitError{1}
+	}
+
+	openErr := false
+	needNL := false
+
+	// Mode 1: single unconditional literal substitution over 64 KB chunks.
+	if len(ops) == 1 {
+		op := ops[0]
+		patB, replB, global := op.pat, op.repl, op.global
+		sameLen := len(patB) == len(replB)
+
+		bp := bufPool64K.Get().(*[]byte)
+		buf := (*bp)[:64*1024]
+		defer bufPool64K.Put(bp)
+
+		var carry []byte
+		processReader := func(rd io.Reader) error {
+			if rd == nil {
+				return nil
+			}
+			carry = carry[:0]
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				n, rerr := rd.Read(buf)
+				var data []byte
+				hadCarry := len(carry) > 0
+				if hadCarry {
+					if n > 0 {
+						carry = append(carry, buf[:n]...)
+					}
+					data = carry
+				} else {
+					data = buf[:n]
+				}
+				if len(data) == 0 {
+					if rerr != nil && rerr != io.EOF {
+						return rerr
+					}
+					break
+				}
+				var tail []byte
+				if data[len(data)-1] != '\n' {
+					if j := bytes.LastIndexByte(data, '\n'); j >= 0 {
+						tail = data[j+1:]
+						data = data[:j+1]
+					} else {
+						tail = data
+						data = nil
+					}
+				}
+				if len(data) > 0 {
+					if needNL {
+						if werr := bw.WriteByte('\n'); werr != nil {
+							return werr
+						}
+						needNL = false
+					}
+					if sameLen {
+						pos := 0
+						for pos < len(data) {
+							idx := bytes.Index(data[pos:], patB)
+							if idx < 0 {
+								break
+							}
+							m := pos + idx
+							copy(data[m:], replB)
+							after := m + len(patB)
+							if global {
+								pos = after
+							} else {
+								nl := bytes.IndexByte(data[after:], '\n')
+								if nl < 0 {
+									break
+								}
+								pos = after + nl + 1
+							}
+						}
+						if bw.Buffered() > 0 {
+							if werr := bw.Flush(); werr != nil {
+								return werr
+							}
+						}
+						if _, werr := hc.Stdout.Write(data); werr != nil {
+							return werr
+						}
+					} else {
+						written := 0
+						pos := 0
+						for pos < len(data) {
+							idx := bytes.Index(data[pos:], patB)
+							if idx < 0 {
+								break
+							}
+							m := pos + idx
+							if m > written {
+								if _, werr := bw.Write(data[written:m]); werr != nil {
+									return werr
+								}
+							}
+							if _, werr := bw.Write(replB); werr != nil {
+								return werr
+							}
+							after := m + len(patB)
+							written = after
+							if global {
+								pos = after
+							} else {
+								nl := bytes.IndexByte(data[after:], '\n')
+								if nl < 0 {
+									break
+								}
+								pos = after + nl + 1
+							}
+						}
+						if written < len(data) {
+							if _, werr := bw.Write(data[written:]); werr != nil {
+								return werr
+							}
+						}
+						if bw.Buffered() > 0 {
+							if werr := bw.Flush(); werr != nil {
+								return werr
+							}
+						}
+					}
+				}
+				if len(tail) > 0 {
+					if hadCarry {
+						if len(tail) != len(carry) || &tail[0] != &carry[0] {
+							nt := copy(carry[:cap(carry)], tail)
+							carry = carry[:nt]
+						}
+					} else {
+						carry = append(carry[:0], tail...)
+					}
+				} else {
+					carry = carry[:0]
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					return rerr
+				}
+			}
+			// Final unterminated line of this reader, if any.
+			if len(carry) > 0 {
+				if needNL {
+					if werr := bw.WriteByte('\n'); werr != nil {
+						return werr
+					}
+				}
+				if sameLen {
+					pos := 0
+					for pos < len(carry) {
+						idx := bytes.Index(carry[pos:], patB)
+						if idx < 0 {
+							break
+						}
+						m := pos + idx
+						copy(carry[m:], replB)
+						if !global {
+							break
+						}
+						pos = m + len(patB)
+					}
+					if _, werr := bw.Write(carry); werr != nil {
+						return werr
+					}
+				} else {
+					written := 0
+					pos := 0
+					for pos < len(carry) {
+						idx := bytes.Index(carry[pos:], patB)
+						if idx < 0 {
+							break
+						}
+						m := pos + idx
+						if m > written {
+							if _, werr := bw.Write(carry[written:m]); werr != nil {
+								return werr
+							}
+						}
+						if _, werr := bw.Write(replB); werr != nil {
+							return werr
+						}
+						after := m + len(patB)
+						written = after
+						if !global {
+							break
+						}
+						pos = after
+					}
+					if written < len(carry) {
+						if _, werr := bw.Write(carry[written:]); werr != nil {
+							return werr
+						}
+					}
+				}
+				if bw.Buffered() > 0 {
+					if werr := bw.Flush(); werr != nil {
+						return werr
+					}
+				}
+				needNL = true
+			}
+			return nil
+		}
+
+		if len(inputs) == 0 {
+			if err := processReader(hc.Stdin); err != nil {
+				if ctx.Err() != nil {
+					return true, ctx.Err()
+				}
+				return handleWriteErr(err)
+			}
+		} else {
+			for _, in := range inputs {
+				if in == "-" || in == "/dev/stdin" {
+					if err := processReader(hc.Stdin); err != nil {
+						if ctx.Err() != nil {
+							return true, ctx.Err()
+						}
+						return handleWriteErr(err)
+					}
+					continue
+				}
+				f, err := openShellFile(resolvePath(hc, in))
+				if err != nil {
+					fmt.Fprintln(hc.Stderr, "sed:", err)
+					openErr = true
+					continue
+				}
+				perr := processReader(f)
+				f.Close()
+				if perr != nil {
+					if ctx.Err() != nil {
+						return true, ctx.Err()
+					}
+					return handleWriteErr(perr)
+				}
+			}
+		}
+		if werr := bw.Flush(); werr != nil {
+			return handleWriteErr(werr)
+		}
+		if err := ctx.Err(); err != nil {
+			return true, err
+		}
+		if openErr {
+			return true, exitError{1}
+		}
+		return true, nil
+	}
+
+	// Mode 2: multi-command unconditional literal substitution chain using
+	// two reusable scratch byte buffers (zero heap allocations per line).
+	var scrA, scrB []byte
+	applyOps := func(line []byte) []byte {
+		cur := line
+		inA := false
+		for _, op := range ops {
+			idx := bytes.Index(cur, op.pat)
+			if idx < 0 {
+				continue
+			}
+			var dst []byte
+			if inA {
+				dst = scrB[:0]
+			} else {
+				dst = scrA[:0]
+			}
+			dst = append(dst, cur[:idx]...)
+			dst = append(dst, op.repl...)
+			pos := idx + len(op.pat)
+			if op.global {
+				for pos < len(cur) {
+					j := bytes.Index(cur[pos:], op.pat)
+					if j < 0 {
+						break
+					}
+					dst = append(dst, cur[pos:pos+j]...)
+					dst = append(dst, op.repl...)
+					pos += j + len(op.pat)
+				}
+			}
+			dst = append(dst, cur[pos:]...)
+			if inA {
+				scrB = dst
+				inA = false
+			} else {
+				scrA = dst
+				inA = true
+			}
+			cur = dst
+		}
+		return cur
+	}
+
+	processMulti := func(rd io.Reader) error {
+		if rd == nil {
+			return nil
+		}
+		var writeErr error
+		err := streamLinesChunked(ctx, rd, func(line []byte, terminated bool) bool {
+			if ctx.Err() != nil {
+				return false
+			}
+			if needNL {
+				if werr := bw.WriteByte('\n'); werr != nil {
+					writeErr = werr
+					return false
+				}
+				needNL = false
+			}
+			out := applyOps(line)
+			if _, werr := bw.Write(out); werr != nil {
+				writeErr = werr
+				return false
+			}
+			if terminated {
+				if werr := bw.WriteByte('\n'); werr != nil {
+					writeErr = werr
+					return false
+				}
+			} else {
+				needNL = true
+			}
+			if bw.Available() < 4096 {
+				if werr := bw.Flush(); werr != nil {
+					writeErr = werr
+					return false
+				}
+			}
+			return true
+		}, func() error {
+			if bw.Buffered() > 0 {
+				return bw.Flush()
+			}
+			return nil
+		})
+		if writeErr != nil {
+			return writeErr
+		}
+		return err
+	}
+
+	if len(inputs) == 0 {
+		if err := processMulti(hc.Stdin); err != nil {
+			if ctx.Err() != nil {
+				return true, ctx.Err()
+			}
+			return handleWriteErr(err)
+		}
+	} else {
+		for _, in := range inputs {
+			if in == "-" || in == "/dev/stdin" {
+				if err := processMulti(hc.Stdin); err != nil {
+					if ctx.Err() != nil {
+						return true, ctx.Err()
+					}
+					return handleWriteErr(err)
+				}
+				continue
+			}
+			f, err := openShellFile(resolvePath(hc, in))
+			if err != nil {
+				fmt.Fprintln(hc.Stderr, "sed:", err)
+				openErr = true
+				continue
+			}
+			perr := processMulti(f)
+			f.Close()
+			if perr != nil {
+				if ctx.Err() != nil {
+					return true, ctx.Err()
+				}
+				return handleWriteErr(perr)
+			}
+		}
+	}
+	if werr := bw.Flush(); werr != nil {
+		return handleWriteErr(werr)
+	}
+	if err := ctx.Err(); err != nil {
+		return true, err
+	}
+	if openErr {
+		return true, exitError{1}
+	}
+	return true, nil
 }
 
 func expandSubMatch(orig string, sub *sedSub, m []int) string {

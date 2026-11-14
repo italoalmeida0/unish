@@ -24,6 +24,7 @@ import (
 type lineReader struct {
 	br         *bufio.Reader
 	line       string
+	fragBuf    []byte
 	endedNL    bool
 	err        error
 	pendingErr error
@@ -50,34 +51,47 @@ func (l *lineReader) Scan() bool {
 		l.done = true
 		return false
 	}
-	frag, err := l.br.ReadBytes('\n')
-	if err != nil {
-		if err == io.EOF {
-			if len(frag) == 0 {
-				l.line = ""
-				l.done = true
-				return false
-			}
-			l.endedNL = frag[len(frag)-1] == '\n'
-			l.line = dropTrailingNewline(frag)
-			l.done = true
-			return true
-		}
-		if len(frag) > 0 {
-			l.endedNL = frag[len(frag)-1] == '\n'
-			l.line = dropTrailingNewline(frag)
-			l.pendingErr = err
-			return true
-		}
-		l.err = err
-		l.line = ""
-		l.done = true
-		return false
+	frag, err := l.br.ReadSlice('\n')
+	if err == nil {
+		l.line = dropTrailingNewline(frag)
+		l.endedNL = true
+		return true
 	}
-	// err == nil: frag ends with '\n'.
-	l.line = dropTrailingNewline(frag)
-	l.endedNL = true
-	return true
+	if err == bufio.ErrBufferFull {
+		l.fragBuf = append(l.fragBuf[:0], frag...)
+		for err == bufio.ErrBufferFull {
+			var more []byte
+			more, err = l.br.ReadSlice('\n')
+			l.fragBuf = append(l.fragBuf, more...)
+		}
+		frag = l.fragBuf
+		if err == nil {
+			l.line = dropTrailingNewline(frag)
+			l.endedNL = true
+			return true
+		}
+	}
+	if err == io.EOF {
+		if len(frag) == 0 {
+			l.line = ""
+			l.done = true
+			return false
+		}
+		l.endedNL = frag[len(frag)-1] == '\n'
+		l.line = dropTrailingNewline(frag)
+		l.done = true
+		return true
+	}
+	if len(frag) > 0 {
+		l.endedNL = frag[len(frag)-1] == '\n'
+		l.line = dropTrailingNewline(frag)
+		l.pendingErr = err
+		return true
+	}
+	l.err = err
+	l.line = ""
+	l.done = true
+	return false
 }
 
 // Text returns the most recent line (without line ending).

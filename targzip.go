@@ -94,9 +94,9 @@ func tarOpenWriter(hc interp.HandlerContext, archive string, zip bool) (io.Close
 		}
 		raw = f
 	}
-	// tar writes 512-byte blocks; a large buffer keeps stdout and file
-	// targets fast.
-	bw := bufio.NewWriterSize(raw, 256*1024)
+	// tar writes 512-byte blocks; reuse a pooled 64 KB buffer to batch
+	// writes without per-invocation heap allocations.
+	bw := getBufWriter64K(raw)
 	var gz *gzip.Writer
 	w := io.Writer(bw)
 	if zip {
@@ -115,11 +115,17 @@ type tarWriteCloser struct {
 }
 
 func (c *tarWriteCloser) Close() error {
-	err := c.bw.Flush()
+	var err error
+	if c.bw != nil {
+		err = c.bw.Flush()
+		putBufWriter64K(c.bw)
+		c.bw = nil
+	}
 	if c.f != nil {
 		if e := c.f.Close(); err == nil {
 			err = e
 		}
+		c.f = nil
 	}
 	return err
 }
@@ -135,6 +141,26 @@ func closeTarWriters(tw *tar.Writer, gz *gzip.Writer, f io.Closer) error {
 		err = e
 	}
 	return err
+}
+
+func tarRelPath(base, path string, absNames bool) (rel string, inBase bool) {
+	rel = path
+	if base != "." {
+		if r, rerr := filepath.Rel(base, path); rerr == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
+			rel = r
+			inBase = true
+		} else if !absNames {
+			rel = stripLeadingRoot(path)
+		}
+	}
+	rel = filepath.ToSlash(rel)
+	if !absNames && strings.HasPrefix(rel, "/") {
+		rel = strings.TrimLeft(rel, "/")
+	}
+	if rel == "" {
+		rel = "."
+	}
+	return rel, inBase
 }
 
 func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base string, paths, excludes []string, zip, verb, absNames bool) error {
@@ -165,99 +191,146 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 	}
 	code := 0
 	// Identity lookups read /etc/passwd+group; do them once per run,
-	// not once per archived file. Same for the copy buffer: io.Copy
-	// would allocate 32KiB per file.
+	// not once per archived file. Reuse a pooled 64 KB copy buffer.
 	_, uname, _, gname := identity()
-	copyBuf := make([]byte, 256*1024)
+	bp := bufPool64K.Get().(*[]byte)
+	defer bufPool64K.Put(bp)
+	copyBuf := (*bp)[:64*1024]
 	verbOut := hc.Stdout
 	if archive == "-" {
 		// Never corrupt binary archive data written to stdout.
 		verbOut = hc.Stderr
 	}
+
+	var walkTar func(path, rel string, inBase bool, info os.FileInfo) error
+	walkTar = func(path, rel string, inBase bool, info os.FileInfo) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		// Never archive the output archive file into itself.
+		if archFi != nil && os.SameFile(info, archFi) {
+			return nil
+		}
+		if tarPathExcluded(rel, excludes) {
+			return nil
+		}
+		linkTarget := ""
+		if info.Mode()&os.ModeSymlink != 0 {
+			lt, lerr := os.Readlink(path)
+			if lerr != nil {
+				return lerr
+			}
+			linkTarget = filepath.ToSlash(lt)
+		}
+		hdr, err := tar.FileInfoHeader(info, linkTarget)
+		if err != nil {
+			return err
+		}
+		hdr.Name = rel
+		isDir := info.IsDir()
+		if isDir && !strings.HasSuffix(hdr.Name, "/") {
+			hdr.Name += "/"
+		}
+		// GNU tar stores user/group names; Go leaves them empty.
+		// Fill from the current identity for -tv parity.
+		if hdr.Uname == "" {
+			hdr.Uname = uname
+		}
+		if hdr.Gname == "" {
+			hdr.Gname = gname
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			return err
+		}
+		if info.Mode().IsRegular() {
+			fh, err := os.Open(path)
+			if err != nil {
+				return err
+			}
+			rem := hdr.Size
+			var copyErr error
+			for rem > 0 {
+				chunk := copyBuf
+				if int64(len(chunk)) > rem {
+					chunk = chunk[:rem]
+				}
+				n, rerr := fh.Read(chunk)
+				if n > 0 {
+					rem -= int64(n)
+					if _, werr := tw.Write(chunk[:n]); werr != nil {
+						copyErr = werr
+						break
+					}
+				}
+				if rerr != nil {
+					if rerr == io.EOF {
+						break
+					}
+					copyErr = rerr
+					break
+				}
+			}
+			cerr := fh.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if cerr != nil {
+				return cerr
+			}
+		}
+		if verb {
+			fmt.Fprintln(verbOut, hdr.Name)
+		}
+		if !isDir {
+			return nil
+		}
+		entries, err := os.ReadDir(path)
+		if err != nil {
+			return err
+		}
+		dirPrefix := path
+		if dirPrefix != "" && dirPrefix[len(dirPrefix)-1] != filepath.Separator && dirPrefix[len(dirPrefix)-1] != '/' {
+			dirPrefix += string(filepath.Separator)
+		}
+		relPrefix := ""
+		if inBase && rel != "." {
+			relPrefix = strings.TrimSuffix(rel, "/") + "/"
+		}
+		for _, e := range entries {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			cinfo, ierr := e.Info()
+			if ierr != nil {
+				return ierr
+			}
+			ename := e.Name()
+			childPath := dirPrefix + ename
+			var childRel string
+			childInBase := inBase
+			if inBase {
+				childRel = relPrefix + ename
+			} else {
+				childRel, childInBase = tarRelPath(base, childPath, absNames)
+			}
+			if werr := walkTar(childPath, childRel, childInBase, cinfo); werr != nil {
+				return werr
+			}
+		}
+		return nil
+	}
+
 	for _, p := range paths {
 		if ctx.Err() != nil {
 			_ = closeTarWriters(tw, gz, f)
 			return ctx.Err()
 		}
 		full := resolve(base, p)
-		err := filepath.Walk(full, func(path string, info os.FileInfo, err error) error {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if err != nil {
-				return err
-			}
-			// Never archive the output archive file into itself.
-			if archFi != nil && os.SameFile(info, archFi) {
-				return nil
-			}
-			rel := path
-			if base != "." {
-				if r, rerr := filepath.Rel(base, path); rerr == nil && r != ".." && !strings.HasPrefix(r, ".."+string(filepath.Separator)) {
-					rel = r
-				} else if !absNames {
-					rel = stripLeadingRoot(path)
-				}
-			}
-			rel = filepath.ToSlash(rel)
-			if !absNames && strings.HasPrefix(rel, "/") {
-				rel = strings.TrimLeft(rel, "/")
-			}
-			if rel == "" {
-				rel = "."
-			}
-			if tarPathExcluded(rel, excludes) {
-				if info.IsDir() {
-					return filepath.SkipDir
-				}
-				return nil
-			}
-			linkTarget := ""
-			if info.Mode()&os.ModeSymlink != 0 {
-				lt, lerr := os.Readlink(path)
-				if lerr != nil {
-					return lerr
-				}
-				linkTarget = filepath.ToSlash(lt)
-			}
-			hdr, err := tar.FileInfoHeader(info, linkTarget)
-			if err != nil {
-				return err
-			}
-			hdr.Name = rel
-			if info.IsDir() && !strings.HasSuffix(hdr.Name, "/") {
-				hdr.Name += "/"
-			}
-			// GNU tar stores user/group names; Go leaves them empty.
-			// Fill from the current identity for -tv parity.
-			if hdr.Uname == "" {
-				hdr.Uname = uname
-			}
-			if hdr.Gname == "" {
-				hdr.Gname = gname
-			}
-			if err := tw.WriteHeader(hdr); err != nil {
-				return err
-			}
-			if info.Mode().IsRegular() {
-				fh, err := os.Open(path)
-				if err != nil {
-					return err
-				}
-				_, err = io.CopyBuffer(tw, fh, copyBuf)
-				cerr := fh.Close()
-				if err != nil {
-					return err
-				}
-				if cerr != nil {
-					return cerr
-				}
-			}
-			if verb {
-				fmt.Fprintln(verbOut, hdr.Name)
-			}
-			return nil
-		})
+		info, err := os.Lstat(full)
+		if err == nil {
+			rel, inBase := tarRelPath(base, full, absNames)
+			err = walkTar(full, rel, inBase, info)
+		}
 		if err != nil {
 			if ctx.Err() != nil {
 				_ = closeTarWriters(tw, gz, f)

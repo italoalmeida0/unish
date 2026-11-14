@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -16,10 +17,39 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
+	"unicode"
 	"unicode/utf8"
+	"unsafe"
 
 	"mvdan.cc/sh/v3/interp"
 )
+
+var nlBytes = []byte{'\n'}
+
+var bufPool64K = sync.Pool{
+	New: func() any {
+		b := make([]byte, 64*1024+8)
+		return &b
+	},
+}
+
+var bufioWriterPool64K = sync.Pool{
+	New: func() any {
+		return bufio.NewWriterSize(io.Discard, 64*1024)
+	},
+}
+
+func getBufWriter64K(w io.Writer) *bufio.Writer {
+	bw := bufioWriterPool64K.Get().(*bufio.Writer)
+	bw.Reset(w)
+	return bw
+}
+
+func putBufWriter64K(bw *bufio.Writer) {
+	bw.Reset(io.Discard)
+	bufioWriterPool64K.Put(bw)
+}
 
 func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	var (
@@ -311,43 +341,49 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 	if context_ > 0 {
 		after, before = context_, context_
 	}
-	pat := "(?:" + strings.Join(quotePatterns(patterns, fixed), "|") + ")"
-	if !fixed && !extended {
-		pat = "(?:" + strings.Join(brePatterns(patterns), "|") + ")"
-	}
-	if lineRegexp {
-		pat = "^(?:" + strings.Join(quotePatterns(patterns, fixed), "|") + ")$"
-		if !fixed && !extended {
-			pat = "^(?:" + strings.Join(brePatterns(patterns), "|") + ")$"
-		}
-	}
-	if wordRegexp {
-		inner := strings.Join(quotePatterns(patterns, fixed), "|")
-		if !fixed && !extended {
-			inner = strings.Join(brePatterns(patterns), "|")
-		}
-		// Capture the word itself in group 1; boundary chars stay
-		// outside so `-o` prints exactly the match (no trailing space).
-		pat = "(?:^|[^A-Za-z0-9_])((?:" + inner + "))(?:[^A-Za-z0-9_]|$)"
-	}
-	if ignoreCase {
-		pat = "(?i)" + pat
-	}
-	re, err := regexp.Compile(pat)
-	if err != nil {
-		fmt.Fprintln(hc.Stderr, "grep:", err)
-		return exitError{2}
-	}
-
 	// Fast path: a single literal pattern over plain line output can use
-	// the byte primitives instead of the regexp engine.
+	// SIMD byte primitives (bytes.Index) instead of compiling/running regexp.
 	lit, litOK := "", false
 	if len(patterns) == 1 && !ignoreCase && !lineRegexp && !wordRegexp &&
-		after == 0 && before == 0 && maxCount == 0 && !filesOnly && !onlyMatch {
+		after == 0 && before == 0 && maxCount == 0 && !onlyMatch && utf8.ValidString(patterns[0]) {
 		if fixed {
-			lit, litOK = patterns[0], true
+			if !strings.ContainsRune(patterns[0], '\n') {
+				lit, litOK = patterns[0], true
+			}
 		} else if p, ok := grepLiteralPattern(patterns[0]); ok {
 			lit, litOK = p, true
+		}
+	}
+
+	var re *regexp.Regexp
+	if !litOK {
+		pat := "(?:" + strings.Join(quotePatterns(patterns, fixed), "|") + ")"
+		if !fixed && !extended {
+			pat = "(?:" + strings.Join(brePatterns(patterns), "|") + ")"
+		}
+		if lineRegexp {
+			pat = "^(?:" + strings.Join(quotePatterns(patterns, fixed), "|") + ")$"
+			if !fixed && !extended {
+				pat = "^(?:" + strings.Join(brePatterns(patterns), "|") + ")$"
+			}
+		}
+		if wordRegexp {
+			inner := strings.Join(quotePatterns(patterns, fixed), "|")
+			if !fixed && !extended {
+				inner = strings.Join(brePatterns(patterns), "|")
+			}
+			// Capture the word itself in group 1; boundary chars stay
+			// outside so `-o` prints exactly the match (no trailing space).
+			pat = "(?:^|[^A-Za-z0-9_])((?:" + inner + "))(?:[^A-Za-z0-9_]|$)"
+		}
+		if ignoreCase {
+			pat = "(?i)" + pat
+		}
+		var err error
+		re, err = regexp.Compile(pat)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "grep:", err)
+			return exitError{2}
 		}
 	}
 
@@ -465,7 +501,9 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 		}
 		if !quiet && !count && !filesOnly && !textMode {
-			probe := make([]byte, 32*1024)
+			pp := bufPool64K.Get().(*[]byte)
+			defer bufPool64K.Put(pp)
+			probe := (*pp)[:32*1024]
 			n, rerr := r.Read(probe)
 			if n == 0 && rerr == io.EOF {
 				return
@@ -480,8 +518,17 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 			if bytes.IndexByte(probe[:n], 0) >= 0 {
 				binMatched := false
+				var litBytes []byte
+				if litOK {
+					litBytes = []byte(lit)
+				}
 				_ = streamLinesCtx(ctx, fullR, func(line []byte, _ bool) bool {
-					ok := re.Match(line)
+					var ok bool
+					if litOK {
+						ok = bytes.Contains(line, litBytes)
+					} else {
+						ok = re.Match(line)
+					}
 					if invert {
 						ok = !ok
 					}
@@ -501,7 +548,7 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 		}
 		// Fast path: literal pattern over plain line output.
 		if litOK {
-			m, gerr := grepFastBuf(ctx, hc, disp, showName, lit, invert, lineNum, count, quiet, !textMode && !quiet && !count && !filesOnly, r)
+			m, gerr := grepFastBuf(ctx, hc, disp, showName, lit, invert, lineNum, count, filesOnly, quiet, !textMode && !quiet && !count && !filesOnly, r)
 			matchedAny = matchedAny || m
 			if quiet && matchedAny {
 				grepStop = true
@@ -601,9 +648,9 @@ func breToGo(pat string) string {
 }
 
 // grepLiteralPattern reports whether a BRE/ERE pattern is a plain
-// literal string (no metacharacters at all).
+// literal string (no metacharacters or newlines at all).
 func grepLiteralPattern(pat string) (string, bool) {
-	if pat == "" || strings.ContainsAny(pat, `\.^$*+?()[]{}|`) {
+	if pat == "" || strings.ContainsAny(pat, "\\.^$*+?()[]{}|\n") {
 		return "", false
 	}
 	return pat, true
@@ -623,34 +670,39 @@ func streamLinesCtx(ctx context.Context, r io.Reader, fn func(line []byte, termi
 }
 
 func streamLinesChunked(ctx context.Context, r io.Reader, fn func(line []byte, terminated bool) bool, afterChunk func() error) error {
-	buf := make([]byte, 256*1024)
-	var pending []byte
+	bp := bufPool64K.Get().(*[]byte)
+	buf := (*bp)[:64*1024]
+	defer bufPool64K.Put(bp)
+
+	var carry []byte
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
 		n, err := r.Read(buf)
 		var data []byte
-		if len(pending) > 0 {
-			data = append(pending, buf[:n]...)
-			pending = nil
+		hadCarry := len(carry) > 0
+		if hadCarry {
+			if n > 0 {
+				carry = append(carry, buf[:n]...)
+			}
+			data = carry
 		} else {
 			data = buf[:n]
 		}
-		if n == 0 && len(data) == 0 {
+		if len(data) == 0 {
 			if err != nil && err != io.EOF {
 				return err
 			}
 			return nil
 		}
-		// Keep any trailing partial line for the next chunk; a chunk
-		// boundary mid-line must not split the line in two.
-		if err == nil && n > 0 && data[len(data)-1] != '\n' {
+		var tail []byte
+		if data[len(data)-1] != '\n' {
 			if j := bytes.LastIndexByte(data, '\n'); j >= 0 {
-				pending = append([]byte(nil), data[j+1:]...)
+				tail = data[j+1:]
 				data = data[:j+1]
 			} else {
-				pending = append([]byte(nil), data...)
+				tail = data
 				data = nil
 			}
 		}
@@ -658,7 +710,6 @@ func streamLinesChunked(ctx context.Context, r io.Reader, fn func(line []byte, t
 		for start < len(data) {
 			end := bytes.IndexByte(data[start:], '\n')
 			if end < 0 {
-				pending = append([]byte(nil), data[start:]...)
 				break
 			}
 			if !fn(data[start:start+end], true) {
@@ -671,7 +722,19 @@ func streamLinesChunked(ctx context.Context, r io.Reader, fn func(line []byte, t
 			}
 			start += end + 1
 		}
-		if afterChunk != nil {
+		if len(tail) > 0 {
+			if hadCarry {
+				if len(tail) != len(carry) || &tail[0] != &carry[0] {
+					nt := copy(carry[:cap(carry)], tail)
+					carry = carry[:nt]
+				}
+			} else {
+				carry = append(carry[:0], tail...)
+			}
+		} else {
+			carry = carry[:0]
+		}
+		if afterChunk != nil && len(data) > 0 {
 			if cerr := afterChunk(); cerr != nil {
 				return cerr
 			}
@@ -684,8 +747,8 @@ func streamLinesChunked(ctx context.Context, r io.Reader, fn func(line []byte, t
 		}
 	}
 	// Last line without a trailing newline.
-	if len(pending) > 0 {
-		fn(pending, false)
+	if len(carry) > 0 {
+		fn(carry, false)
 		if afterChunk != nil {
 			if cerr := afterChunk(); cerr != nil {
 				return cerr
@@ -695,18 +758,252 @@ func streamLinesChunked(ctx context.Context, r io.Reader, fn func(line []byte, t
 	return nil
 }
 
-// grepFastBuf scans a literal pattern with the byte primitives,
-// streaming in chunks (constant memory, like GNU grep). It covers the
-// everyday grep shape: plain output plus -c/-n/-v/-q/-H.
+// grepFastBuf scans a literal pattern with SIMD byte primitives (bytes.Index),
+// streaming in 64 KB chunks (constant memory, zero per-line allocations).
+// It covers plain output plus -c/-l/-n/-v/-q/-H.
 func grepFastBuf(ctx context.Context, hc interp.HandlerContext, name string, showName bool, lit string,
-	invert, lineNum, count, quiet, checkBin bool, r io.Reader) (bool, error) {
+	invert, lineNum, count, filesOnly, quiet, checkBin bool, r io.Reader) (bool, error) {
 	prefix := ""
 	if showName && name != "" {
 		prefix = name + ":"
 	}
-	bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
-	defer bw.Flush()
 	litB := []byte(lit)
+
+	// Whole-chunk SIMD fast path when searching for a non-empty literal
+	// without -v or -n: bytes.Index jumps directly between matches across
+	// entire 64 KB chunks without splitting non-matching lines.
+	if !invert && !lineNum && len(litB) > 0 && bytes.IndexByte(litB, '\n') < 0 {
+		bp := bufPool64K.Get().(*[]byte)
+		buf := (*bp)[:64*1024]
+		defer bufPool64K.Put(bp)
+
+		var bw *bufio.Writer
+		if !quiet && !count && !filesOnly {
+			bw = getBufWriter64K(hc.Stdout)
+			defer func() {
+				_ = bw.Flush()
+				putBufWriter64K(bw)
+			}()
+		}
+
+		matched, matchedAny := 0, false
+		var carry []byte
+		for {
+			if err := ctx.Err(); err != nil {
+				return matchedAny, err
+			}
+			n, rerr := r.Read(buf)
+			var data []byte
+			hadCarry := len(carry) > 0
+			if hadCarry {
+				if n > 0 {
+					carry = append(carry, buf[:n]...)
+				}
+				data = carry
+			} else {
+				data = buf[:n]
+			}
+			if len(data) == 0 {
+				if rerr != nil && rerr != io.EOF {
+					return matchedAny, rerr
+				}
+				break
+			}
+			var tail []byte
+			if data[len(data)-1] != '\n' {
+				if j := bytes.LastIndexByte(data, '\n'); j >= 0 {
+					tail = data[j+1:]
+					data = data[:j+1]
+				} else {
+					tail = data
+					data = nil
+				}
+			}
+			if len(data) > 0 {
+				if quiet || filesOnly {
+					if bytes.Index(data, litB) >= 0 {
+						if filesOnly && !quiet {
+							if _, werr := fmt.Fprintln(hc.Stdout, name); werr != nil {
+								if isPipeClosed(werr) {
+									return true, epipeErr{}
+								}
+								return true, werr
+							}
+						}
+						return true, nil
+					}
+				} else if count {
+					pos := 0
+					for pos < len(data) {
+						idx := bytes.Index(data[pos:], litB)
+						if idx < 0 {
+							break
+						}
+						matchedAny = true
+						matched++
+						m := pos + idx + len(litB)
+						nl := bytes.IndexByte(data[m:], '\n')
+						if nl < 0 {
+							break
+						}
+						pos = m + nl + 1
+					}
+				} else if checkBin && bytes.IndexByte(data, 0) >= 0 {
+					start := 0
+					for start < len(data) {
+						end := bytes.IndexByte(data[start:], '\n')
+						if end < 0 {
+							break
+						}
+						line := data[start : start+end]
+						if bytes.Index(line, litB) >= 0 {
+							matchedAny = true
+							if bytes.IndexByte(line, 0) >= 0 {
+								if bw.Buffered() > 0 {
+									if werr := bw.Flush(); werr != nil {
+										return matchedAny, werr
+									}
+								}
+								fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", name)
+								return matchedAny, nil
+							}
+							if prefix != "" {
+								bw.WriteString(prefix)
+							}
+							if _, werr := bw.Write(data[start : start+end+1]); werr != nil {
+								return matchedAny, werr
+							}
+						}
+						start += end + 1
+					}
+					if bw.Buffered() > 0 {
+						if werr := bw.Flush(); werr != nil {
+							return matchedAny, werr
+						}
+					}
+				} else {
+					pos := 0
+					for pos < len(data) {
+						idx := bytes.Index(data[pos:], litB)
+						if idx < 0 {
+							break
+						}
+						matchedAny = true
+						matchPos := pos + idx
+						lineStart := pos
+						if prevNL := bytes.LastIndexByte(data[pos:matchPos], '\n'); prevNL >= 0 {
+							lineStart = pos + prevNL + 1
+						}
+						m := matchPos + len(litB)
+						nl := bytes.IndexByte(data[m:], '\n')
+						lineEnd := len(data)
+						if nl >= 0 {
+							lineEnd = m + nl + 1
+						}
+						if prefix != "" {
+							bw.WriteString(prefix)
+						}
+						if _, werr := bw.Write(data[lineStart:lineEnd]); werr != nil {
+							return matchedAny, werr
+						}
+						pos = lineEnd
+					}
+					if bw.Buffered() > 0 {
+						if werr := bw.Flush(); werr != nil {
+							return matchedAny, werr
+						}
+					}
+				}
+			}
+			if len(tail) > 0 {
+				if hadCarry {
+					if len(tail) != len(carry) || &tail[0] != &carry[0] {
+						nt := copy(carry[:cap(carry)], tail)
+						carry = carry[:nt]
+					}
+				} else {
+					carry = append(carry[:0], tail...)
+				}
+			} else {
+				carry = carry[:0]
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return matchedAny, rerr
+			}
+		}
+
+		// Handle final unterminated line, if any.
+		if len(carry) > 0 && bytes.Index(carry, litB) >= 0 {
+			matchedAny = true
+			if quiet {
+				return true, nil
+			}
+			if filesOnly {
+				if _, werr := fmt.Fprintln(hc.Stdout, name); werr != nil {
+					if isPipeClosed(werr) {
+						return true, epipeErr{}
+					}
+					return true, werr
+				}
+				return true, nil
+			}
+			if count {
+				matched++
+			} else if checkBin && bytes.IndexByte(carry, 0) >= 0 {
+				if bw.Buffered() > 0 {
+					if werr := bw.Flush(); werr != nil {
+						return matchedAny, werr
+					}
+				}
+				fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", name)
+				return matchedAny, nil
+			} else {
+				if prefix != "" {
+					bw.WriteString(prefix)
+				}
+				if _, werr := bw.Write(carry); werr != nil {
+					return matchedAny, werr
+				}
+				if werr := bw.WriteByte('\n'); werr != nil {
+					return matchedAny, werr
+				}
+			}
+		}
+		if err := ctx.Err(); err != nil {
+			return matchedAny, err
+		}
+		if count && !quiet {
+			var outBuf [128]byte
+			b := outBuf[:0]
+			if len(prefix)+24 <= len(outBuf) {
+				b = append(b, prefix...)
+				b = strconv.AppendInt(b, int64(matched), 10)
+				b = append(b, '\n')
+				if _, werr := hc.Stdout.Write(b); werr != nil {
+					return matchedAny, werr
+				}
+			} else {
+				s := prefix + strconv.Itoa(matched) + "\n"
+				if _, werr := io.WriteString(hc.Stdout, s); werr != nil {
+					return matchedAny, werr
+				}
+			}
+		} else if bw != nil && bw.Buffered() > 0 {
+			if werr := bw.Flush(); werr != nil {
+				return matchedAny, werr
+			}
+		}
+		return matchedAny, nil
+	}
+
+	bw := getBufWriter64K(hc.Stdout)
+	defer func() {
+		_ = bw.Flush()
+		putBufWriter64K(bw)
+	}()
 	matched, matchedAny := 0, false
 	ln := 0
 	var writeErr error
@@ -725,6 +1022,11 @@ func grepFastBuf(ctx context.Context, hc interp.HandlerContext, name string, sho
 			if quiet {
 				return false
 			}
+			if filesOnly {
+				bw.WriteString(name)
+				bw.WriteByte('\n')
+				return false
+			}
 			if checkBin && bytes.IndexByte(line, 0) >= 0 {
 				if bw.Buffered() > 0 {
 					if err := bw.Flush(); err != nil {
@@ -740,14 +1042,15 @@ func grepFastBuf(ctx context.Context, hc interp.HandlerContext, name string, sho
 			} else {
 				bw.WriteString(prefix)
 				if lineNum {
-					bw.WriteString(strconv.Itoa(ln))
+					var numBuf [24]byte
+					bw.Write(strconv.AppendInt(numBuf[:0], int64(ln), 10))
 					bw.WriteByte(':')
 				}
 				bw.Write(line)
 				if terminated {
 					bw.WriteByte('\n')
 				}
-				if bw.Buffered() >= 4096 {
+				if bw.Available() < 4096 {
 					if err := bw.Flush(); err != nil {
 						writeErr = err
 						return false
@@ -772,7 +1075,7 @@ func grepFastBuf(ctx context.Context, hc interp.HandlerContext, name string, sho
 	if err := ctx.Err(); err != nil {
 		return matchedAny, err
 	}
-	if count && !quiet {
+	if count && !quiet && !filesOnly {
 		bw.WriteString(prefix)
 		bw.WriteString(strconv.Itoa(matched))
 		bw.WriteByte('\n')
@@ -780,7 +1083,7 @@ func grepFastBuf(ctx context.Context, hc interp.HandlerContext, name string, sho
 			return matchedAny, err
 		}
 	}
-	return matchedAny, nil
+	return matchedAny, bw.Flush()
 }
 
 func grepReader(ctx context.Context, hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, checkBin bool, maxCount, after, before int, r io.Reader) (bool, error) {
@@ -1101,38 +1404,73 @@ func cmdHead(ctx context.Context, hc interp.HandlerContext, args []string) error
 		return nil
 	}
 	multi := len(readers) > 1
+	bp := bufPool64K.Get().(*[]byte)
+	buf := (*bp)[:64*1024]
+	defer bufPool64K.Put(bp)
+	bw := getBufWriter64K(hc.Stdout)
+	defer func() {
+		_ = bw.Flush()
+		putBufWriter64K(bw)
+	}()
 	for i, r := range readers {
 		if (multi && !*quiet) || *verbose {
 			if i > 0 {
-				if _, err := fmt.Fprintln(hc.Stdout); err != nil {
+				if err := bw.WriteByte('\n'); err != nil {
 					return err
 				}
 			}
-			if _, err := fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i]); err != nil {
+			if _, err := fmt.Fprintf(bw, "==> %s <==\n", names[i]); err != nil {
 				return err
 			}
 		}
-		sc := newLineReader(r)
 		var c uint64
-		for c < n && sc.Scan() {
+		for c < n {
 			if err := ctx.Err(); err != nil {
 				return err
 			}
-			nl := "\n"
-			if !sc.EndedWithNewline() {
-				nl = ""
+			nr, rerr := r.Read(buf)
+			if nr > 0 {
+				chunk := buf[:nr]
+				need := n - c
+				cnt := uint64(bytes.Count(chunk, nlBytes))
+				if cnt < need {
+					if _, werr := bw.Write(chunk); werr != nil {
+						return werr
+					}
+					c += cnt
+				} else {
+					pos := 0
+					for rem := need; rem > 0; rem-- {
+						j := bytes.IndexByte(chunk[pos:], '\n')
+						pos += j + 1
+					}
+					if _, werr := bw.Write(chunk[:pos]); werr != nil {
+						return werr
+					}
+					c = n
+					if nr > pos && r == hc.Stdin {
+						if sk, ok := r.(io.Seeker); ok {
+							_, _ = sk.Seek(-int64(nr-pos), io.SeekCurrent)
+						}
+					}
+				}
+				if bw.Buffered() > 0 {
+					if werr := bw.Flush(); werr != nil {
+						return werr
+					}
+				}
 			}
-			if _, err := fmt.Fprint(hc.Stdout, sc.Text()+nl); err != nil {
-				return err
+			if c >= n || rerr == io.EOF {
+				break
 			}
-			c++
-		}
-		if err := sc.Err(); err != nil {
-			fmt.Fprintln(hc.Stderr, "head:", err)
-			return exitError{1}
+			if rerr != nil {
+				_ = bw.Flush()
+				fmt.Fprintln(hc.Stderr, "head:", rerr)
+				return exitError{1}
+			}
 		}
 	}
-	return nil
+	return bw.Flush()
 }
 
 // parseCountUint parses GNU counts (head/tail -n) without sign.
@@ -1461,208 +1799,424 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if *zeroTerm {
 		delim = 0
 	}
-	var all []byte
-	for _, r := range readers {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "sort:", err)
-			return exitError{1}
-		}
-		all = append(all, data...)
+	all, err := readAllSortInputs(readers)
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, "sort:", err)
+		return exitError{1}
 	}
-	lines := splitSortRecords(string(all), delim)
-	// keyEqual and less are defined below via sortConfig.
-	// Fast path: a plain whole-line byte sort needs no keys at all.
-	if !*check && len(cfg.specs) == 1 && cfg.specs[0] == (sortKeySpec{}) &&
-		cfg.mode == sortModeByte && !cfg.fold && !cfg.dict && !cfg.nonprint && !cfg.skipBlank {
-		cmp := func(a, b string) int {
-			c := strings.Compare(a, b)
-			if cfg.reverse {
-				c = -c
-			}
-			return c
-		}
-		if cfg.stable {
-			slices.SortStableFunc(lines, cmp)
-		} else {
-			// With an implicit whole-line key, duplicate lines are
-			// byte-identical, so -u doesn't need a stable order.
-			slices.SortFunc(lines, cmp)
-		}
-		var out *bufio.Writer
+
+	openSortOut := func() (*bufio.Writer, *os.File, error) {
 		if *outFile != "" {
 			p := resolve(hc.Dir, *outFile)
 			f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "sort:", err)
-				return exitError{1}
+				return nil, nil, exitError{1}
 			}
-			defer f.Close()
-			out = bufio.NewWriterSize(f, 256*1024)
-		} else {
-			out = bufio.NewWriterSize(hc.Stdout, 256*1024)
+			return getBufWriter64K(f), f, nil
 		}
-		defer out.Flush()
-		for i, l := range lines {
-			if cfg.unique && i > 0 && lines[i-1] == l {
-				continue
-			}
-			out.WriteString(l)
-			if *zeroTerm {
-				out.WriteByte(0)
-			} else {
-				out.WriteByte('\n')
-			}
-		}
-		return nil
+		return getBufWriter64K(hc.Stdout), nil, nil
 	}
-	// Fast path: a single numeric key over plain output sorts a flat
-	// struct directly, letting the compiler inline the comparison.
-	if !*check && len(cfg.specs) == 1 && !cfg.fold && !cfg.dict && !cfg.nonprint &&
-		cfg.specs[0].start.char == 0 && !(cfg.specs[0].hasEnd && cfg.specs[0].end.char > 0) {
-		sp := &cfg.specs[0]
-		mode := sp.mode
-		if mode == sortModeByte {
-			mode = cfg.mode
-		}
-		if mode == sortModeNumeric {
-			type numItem struct {
-				neg    bool
-				ip, fp string
-				val    int64 // fast path: the key fits in an int64
-				fits   bool
-				line   string
-			}
-			its := make([]numItem, len(lines))
-			fr := cfg.frScr[:0]
-			for i, l := range lines {
-				fr = sortFieldRangesB(fr, l, cfg.sep)
-				as, ae := sp.keyRangeB(l, fr, cfg.skipBlank)
-				neg, ip, fp := sortParseNum(l[as:ae])
-				ip = strings.TrimLeft(ip, "0")
-				fp = strings.TrimRight(fp, "0")
-				if ip == "" {
-					ip = "0"
+	outDelim := byte('\n')
+	if *zeroTerm {
+		outDelim = 0
+	}
+
+	// Fast path 1: plain whole-line byte sort over compact 16-byte spans with
+	// an in-register 8-byte big-endian prefix (zero string slice allocs, zero
+	// GC pointer scanning, and register-only comparisons for <=8B records).
+	if !*check && len(all) <= math.MaxUint32 &&
+		len(cfg.specs) == 1 && cfg.specs[0] == (sortKeySpec{}) &&
+		cfg.mode == sortModeByte && !cfg.fold && !cfg.dict && !cfg.nonprint && !cfg.skipBlank {
+		spans := splitSortSpans(all, delim)
+		rev := cfg.reverse
+		cmpSpan := func(a, b sortSpan) int {
+			var c int
+			if a.prefix != b.prefix {
+				if a.prefix < b.prefix {
+					c = -1
+				} else {
+					c = 1
 				}
-				if ip == "0" && fp == "" {
-					neg = false
-				}
-				it := numItem{neg: neg, ip: ip, fp: fp, line: l}
-				// Most real keys fit in an int64; compare those as
-				// primitives and keep the decimal form as fallback.
-				if fp == "" && len(ip) <= 18 {
-					if v, err := strconv.ParseInt(ip, 10, 64); err == nil {
-						if neg {
-							v = -v
-						}
-						it.val, it.fits = v, true
-					}
-				}
-				its[i] = it
-			}
-			rev := sp.reverse != cfg.reverse
-			cmp := func(a, b *numItem) int {
-				var c int
-				if a.fits && b.fits {
-					if a.val < b.val {
+			} else {
+				la := a.end - a.off
+				lb := b.end - b.off
+				if la <= 8 || lb <= 8 {
+					if la < lb {
 						c = -1
-					} else if a.val > b.val {
-						c = 1
-					}
-				} else if a.neg != b.neg {
-					if a.neg {
-						c = -1
-					} else {
+					} else if la > lb {
 						c = 1
 					}
 				} else {
-					sign := 1
-					if a.neg {
-						sign = -1
+					c = bytes.Compare(all[a.off+8:a.end], all[b.off+8:b.end])
+				}
+			}
+			if rev {
+				return -c
+			}
+			return c
+		}
+		if cfg.stable {
+			slices.SortStableFunc(spans, cmpSpan)
+		} else {
+			slices.SortFunc(spans, cmpSpan)
+		}
+		out, f, err := openSortOut()
+		if err != nil {
+			return err
+		}
+		if f != nil {
+			defer f.Close()
+		}
+		defer func() {
+			_ = out.Flush()
+			putBufWriter64K(out)
+		}()
+		for i, s := range spans {
+			if cfg.unique && i > 0 {
+				p := spans[i-1]
+				if p.prefix == s.prefix {
+					lp := p.end - p.off
+					ls := s.end - s.off
+					if lp == ls && (ls <= 8 || bytes.Equal(all[p.off+8:p.end], all[s.off+8:s.end])) {
+						continue
 					}
-					mag := 0
-					if a.ip != b.ip {
-						if len(a.ip) != len(b.ip) {
-							if len(a.ip) < len(b.ip) {
-								mag = -1
-							} else {
-								mag = 1
-							}
-						} else if a.ip < b.ip {
-							mag = -1
-						} else {
-							mag = 1
+				}
+			}
+			if int(s.end) < len(all) && all[s.end] == outDelim {
+				out.Write(all[s.off : s.end+1])
+			} else {
+				out.Write(all[s.off:s.end])
+				out.WriteByte(outDelim)
+			}
+		}
+		return out.Flush()
+	}
+
+	// Fast path 2: single-key Schwartzian transform over pointer-free (noscan)
+	// 16-byte/24-byte records directly indexing `all` (zero []string allocation,
+	// zero GC pointer scanning, single pass over input).
+	if !*check && len(all) <= math.MaxUint32 &&
+		len(cfg.specs) == 1 && !cfg.fold && !cfg.dict && !cfg.nonprint &&
+		!cfg.specs[0].fold && !cfg.specs[0].dict && !cfg.specs[0].nonprint &&
+		cfg.specs[0].start.char == 0 && !(cfg.specs[0].hasEnd && cfg.specs[0].end.char > 0) {
+		sp := &cfg.specs[0]
+		kmode := sp.mode
+		if kmode == sortModeByte {
+			kmode = cfg.mode
+		}
+		if kmode == sortModeNumeric || kmode == sortModeGeneral || kmode == sortModeHuman || kmode == sortModeByte {
+			if len(all) == 0 {
+				out, f, err := openSortOut()
+				if err != nil {
+					return err
+				}
+				if f != nil {
+					defer f.Close()
+				}
+				err = out.Flush()
+				putBufWriter64K(out)
+				return err
+			}
+			endPos := len(all)
+			if all[endPos-1] == delim {
+				endPos--
+			}
+			trimmed := all[:endPos]
+			var delimBuf [1]byte
+			delimBuf[0] = delim
+			nLines := bytes.Count(trimmed, delimBuf[:]) + 1
+			allS := unsafe.String(unsafe.SliceData(all), len(all))
+			rev := sp.reverse != cfg.reverse
+			needTie := !cfg.stable && !cfg.unique
+
+			switch kmode {
+			case sortModeNumeric:
+				recs := make([]fastNumRec, nLines)
+				var overflow []sortKeyVal
+				idx, off := 0, 0
+				for {
+					j := bytes.IndexByte(trimmed[off:], delim)
+					recEnd := endPos
+					if j >= 0 {
+						recEnd = off + j
+					}
+					l := allS[off:recEnd]
+					as, ae := extractSingleKeyRangeB(l, cfg.sep, sp, cfg.skipBlank)
+					ks := l[as:ae]
+					var val int64
+					if v, ok := parseSortIntFast(ks); ok {
+						val = v
+					} else {
+						neg, ip, fp := sortParseNum(ks)
+						ip = strings.TrimLeft(ip, "0")
+						fp = strings.TrimRight(fp, "0")
+						if ip == "" {
+							ip = "0"
+						}
+						if ip == "0" && fp == "" {
+							neg = false
+						}
+						val = sortNumOvBase - int64(len(overflow))
+						overflow = append(overflow, sortKeyVal{neg: neg, ip: ip, fp: fp})
+					}
+					recs[idx] = fastNumRec{val: val, off: uint32(off), end: uint32(recEnd)}
+					if j < 0 {
+						break
+					}
+					idx++
+					off = recEnd + 1
+				}
+				recs = recs[:idx+1]
+				cmpNum := func(a, b fastNumRec) int {
+					var c int
+					if a.val > sortNumOvBase && b.val > sortNumOvBase {
+						if a.val < b.val {
+							c = -1
+						} else if a.val > b.val {
+							c = 1
 						}
 					} else {
-						n, m := len(a.fp), len(b.fp)
-						mm := n
-						if m < mm {
-							mm = m
-						}
-						if cc := strings.Compare(a.fp[:mm], b.fp[:mm]); cc != 0 {
-							mag = cc
-						} else if n != m {
-							if n < m {
-								mag = -1
-							} else {
-								mag = 1
-							}
-						}
+						c = compareFastNumMixed(a.val, b.val, overflow)
 					}
-					c = sign * mag
-				}
-				if c != 0 {
-					if rev {
+					if c != 0 {
+						if rev {
+							return -c
+						}
+						return c
+					}
+					if !needTie {
+						return 0
+					}
+					c = strings.Compare(allS[a.off:a.end], allS[b.off:b.end])
+					if cfg.reverse {
 						return -c
 					}
 					return c
 				}
 				if cfg.stable || cfg.unique {
-					return 0
-				}
-				c = strings.Compare(a.line, b.line)
-				if cfg.reverse {
-					return -c
-				}
-				return c
-			}
-			idx := make([]int32, len(its))
-			for i := range idx {
-				idx[i] = int32(i)
-			}
-			if cfg.stable || cfg.unique {
-				slices.SortStableFunc(idx, func(a, b int32) int { return cmp(&its[a], &its[b]) })
-			} else {
-				slices.SortFunc(idx, func(a, b int32) int { return cmp(&its[a], &its[b]) })
-			}
-			var out *bufio.Writer
-			if *outFile != "" {
-				p := resolve(hc.Dir, *outFile)
-				f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-				if err != nil {
-					fmt.Fprintln(hc.Stderr, "sort:", err)
-					return exitError{1}
-				}
-				defer f.Close()
-				out = bufio.NewWriterSize(f, 256*1024)
-			} else {
-				out = bufio.NewWriterSize(hc.Stdout, 256*1024)
-			}
-			defer out.Flush()
-			for i, j := range idx {
-				if cfg.unique && i > 0 && its[idx[i-1]].neg == its[j].neg && its[idx[i-1]].ip == its[j].ip && its[idx[i-1]].fp == its[j].fp {
-					continue
-				}
-				out.WriteString(its[j].line)
-				if *zeroTerm {
-					out.WriteByte(0)
+					slices.SortStableFunc(recs, cmpNum)
 				} else {
-					out.WriteByte('\n')
+					slices.SortFunc(recs, cmpNum)
 				}
+				out, f, err := openSortOut()
+				if err != nil {
+					return err
+				}
+				if f != nil {
+					defer f.Close()
+				}
+				defer func() {
+					_ = out.Flush()
+					putBufWriter64K(out)
+				}()
+				for i, r := range recs {
+					if cfg.unique && i > 0 {
+						p := recs[i-1]
+						if p.val > sortNumOvBase && r.val > sortNumOvBase {
+							if p.val == r.val {
+								continue
+							}
+						} else if compareFastNumMixed(p.val, r.val, overflow) == 0 {
+							continue
+						}
+					}
+					if int(r.end) < len(all) && all[r.end] == outDelim {
+						out.Write(all[r.off : r.end+1])
+					} else {
+						out.Write(all[r.off:r.end])
+						out.WriteByte(outDelim)
+					}
+				}
+				return out.Flush()
+
+			case sortModeGeneral, sortModeHuman:
+				recs := make([]fastFloatRec, nLines)
+				idx, off := 0, 0
+				for {
+					j := bytes.IndexByte(trimmed[off:], delim)
+					recEnd := endPos
+					if j >= 0 {
+						recEnd = off + j
+					}
+					l := allS[off:recEnd]
+					as, ae := extractSingleKeyRangeB(l, cfg.sep, sp, cfg.skipBlank)
+					ks := l[as:ae]
+					var fv float64
+					if kmode == sortModeGeneral {
+						fv = sortParseGeneral(ks)
+					} else {
+						fv = sortParseHuman(ks)
+					}
+					if fv == 0 {
+						fv = 0
+					}
+					recs[idx] = fastFloatRec{val: fv, off: uint32(off), end: uint32(recEnd)}
+					if j < 0 {
+						break
+					}
+					idx++
+					off = recEnd + 1
+				}
+				recs = recs[:idx+1]
+				cmpFlt := func(a, b fastFloatRec) int {
+					var c int
+					if a.val < b.val {
+						c = -1
+					} else if a.val > b.val {
+						c = 1
+					}
+					if c != 0 {
+						if rev {
+							return -c
+						}
+						return c
+					}
+					if !needTie {
+						return 0
+					}
+					c = strings.Compare(allS[a.off:a.end], allS[b.off:b.end])
+					if cfg.reverse {
+						return -c
+					}
+					return c
+				}
+				if cfg.stable || cfg.unique {
+					slices.SortStableFunc(recs, cmpFlt)
+				} else {
+					slices.SortFunc(recs, cmpFlt)
+				}
+				out, f, err := openSortOut()
+				if err != nil {
+					return err
+				}
+				if f != nil {
+					defer f.Close()
+				}
+				defer func() {
+					_ = out.Flush()
+					putBufWriter64K(out)
+				}()
+				for i, r := range recs {
+					if cfg.unique && i > 0 && recs[i-1].val == r.val {
+						continue
+					}
+					if int(r.end) < len(all) && all[r.end] == outDelim {
+						out.Write(all[r.off : r.end+1])
+					} else {
+						out.Write(all[r.off:r.end])
+						out.WriteByte(outDelim)
+					}
+				}
+				return out.Flush()
+
+			case sortModeByte:
+				recs := make([]fastByteKeyRec, nLines)
+				idx, off := 0, 0
+				for {
+					j := bytes.IndexByte(trimmed[off:], delim)
+					recEnd := endPos
+					if j >= 0 {
+						recEnd = off + j
+					}
+					l := allS[off:recEnd]
+					as, ae := extractSingleKeyRangeB(l, cfg.sep, sp, cfg.skipBlank)
+					ks := l[as:ae]
+					recs[idx] = fastByteKeyRec{
+						keyPfx: packPrefix8S(ks),
+						keyOff: uint32(off + as),
+						keyEnd: uint32(off + ae),
+						off:    uint32(off),
+						end:    uint32(recEnd),
+					}
+					if j < 0 {
+						break
+					}
+					idx++
+					off = recEnd + 1
+				}
+				recs = recs[:idx+1]
+				cmpKey := func(a, b fastByteKeyRec) int {
+					var c int
+					if a.keyPfx != b.keyPfx {
+						if a.keyPfx < b.keyPfx {
+							c = -1
+						} else {
+							c = 1
+						}
+					} else {
+						la := a.keyEnd - a.keyOff
+						lb := b.keyEnd - b.keyOff
+						if la <= 8 || lb <= 8 {
+							if la < lb {
+								c = -1
+							} else if la > lb {
+								c = 1
+							}
+						} else {
+							c = strings.Compare(allS[a.keyOff+8:a.keyEnd], allS[b.keyOff+8:b.keyEnd])
+						}
+					}
+					if c != 0 {
+						if rev {
+							return -c
+						}
+						return c
+					}
+					if !needTie {
+						return 0
+					}
+					c = strings.Compare(allS[a.off:a.end], allS[b.off:b.end])
+					if cfg.reverse {
+						return -c
+					}
+					return c
+				}
+				if cfg.stable || cfg.unique {
+					slices.SortStableFunc(recs, cmpKey)
+				} else {
+					slices.SortFunc(recs, cmpKey)
+				}
+				out, f, err := openSortOut()
+				if err != nil {
+					return err
+				}
+				if f != nil {
+					defer f.Close()
+				}
+				defer func() {
+					_ = out.Flush()
+					putBufWriter64K(out)
+				}()
+				for i, r := range recs {
+					if cfg.unique && i > 0 {
+						p := recs[i-1]
+						if p.keyPfx == r.keyPfx {
+							lp := p.keyEnd - p.keyOff
+							lr := r.keyEnd - r.keyOff
+							if lp == lr && (lr <= 8 || allS[p.keyOff+8:p.keyEnd] == allS[r.keyOff+8:r.keyEnd]) {
+								continue
+							}
+						}
+					}
+					if int(r.end) < len(all) && all[r.end] == outDelim {
+						out.Write(all[r.off : r.end+1])
+					} else {
+						out.Write(all[r.off:r.end])
+						out.WriteByte(outDelim)
+					}
+				}
+				return out.Flush()
 			}
-			return nil
 		}
 	}
+
+	var allStr string
+	if len(all) > 0 {
+		allStr = unsafe.String(unsafe.SliceData(all), len(all))
+	}
+	lines := splitSortRecords(allStr, delim)
+
 	items := make([]sortItem, len(lines))
 	nSpec := len(cfg.specs)
 	keyArena := make([]sortKeyVal, len(lines)*nSpec)
@@ -1687,37 +2241,337 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	} else {
 		slices.SortFunc(items, func(a, b sortItem) int { return cfg.cmpItems(&a, &b) })
 	}
-	var out *bufio.Writer
-	if *outFile != "" {
-		p := resolve(hc.Dir, *outFile)
-		f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "sort:", err)
-			return exitError{1}
-		}
-		defer f.Close()
-		out = bufio.NewWriterSize(f, 256*1024)
-	} else {
-		out = bufio.NewWriterSize(hc.Stdout, 256*1024)
+	out, f, err := openSortOut()
+	if err != nil {
+		return err
 	}
-	defer out.Flush()
+	if f != nil {
+		defer f.Close()
+	}
+	defer func() {
+		_ = out.Flush()
+		putBufWriter64K(out)
+	}()
 	var prev *sortItem
 	for i := range items {
 		it := &items[i]
 		if *unique && prev != nil && cfg.keysEqualItems(prev, it) {
 			continue
 		}
-		l := it.line
-		if *zeroTerm {
-			out.WriteString(l)
-			out.WriteByte(0)
-		} else {
-			out.WriteString(l)
-			out.WriteByte('\n')
-		}
+		out.WriteString(it.line)
+		out.WriteByte(outDelim)
 		prev = it
 	}
-	return nil
+	return out.Flush()
+}
+
+const sortNumOvBase int64 = -4_000_000_000_000_000_000
+
+type sortSpan struct {
+	prefix uint64
+	off    uint32
+	end    uint32
+}
+
+type fastNumRec struct {
+	val int64
+	off uint32
+	end uint32
+}
+
+type fastFloatRec struct {
+	val float64
+	off uint32
+	end uint32
+}
+
+type fastByteKeyRec struct {
+	keyPfx uint64
+	keyOff uint32
+	keyEnd uint32
+	off    uint32
+	end    uint32
+}
+
+func readAllSortInputs(readers []io.Reader) ([]byte, error) {
+	var est int64
+	for _, r := range readers {
+		if st, ok := r.(interface{ Stat() (os.FileInfo, error) }); ok {
+			if fi, err := st.Stat(); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+				est += fi.Size()
+			}
+		}
+	}
+	var all []byte
+	if est > 0 && est < 1<<30 {
+		all = make([]byte, 0, est+64)
+	}
+	for _, r := range readers {
+		for {
+			if len(all) == cap(all) {
+				grow := max(64*1024, cap(all))
+				next := make([]byte, len(all), cap(all)+grow)
+				copy(next, all)
+				all = next
+			}
+			n, err := r.Read(all[len(all):cap(all)])
+			all = all[:len(all)+n]
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	return all, nil
+}
+
+func packPrefix8(b []byte) uint64 {
+	if len(b) >= 8 {
+		return binary.BigEndian.Uint64(b)
+	}
+	var p uint64
+	for i := 0; i < len(b); i++ {
+		p |= uint64(b[i]) << (56 - 8*i)
+	}
+	return p
+}
+
+func packPrefix8S(s string) uint64 {
+	if len(s) >= 8 {
+		return uint64(s[0])<<56 | uint64(s[1])<<48 | uint64(s[2])<<40 | uint64(s[3])<<32 |
+			uint64(s[4])<<24 | uint64(s[5])<<16 | uint64(s[6])<<8 | uint64(s[7])
+	}
+	var p uint64
+	for i := 0; i < len(s); i++ {
+		p |= uint64(s[i]) << (56 - 8*i)
+	}
+	return p
+}
+
+func splitSortSpans(data []byte, delim byte) []sortSpan {
+	if len(data) == 0 {
+		return nil
+	}
+	endPos := len(data)
+	if data[endPos-1] == delim {
+		endPos--
+	}
+	trimmed := data[:endPos]
+	var delimBuf [1]byte
+	delimBuf[0] = delim
+	n := bytes.Count(trimmed, delimBuf[:]) + 1
+	spans := make([]sortSpan, n)
+	idx := 0
+	off := 0
+	for {
+		j := bytes.IndexByte(trimmed[off:], delim)
+		if j < 0 {
+			rec := trimmed[off:]
+			spans[idx] = sortSpan{
+				prefix: packPrefix8(rec),
+				off:    uint32(off),
+				end:    uint32(endPos),
+			}
+			break
+		}
+		recEnd := off + j
+		rec := trimmed[off:recEnd]
+		spans[idx] = sortSpan{
+			prefix: packPrefix8(rec),
+			off:    uint32(off),
+			end:    uint32(recEnd),
+		}
+		idx++
+		off = recEnd + 1
+	}
+	return spans[:idx+1]
+}
+
+func parseSortIntFast(s string) (int64, bool) {
+	i := 0
+	for i < len(s) && (s[i] == ' ' || s[i] == '\t') {
+		i++
+	}
+	neg := false
+	if i < len(s) && s[i] == '-' {
+		neg = true
+		i++
+	}
+	for i < len(s) && s[i] == '0' {
+		i++
+	}
+	var u uint64
+	digits := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		if digits < 19 {
+			u = u*10 + uint64(s[i]-'0')
+		}
+		digits++
+		i++
+	}
+	if i < len(s) && s[i] == '.' {
+		i++
+		for i < len(s) && s[i] == '0' {
+			i++
+		}
+		if i < len(s) && s[i] >= '1' && s[i] <= '9' {
+			return 0, false
+		}
+	}
+	if digits > 18 {
+		return 0, false
+	}
+	if u == 0 {
+		return 0, true
+	}
+	if neg {
+		return -int64(u), true
+	}
+	return int64(u), true
+}
+
+func compareIntVsNumKey(iv int64, b *sortKeyVal) int {
+	negA := iv < 0
+	if negA != b.neg {
+		if negA {
+			return -1
+		}
+		return 1
+	}
+	var u uint64
+	if negA {
+		u = uint64(-iv)
+	} else {
+		u = uint64(iv)
+	}
+	var numBuf [24]byte
+	ipA := strconv.AppendUint(numBuf[:0], u, 10)
+	sign := 1
+	if negA {
+		sign = -1
+	}
+	mag := 0
+	if len(ipA) != len(b.ip) {
+		if len(ipA) < len(b.ip) {
+			mag = -1
+		} else {
+			mag = 1
+		}
+	} else {
+		bp := unsafe.Slice(unsafe.StringData(b.ip), len(b.ip))
+		if cc := bytes.Compare(ipA, bp); cc != 0 {
+			mag = cc
+		} else if len(b.fp) > 0 {
+			mag = -1
+		}
+	}
+	return sign * mag
+}
+
+func compareFastNumMixed(av, bv int64, overflow []sortKeyVal) int {
+	if av <= sortNumOvBase && bv <= sortNumOvBase {
+		return compareNumParts(&overflow[sortNumOvBase-av], &overflow[sortNumOvBase-bv])
+	}
+	if av > sortNumOvBase {
+		return compareIntVsNumKey(av, &overflow[sortNumOvBase-bv])
+	}
+	return -compareIntVsNumKey(bv, &overflow[sortNumOvBase-av])
+}
+
+func extractSingleKeyRangeB(line, sep string, sp *sortKeySpec, skipGlobal bool) (int, int) {
+	skip := sp.skipBlank || skipGlobal
+	sf := sp.start.field
+	hasEnd := sp.hasEnd
+	ef := sp.end.field
+	n := len(line)
+	if sf <= 0 && !hasEnd && !skip {
+		return 0, n
+	}
+	maxF := sf
+	if hasEnd && ef > maxF {
+		maxF = ef
+	}
+	fs, fe := n, n
+	if sf <= 0 {
+		fs, fe = 0, n
+	}
+	en := n
+	if sep != "" {
+		sepB := sep[0]
+		pos := 0
+		for cur := 1; cur <= maxF; cur++ {
+			j := strings.IndexByte(line[pos:], sepB)
+			end := n
+			if j >= 0 {
+				end = pos + j
+			}
+			if cur == sf {
+				fs, fe = pos, end
+			}
+			if hasEnd && cur == ef {
+				en = end
+			}
+			if j < 0 {
+				break
+			}
+			pos = end + 1
+		}
+	} else {
+		prevEnd := 0
+		cur := 0
+		i := 0
+		for i < n && cur < maxF {
+			for i < n && (line[i] == ' ' || line[i] == '\t') {
+				i++
+			}
+			if i >= n {
+				break
+			}
+			j := i + 1
+			for j < n && line[j] != ' ' && line[j] != '\t' {
+				j++
+			}
+			cur++
+			start := prevEnd
+			if cur == 1 {
+				start = 0
+			}
+			if cur == sf {
+				fs, fe = start, j
+			}
+			if hasEnd && cur == ef {
+				en = j
+			}
+			prevEnd = j
+			i = j
+		}
+		if cur == 0 {
+			if sf == 1 {
+				fs, fe = 0, n
+			}
+			if hasEnd && ef == 1 {
+				en = n
+			}
+		}
+	}
+	st := fs
+	if skip {
+		for st < fe && (line[st] == ' ' || line[st] == '\t') {
+			st++
+		}
+	}
+	if st > n {
+		st = n
+	}
+	if !hasEnd {
+		en = n
+	}
+	if en < st {
+		en = st
+	}
+	return st, en
 }
 
 // splitSortRecords splits the whole input into records as zero-copy
@@ -1730,21 +2584,25 @@ func splitSortRecords(data string, delim byte) []string {
 	if data[len(data)-1] == delim {
 		data = data[:len(data)-1]
 	}
+	var delimBuf [1]byte
+	delimBuf[0] = delim
 	n := 1
-	for i := 0; i < len(data); i++ {
-		if data[i] == delim {
-			n++
-		}
+	if len(data) > 0 {
+		n += bytes.Count(unsafe.Slice(unsafe.StringData(data), len(data)), delimBuf[:])
 	}
-	lines := make([]string, 0, n)
-	start := 0
-	for i := 0; i < len(data); i++ {
-		if data[i] == delim {
-			lines = append(lines, data[start:i])
-			start = i + 1
+	lines := make([]string, n)
+	idx := 0
+	for {
+		j := strings.IndexByte(data, delim)
+		if j < 0 {
+			lines[idx] = data
+			break
 		}
+		lines[idx] = data[:j]
+		idx++
+		data = data[j+1:]
 	}
-	return append(lines, data[start:])
+	return lines[:idx+1]
 }
 
 // sortKeyVal is one precomputed key of one line: the key text plus any
@@ -2866,9 +3724,78 @@ func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error
 		defer f.Close()
 		w = f
 	}
-	bw := bufio.NewWriterSize(w, 256*1024)
-	defer bw.Flush()
+	bw := getBufWriter64K(w)
+	defer func() {
+		_ = bw.Flush()
+		putBufWriter64K(bw)
+	}()
 	w = bw
+
+	// Fast byte-streaming path for whole-line case-sensitive uniq (including
+	// -c, -d, -u): zero per-line string allocations.
+	if *skipFields == 0 && *skipChars == 0 && *checkChars == 0 && !wSet && !*ignoreCase && groupMode == "" {
+		var prev []byte
+		n := 0
+		var numBuf [32]byte
+		emitPrev := func() {
+			if n == 0 {
+				return
+			}
+			if (*dupOnly && n < 2) || (*uniqueOnly && n > 1) {
+				return
+			}
+			if *count {
+				digits := strconv.AppendInt(numBuf[:0], int64(n), 10)
+				for pad := len(digits); pad < 7; pad++ {
+					bw.WriteByte(' ')
+				}
+				bw.Write(digits)
+				bw.WriteByte(' ')
+			}
+			bw.Write(prev)
+			bw.WriteByte('\n')
+		}
+		for _, r := range readers {
+			var writeErr error
+			rerr := streamLinesChunked(ctx, r, func(line []byte, _ bool) bool {
+				if ctx.Err() != nil {
+					return false
+				}
+				if n > 0 && bytes.Equal(line, prev) {
+					n++
+					return true
+				}
+				emitPrev()
+				if bw.Available() < 4096 {
+					if err := bw.Flush(); err != nil {
+						writeErr = err
+						return false
+					}
+				}
+				prev = append(prev[:0], line...)
+				n = 1
+				return true
+			}, func() error {
+				if bw.Buffered() > 0 {
+					return bw.Flush()
+				}
+				return nil
+			})
+			if writeErr != nil {
+				return writeErr
+			}
+			if rerr != nil {
+				if isPipeClosed(rerr) || ctx.Err() != nil {
+					return rerr
+				}
+				fmt.Fprintln(hc.Stderr, "uniq:", rerr)
+				return exitError{1}
+			}
+		}
+		emitPrev()
+		return bw.Flush()
+	}
+
 	norm := func(s string) string {
 		// GNU comparison key: skip N fields, then N chars, then
 		// optionally truncate to M chars (-w). Raw line is printed.
@@ -2920,7 +3847,7 @@ func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error
 				io.WriteString(w, prevRaw)
 				io.WriteString(w, "\n")
 			}
-			if (forceFlush && bw.Buffered() > 0) || bw.Buffered() >= 4096 {
+			if (forceFlush && bw.Buffered() > 0) || bw.Available() < 4096 {
 				return bw.Flush()
 			}
 			return nil
@@ -2932,7 +3859,7 @@ func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error
 				io.WriteString(w, prevRaw)
 				io.WriteString(w, "\n")
 			}
-			if (forceFlush && bw.Buffered() > 0) || bw.Buffered() >= 4096 {
+			if (forceFlush && bw.Buffered() > 0) || bw.Available() < 4096 {
 				return bw.Flush()
 			}
 		}
@@ -2966,7 +3893,19 @@ func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return bw.Flush()
 }
 
-func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
+var wcWordTbl = func() [256]uint8 {
+	var t [256]uint8
+	for i := 0; i < 128; i++ {
+		switch byte(i) {
+		case ' ', '\t', '\n', '\r', '\v', '\f':
+		default:
+			t[i] = 1
+		}
+	}
+	return t
+}()
+
+func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("wc", hc.Stderr)
 	lines := fs.Bool("l", false, "")
 	words := fs.Bool("w", false, "")
@@ -2987,16 +3926,24 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	defer closeAll()
-	// Regularity per input: file operands stat the file; stdin checks
-	// whether the reader is a regular file (redirect) or pipe.
+	// Regularity per input: inspect open file handles directly without
+	// redundant path-based os.Stat syscalls.
 	isReg := make([]bool, len(readers))
+	regInfo := make([]os.FileInfo, len(readers))
+	isFileArg := make([]bool, len(readers))
 	for k := range readers {
 		if len(files) > 0 && names[k] != "" && names[k] != "standard input" && names[k] != "-" {
-			if fi, err := os.Stat(resolve(hc.Dir, files[k])); err == nil {
-				isReg[k] = fi.Mode().IsRegular()
+			isFileArg[k] = true
+			if fi, ok := readerRegularStat(readers[k]); ok {
+				isReg[k] = true
+				regInfo[k] = fi
+			} else if fi, err := os.Stat(resolve(hc.Dir, files[k])); err == nil && fi.Mode().IsRegular() {
+				isReg[k] = true
+				regInfo[k] = fi
 			}
-		} else {
-			isReg[k] = stdinIsRegular(hc.Stdin)
+		} else if fi, ok := readerRegularStat(hc.Stdin); ok {
+			isReg[k] = true
+			regInfo[k] = fi
 		}
 	}
 	type wcRow struct {
@@ -3024,60 +3971,274 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return vals
 	}
 	wantLines, wantWords, wantChars, wantMax := *lines, *words, *chars, *maxLine
+	bytesOnly := *bytes_ && !wantLines && !wantWords && !wantChars && !wantMax
+
+	bp := bufPool64K.Get().(*[]byte)
+	rawBuf := *bp // len == 64*1024 + 8; [0:4] reserved for UTF-8 chunk carry
+	defer bufPool64K.Put(bp)
+
 	for i, r := range readers {
 		l, w, b := 0, 0, 0
-		chars, maxLineLen := 0, 0
-		data, err := io.ReadAll(r)
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "wc:", err)
-			return exitError{1}
+		nchars, maxLineLen := 0, 0
+
+		// Fast Path 1: `wc -c` on a non-empty regular file needs zero Read syscalls.
+		if bytesOnly && isReg[i] && regInfo[i] != nil && regInfo[i].Size() > 0 {
+			if isFileArg[i] {
+				b = int(regInfo[i].Size())
+				goto recordRow
+			}
+			if sk, ok := r.(io.Seeker); ok {
+				cur, err1 := sk.Seek(0, io.SeekCurrent)
+				end, err2 := sk.Seek(0, io.SeekEnd)
+				if err1 == nil && err2 == nil && end >= cur {
+					b = int(end - cur)
+					goto recordRow
+				}
+			}
 		}
-		b = len(data)
-		if wantChars {
-			chars = utf8.RuneCount(data)
+
+		// Fast Path 2: `-l` and/or `-c` without `-w`/`-m`/`-L`: 64 KB chunks + SIMD bytes.Count.
+		if !wantWords && !wantChars && !wantMax {
+			buf := rawBuf[:64*1024]
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				nr, rerr := r.Read(buf)
+				if nr > 0 {
+					b += nr
+					if wantLines {
+						l += bytes.Count(buf[:nr], nlBytes)
+					}
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					fmt.Fprintln(hc.Stderr, "wc:", rerr)
+					return exitError{1}
+				}
+			}
+			goto recordRow
 		}
-		if wantLines {
-			l = bytes.Count(data, []byte{'\n'})
+
+		// Fast Path 3: `-w` (with optional `-l`/`-c`, without `-m`/`-L`):
+		// branchless 8-byte ASCII scanner + SIMD bytes.Count, falling back
+		// to UTF-8 rune decode only if byte >= 0x80 is encountered.
+		if wantWords && !wantChars && !wantMax {
+			readSlice := rawBuf[4 : 4+64*1024]
+			var inWord uint8
+			var utf8Carry [4]byte
+			carryLen := 0
+			scanUTF8Words := func(work []byte) {
+				p := 0
+				for p < len(work) {
+					c := work[p]
+					if c < 0x80 {
+						cur := wcWordTbl[c]
+						w += int(cur &^ inWord)
+						inWord = cur
+						p++
+						continue
+					}
+					rn, sz := utf8.DecodeRune(work[p:])
+					if rn != utf8.RuneError && rn != '\u00a0' && unicode.IsSpace(rn) {
+						inWord = 0
+					} else {
+						w += int(1 &^ inWord)
+						inWord = 1
+					}
+					p += sz
+				}
+			}
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				nr, rerr := r.Read(readSlice)
+				if nr > 0 {
+					b += nr
+					chunk := readSlice[:nr]
+					if wantLines {
+						l += bytes.Count(chunk, nlBytes)
+					}
+					j := 0
+					if carryLen == 0 {
+						for ; j+8 <= nr; j += 8 {
+							u := binary.LittleEndian.Uint64(chunk[j:])
+							if u&0x8080808080808080 != 0 {
+								break
+							}
+							c0 := wcWordTbl[byte(u)]
+							w += int(c0 &^ inWord)
+							c1 := wcWordTbl[byte(u>>8)]
+							w += int(c1 &^ c0)
+							c2 := wcWordTbl[byte(u>>16)]
+							w += int(c2 &^ c1)
+							c3 := wcWordTbl[byte(u>>24)]
+							w += int(c3 &^ c2)
+							c4 := wcWordTbl[byte(u>>32)]
+							w += int(c4 &^ c3)
+							c5 := wcWordTbl[byte(u>>40)]
+							w += int(c5 &^ c4)
+							c6 := wcWordTbl[byte(u>>48)]
+							w += int(c6 &^ c5)
+							c7 := wcWordTbl[byte(u>>56)]
+							w += int(c7 &^ c6)
+							inWord = c7
+						}
+						for ; j < nr && chunk[j] < 0x80; j++ {
+							cur := wcWordTbl[chunk[j]]
+							w += int(cur &^ inWord)
+							inWord = cur
+						}
+					}
+					if j < nr || carryLen > 0 {
+						var work []byte
+						if carryLen > 0 {
+							copy(rawBuf[4-carryLen:4], utf8Carry[:carryLen])
+							work = rawBuf[4-carryLen : 4+nr]
+						} else {
+							work = chunk[j:]
+						}
+						carryLen = 0
+						if rerr == nil && len(work) > 0 {
+							k := len(work) - 1
+							limit := max(0, len(work)-3)
+							for k > limit && (work[k]&0xC0) == 0x80 {
+								k--
+							}
+							if work[k] >= 0x80 && !utf8.FullRune(work[k:]) {
+								carryLen = copy(utf8Carry[:], work[k:])
+								work = work[:k]
+							}
+						}
+						scanUTF8Words(work)
+					}
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					fmt.Fprintln(hc.Stderr, "wc:", rerr)
+					return exitError{1}
+				}
+			}
+			if carryLen > 0 {
+				scanUTF8Words(utf8Carry[:carryLen])
+			}
+			goto recordRow
 		}
-		// Single byte pass for words and display width: non-ASCII
-		// continuation bytes don't advance the column, and tabs move
-		// to the next multiple of 8 (GNU -L).
-		if wantWords || wantMax {
+
+		// Path 4: streaming 64 KB chunk scanner for `-m` and/or `-L` (with UTF-8 carry).
+		{
+			readSlice := rawBuf[4 : 4+64*1024]
 			inWord := false
 			col := 0
-			for _, c := range data {
-				if c == '\n' {
-					if col > maxLineLen {
-						maxLineLen = col
-					}
-					col = 0
-					inWord = false
-					continue
-				}
-				if wantWords {
-					switch c {
-					case ' ', '\t', '\r', '\v', '\f':
+			var utf8Carry [4]byte
+			carryLen := 0
+			scanFull := func(work []byte) {
+				p := 0
+				for p < len(work) {
+					c := work[p]
+					if c == '\n' {
+						l++
+						if wantChars {
+							nchars++
+						}
+						if col > maxLineLen {
+							maxLineLen = col
+						}
+						col = 0
 						inWord = false
-					default:
-						if !inWord {
+						p++
+						continue
+					}
+					if c < 0x80 {
+						if wantChars {
+							nchars++
+						}
+						if wantWords {
+							if wcWordTbl[c] == 0 {
+								inWord = false
+							} else if !inWord {
+								inWord = true
+								w++
+							}
+						}
+						if wantMax {
+							if c == '\t' {
+								col = (col/8 + 1) * 8
+							} else {
+								col++
+							}
+						}
+						p++
+						continue
+					}
+					rn, sz := utf8.DecodeRune(work[p:])
+					if wantChars {
+						nchars++
+					}
+					if wantWords {
+						if rn != utf8.RuneError && rn != '\u00a0' && unicode.IsSpace(rn) {
+							inWord = false
+						} else if !inWord {
 							inWord = true
 							w++
 						}
 					}
-				}
-				if wantMax {
-					if c == '\t' {
-						col = (col/8 + 1) * 8
-					} else if c&0xC0 != 0x80 {
-						col++
+					if wantMax {
+						for q := p; q < p+sz; q++ {
+							if work[q]&0xC0 != 0x80 {
+								col++
+							}
+						}
 					}
+					p += sz
 				}
+			}
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				nr, rerr := r.Read(readSlice)
+				if nr > 0 {
+					b += nr
+					copy(rawBuf[4-carryLen:4], utf8Carry[:carryLen])
+					work := rawBuf[4-carryLen : 4+nr]
+					carryLen = 0
+					if rerr == nil && len(work) > 0 {
+						k := len(work) - 1
+						limit := max(0, len(work)-3)
+						for k > limit && (work[k]&0xC0) == 0x80 {
+							k--
+						}
+						if work[k] >= 0x80 && !utf8.FullRune(work[k:]) {
+							carryLen = copy(utf8Carry[:], work[k:])
+							work = work[:k]
+						}
+					}
+					scanFull(work)
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					fmt.Fprintln(hc.Stderr, "wc:", rerr)
+					return exitError{1}
+				}
+			}
+			if carryLen > 0 {
+				scanFull(utf8Carry[:carryLen])
 			}
 			if col > maxLineLen {
 				maxLineLen = col
 			}
 		}
-		tl, tw, tb, tc, tm = tl+l, tw+w, tb+b, tc+chars, max(maxLineLen, tm)
+
+	recordRow:
+		tl, tw, tb, tc, tm = tl+l, tw+w, tb+b, tc+nchars, max(maxLineLen, tm)
 		name := ""
 		if len(files) > 0 && names[i] != "" && names[i] != "standard input" {
 			name = names[i]
@@ -3086,7 +4247,7 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 			// displayed as "-" like GNU.
 			name = "-"
 		}
-		rows = append(rows, wcRow{colVals(l, w, b, chars, maxLineLen), name})
+		rows = append(rows, wcRow{colVals(l, w, b, nchars, maxLineLen), name})
 	}
 	showTotal := len(readers) > 1
 	if showTotal {
@@ -3143,16 +4304,23 @@ func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
+// readerRegularStat inspects an open reader's Stat() (supporting both *os.File
+// and *refcountedFileShim) and returns its FileInfo if it is a regular file.
+func readerRegularStat(r io.Reader) (os.FileInfo, bool) {
+	if st, ok := r.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if fi, err := st.Stat(); err == nil && fi.Mode().IsRegular() {
+			return fi, true
+		}
+	}
+	return nil, false
+}
+
 // stdinIsRegular reports whether the wc input reader is a regular file
 // (stdin redirected from a file) as opposed to a pipe. GNU wc pads
 // columns to width 7 for pipes but uses natural width for regular files.
 func stdinIsRegular(r io.Reader) bool {
-	if f, ok := r.(*os.File); ok {
-		if fi, err := f.Stat(); err == nil {
-			return fi.Mode().IsRegular()
-		}
-	}
-	return false
+	_, ok := readerRegularStat(r)
+	return ok
 }
 
 func cmdTee(ctx context.Context, hc interp.HandlerContext, args []string) error {
@@ -3213,8 +4381,11 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "tr:", err)
 		return exitError{1}
 	}
+	bp := bufPool64K.Get().(*[]byte)
+	buf := (*bp)[:64*1024]
+	defer bufPool64K.Put(bp)
+
 	if *complement && !*del && len(rest) < 2 {
-		buf := make([]byte, 256*1024)
 		for {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -3234,13 +4405,13 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		}
 	}
 	if *complement {
-		present := make(map[byte]bool, len(from))
+		var present [256]bool
 		for _, b := range from {
 			present[b] = true
 		}
-		from = nil
+		from = from[:0]
 		for i := 0; i < 256; i++ {
-			if !present[byte(i)] {
+			if !present[i] {
 				from = append(from, byte(i))
 			}
 		}
@@ -3250,8 +4421,6 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		for _, b := range from {
 			delSet[b] = true
 		}
-		buf := make([]byte, 256*1024)
-		out := make([]byte, 256*1024)
 		for {
 			if err := ctx.Err(); err != nil {
 				return err
@@ -3261,12 +4430,14 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 				k := 0
 				for _, b := range buf[:n] {
 					if !delSet[b] {
-						out[k] = b
+						buf[k] = b
 						k++
 					}
 				}
-				if _, werr := hc.Stdout.Write(out[:k]); werr != nil {
-					return werr
+				if k > 0 {
+					if _, werr := hc.Stdout.Write(buf[:k]); werr != nil {
+						return werr
+					}
 				}
 			}
 			if err == io.EOF {
@@ -3280,7 +4451,10 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	if len(rest) < 2 {
 		if *squeeze {
-			buf := make([]byte, 256*1024)
+			var inSet [256]bool
+			for _, b := range from {
+				inSet[b] = true
+			}
 			var carry byte
 			hasCarry := false
 			for {
@@ -3289,9 +4463,11 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 				}
 				n, err := hc.Stdin.Read(buf)
 				if n > 0 {
-					chunk := squeezeBytes(buf[:n], from, &carry, &hasCarry)
-					if _, werr := hc.Stdout.Write(chunk); werr != nil {
-						return werr
+					chunk := squeezeBytesInPlace(buf[:n], &inSet, &carry, &hasCarry)
+					if len(chunk) > 0 {
+						if _, werr := hc.Stdout.Write(chunk); werr != nil {
+							return werr
+						}
 					}
 				}
 				if err == io.EOF {
@@ -3333,9 +4509,13 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		table[b] = c
 	}
-	// Stream in chunks: constant memory and no GC churn in loops.
-	buf := make([]byte, 256*1024)
-	out := make([]byte, 256*1024)
+	var sqSet [256]bool
+	if *squeeze {
+		for _, b := range to {
+			sqSet[b] = true
+		}
+	}
+	// Stream in pooled 64 KB chunks with in-place 8x unrolled lookup table.
 	var carry byte
 	hasCarry := false
 	for {
@@ -3344,15 +4524,29 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		n, err := hc.Stdin.Read(buf)
 		if n > 0 {
-			for i := 0; i < n; i++ {
-				out[i] = table[buf[i]]
+			chunk := buf[:n]
+			i := 0
+			for ; i+8 <= n; i += 8 {
+				s := chunk[i : i+8 : i+8]
+				s[0] = table[s[0]]
+				s[1] = table[s[1]]
+				s[2] = table[s[2]]
+				s[3] = table[s[3]]
+				s[4] = table[s[4]]
+				s[5] = table[s[5]]
+				s[6] = table[s[6]]
+				s[7] = table[s[7]]
 			}
-			chunk := out[:n]
+			for ; i < n; i++ {
+				chunk[i] = table[chunk[i]]
+			}
 			if *squeeze {
-				chunk = squeezeBytes(chunk, to, &carry, &hasCarry)
+				chunk = squeezeBytesInPlace(chunk, &sqSet, &carry, &hasCarry)
 			}
-			if _, werr := hc.Stdout.Write(chunk); werr != nil {
-				return werr
+			if len(chunk) > 0 {
+				if _, werr := hc.Stdout.Write(chunk); werr != nil {
+					return werr
+				}
 			}
 		}
 		if err == io.EOF {
@@ -3365,20 +4559,17 @@ func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func squeezeBytes(data, set []byte, carry *byte, hasCarry *bool) []byte {
-	var inSet [256]bool
-	for _, b := range set {
-		inSet[b] = true
-	}
-	out := data[:0:0]
+func squeezeBytesInPlace(data []byte, inSet *[256]bool, carry *byte, hasCarry *bool) []byte {
+	k := 0
 	for _, b := range data {
 		if *hasCarry && b == *carry && inSet[b] {
 			continue
 		}
-		out = append(out, b)
+		data[k] = b
+		k++
 		*carry, *hasCarry = b, true
 	}
-	return out
+	return data[:k]
 }
 
 func nextTrAtom(s string, i int) (byte, int, bool) {
@@ -3580,22 +4771,6 @@ func cmdSeq(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		fmt.Fprintln(hc.Stderr, "Try 'seq --help' for more information.")
 		return exitError{1}
 	}
-	bw := bufio.NewWriterSize(hc.Stdout, 64*1024)
-	steps := 0
-	checkStep := func() error {
-		steps++
-		if steps&1023 == 0 {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-		}
-		if bw.Buffered() >= 4096 {
-			if err := bw.Flush(); err != nil {
-				return err
-			}
-		}
-		return nil
-	}
 	parseSeqInt := func(s string) (int64, bool) {
 		s = strings.TrimSpace(s)
 		if s == "" || strings.ContainsAny(s, ".eExX") {
@@ -3626,6 +4801,50 @@ func cmdSeq(ctx context.Context, hc interp.HandlerContext, args []string) error 
 			if (istep > 0 && iv > ilast) || (istep < 0 && iv < ilast) {
 				return nil
 			}
+			bp := bufPool64K.Get().(*[]byte)
+			raw := (*bp)[:64*1024]
+			defer bufPool64K.Put(bp)
+			outBuf := raw[:0]
+
+			if !padWidth && sep == "\n" {
+				for {
+					outBuf = strconv.AppendInt(outBuf, iv, 10)
+					outBuf = append(outBuf, '\n')
+					if len(outBuf) >= 60*1024 {
+						if err := ctx.Err(); err != nil {
+							return err
+						}
+						if _, err := hc.Stdout.Write(outBuf); err != nil {
+							return err
+						}
+						outBuf = outBuf[:0]
+					}
+					if istep > 0 {
+						if iv > 0 && istep > math.MaxInt64-iv {
+							break
+						}
+						iv += istep
+						if iv > ilast {
+							break
+						}
+					} else {
+						if iv < 0 && istep < math.MinInt64-iv {
+							break
+						}
+						iv += istep
+						if iv < ilast {
+							break
+						}
+					}
+				}
+				if len(outBuf) > 0 {
+					if _, err := hc.Stdout.Write(outBuf); err != nil {
+						return err
+					}
+				}
+				return nil
+			}
+
 			padW := 0
 			if padWidth {
 				var endVal int64
@@ -3638,38 +4857,45 @@ func cmdSeq(ctx context.Context, hc interp.HandlerContext, args []string) error 
 				}
 				padW = max(len(strconv.FormatInt(iv, 10)), len(strconv.FormatInt(endVal, 10)))
 			}
-			buf := make([]byte, 0, 32)
+			var numBuf [32]byte
 			firstOut := true
 			for {
 				if (istep > 0 && iv > ilast) || (istep < 0 && iv < ilast) {
 					break
 				}
+				need := len(sep) + max(padW, 24) + 2
+				if len(outBuf)+need > len(raw) && len(outBuf) > 0 {
+					if err := ctx.Err(); err != nil {
+						return err
+					}
+					if _, err := hc.Stdout.Write(outBuf); err != nil {
+						return err
+					}
+					outBuf = outBuf[:0]
+				}
 				if !firstOut && sep != "\n" {
-					bw.WriteString(sep)
+					outBuf = append(outBuf, sep...)
 				}
 				firstOut = false
-				buf = strconv.AppendInt(buf[:0], iv, 10)
-				if padW > len(buf) {
-					if buf[0] == '-' {
-						bw.WriteByte('-')
-						for z := 0; z < padW-len(buf); z++ {
-							bw.WriteByte('0')
+				nb := strconv.AppendInt(numBuf[:0], iv, 10)
+				if padW > len(nb) {
+					if nb[0] == '-' {
+						outBuf = append(outBuf, '-')
+						for z := 0; z < padW-len(nb); z++ {
+							outBuf = append(outBuf, '0')
 						}
-						bw.Write(buf[1:])
+						outBuf = append(outBuf, nb[1:]...)
 					} else {
-						for z := 0; z < padW-len(buf); z++ {
-							bw.WriteByte('0')
+						for z := 0; z < padW-len(nb); z++ {
+							outBuf = append(outBuf, '0')
 						}
-						bw.Write(buf)
+						outBuf = append(outBuf, nb...)
 					}
 				} else {
-					bw.Write(buf)
+					outBuf = append(outBuf, nb...)
 				}
 				if sep == "\n" {
-					bw.WriteByte('\n')
-				}
-				if err := checkStep(); err != nil {
-					return err
+					outBuf = append(outBuf, '\n')
 				}
 				if istep > 0 && iv > 0 && istep > math.MaxInt64-iv {
 					break
@@ -3680,10 +4906,35 @@ func cmdSeq(ctx context.Context, hc interp.HandlerContext, args []string) error 
 				iv += istep
 			}
 			if !firstOut && sep != "\n" {
-				bw.WriteByte('\n')
+				outBuf = append(outBuf, '\n')
 			}
-			return bw.Flush()
+			if len(outBuf) > 0 {
+				if _, err := hc.Stdout.Write(outBuf); err != nil {
+					return err
+				}
+			}
+			return nil
 		}
+	}
+	bw := getBufWriter64K(hc.Stdout)
+	defer func() {
+		_ = bw.Flush()
+		putBufWriter64K(bw)
+	}()
+	steps := 0
+	checkStep := func() error {
+		steps++
+		if steps&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if bw.Available() < 4096 {
+			if err := bw.Flush(); err != nil {
+				return err
+			}
+		}
+		return nil
 	}
 	fmtNum := func(v float64) string {
 		if format != "" {
@@ -3881,23 +5132,48 @@ func cmdCut(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		return exitError{1}
 	}
 	defer closeAll()
-	bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
-	defer bw.Flush()
+	bw := getBufWriter64K(hc.Stdout)
+	defer func() {
+		_ = bw.Flush()
+		putBufWriter64K(bw)
+	}()
 	if len(d) == 1 {
-		// Fast byte-level path for the common single-byte delimiters.
+		// Fast SIMD byte-level path for single-byte delimiters using bytes.IndexByte
+		// with early exit past maxField when bounded.
 		delimB := d[0]
 		joinerB := joiner
+		maxField := 0
+		unbounded := *complement
+		if !unbounded {
+			for _, s := range spans {
+				if s.hi == -1 {
+					unbounded = true
+					break
+				}
+				if s.hi > maxField {
+					maxField = s.hi
+				}
+			}
+		}
+		var fastMask [65]bool
+		useFastMask := !unbounded && maxField <= 64
+		if useFastMask {
+			for f := 1; f <= maxField; f++ {
+				fastMask[f] = in(f)
+			}
+		}
 		for _, r := range readers {
 			var writeErr error
-			err := streamLinesChunked(ctx, r, func(line []byte, terminated bool) bool {
+			err := streamLinesChunked(ctx, r, func(line []byte, _ bool) bool {
 				if ctx.Err() != nil {
 					return false
 				}
-				if bytes.IndexByte(line, delimB) < 0 {
+				firstIdx := bytes.IndexByte(line, delimB)
+				if firstIdx < 0 {
 					if !*onlyDelim {
 						bw.Write(line)
 						bw.WriteByte('\n')
-						if bw.Buffered() >= 4096 {
+						if bw.Available() < 4096 {
 							if werr := bw.Flush(); werr != nil {
 								writeErr = werr
 								return false
@@ -3906,24 +5182,49 @@ func cmdCut(ctx context.Context, hc interp.HandlerContext, args []string) error 
 					}
 					return true
 				}
-				fs2, wrote := 0, false
-				fstart := 0
-				for j := 0; j <= len(line); j++ {
-					if j < len(line) && line[j] != delimB {
-						continue
-					}
-					fs2++
-					if in(fs2) {
-						if wrote {
-							bw.WriteString(joinerB)
+				wrote := false
+				// Field 1 is already known from firstIdx!
+				var sel1 bool
+				if useFastMask {
+					sel1 = fastMask[1]
+				} else {
+					sel1 = in(1)
+				}
+				if sel1 {
+					bw.Write(line[:firstIdx])
+					wrote = true
+				}
+				if !useFastMask || maxField > 1 {
+					fstart := firstIdx + 1
+					fs2 := 1
+					for {
+						fs2++
+						j := bytes.IndexByte(line[fstart:], delimB)
+						fend := len(line)
+						if j >= 0 {
+							fend = fstart + j
 						}
-						bw.Write(line[fstart:j])
-						wrote = true
+						var sel bool
+						if useFastMask {
+							sel = fs2 <= maxField && fastMask[fs2]
+						} else {
+							sel = in(fs2)
+						}
+						if sel {
+							if wrote {
+								bw.WriteString(joinerB)
+							}
+							bw.Write(line[fstart:fend])
+							wrote = true
+						}
+						if j < 0 || (!unbounded && fs2 >= maxField) {
+							break
+						}
+						fstart = fend + 1
 					}
-					fstart = j + 1
 				}
 				bw.WriteByte('\n')
-				if bw.Buffered() >= 4096 {
+				if bw.Available() < 4096 {
 					if werr := bw.Flush(); werr != nil {
 						writeErr = werr
 						return false

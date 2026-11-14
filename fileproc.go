@@ -889,19 +889,34 @@ func splitMktempPattern(pattern string) (prefix, suffix string, xLen int) {
 }
 
 type findNode struct {
-	display string
-	full    string
-	fi      os.FileInfo // loaded lazily (find -type f doesn't need it)
-	typ     os.FileMode // from d_type when known (0 = unknown)
-	depth   int
-	pruned  bool
-	follow  bool
+	display  string
+	full     string
+	dirFull  string
+	name     string
+	ent      os.DirEntry
+	fi       os.FileInfo // loaded lazily (find -type f doesn't need it)
+	typ      os.FileMode // from d_type when known
+	typKnown bool
+	depth    int
+	pruned   bool
+	follow   bool
+}
+
+func (n *findNode) fullPath() string {
+	if n.full == "" && n.dirFull != "" && n.name != "" {
+		n.full = filepath.Join(n.dirFull, n.name)
+	}
+	return n.full
+}
+
+func entTypeKnown(t os.FileMode) bool {
+	return t != ^os.FileMode(0) && t != os.ModeIrregular
 }
 
 // stat lazily loads the file info; GNU find only stats entries whose
 // predicates need the metadata (the type comes from readdir otherwise).
-// Files that vanish mid-walk get a zero FileInfo so predicates stay
-// nil-safe.
+// When !follow and DirEntry is available, DirEntry.Info() reuses cached
+// directory metadata on Windows without extra syscalls.
 func (n *findNode) stat() os.FileInfo {
 	if n.fi == nil {
 		var (
@@ -909,12 +924,18 @@ func (n *findNode) stat() os.FileInfo {
 			err error
 		)
 		if n.follow {
-			fi, err = os.Stat(n.full)
+			fp := n.fullPath()
+			fi, err = os.Stat(fp)
 			if err != nil {
-				fi, err = os.Lstat(n.full)
+				fi, err = os.Lstat(fp)
+			}
+		} else if n.ent != nil {
+			fi, err = n.ent.Info()
+			if err != nil {
+				fi, err = os.Lstat(n.fullPath())
 			}
 		} else {
-			fi, err = os.Lstat(n.full)
+			fi, err = os.Lstat(n.fullPath())
 		}
 		if err != nil {
 			fi = zeroFileInfo{}
@@ -936,7 +957,7 @@ func (zeroFileInfo) Sys() any           { return nil }
 
 // isDir reports whether the node is a directory, preferring d_type.
 func (n *findNode) isDir() bool {
-	if n.typ != 0 {
+	if n.typKnown {
 		return n.typ.IsDir()
 	}
 	fi := n.stat()
@@ -947,7 +968,7 @@ func (n *findNode) isDir() bool {
 // (GNU find only stats entries when it must).
 func (n *findNode) typeIs(letter string) bool {
 	m := n.typ
-	if m == 0 {
+	if !n.typKnown {
 		fi := n.stat()
 		if fi == nil {
 			return false
@@ -1143,34 +1164,58 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		switch tok {
 		case "-name":
 			pat := next()
+			hasMeta := strings.ContainsAny(pat, "*?[")
+			dotPrefix := strings.HasPrefix(pat, ".") && !hasMeta
 			return func(n *findNode, _ interp.HandlerContext) bool {
 				// GNU matches -name against the basename of the path
 				// as given ("." for the root), not the resolved name.
-				base := filepath.Base(n.full)
-				if b := pathBase(n.display); b != "" {
-					base = b
+				base := n.name
+				if base == "" {
+					if b := pathBase(n.display); b != "" {
+						base = b
+					} else {
+						base = filepath.Base(n.fullPath())
+					}
+				}
+				if !hasMeta {
+					if base == pat {
+						return true
+					}
+					if dotPrefix {
+						return strings.HasSuffix(base, pat)
+					}
+					return false
 				}
 				if ok, _ := filepath.Match(pat, base); ok {
 					return true
-				}
-				if strings.HasPrefix(pat, ".") && !strings.ContainsAny(pat, "*?[") {
-					return strings.HasSuffix(base, pat)
 				}
 				return false
 			}
 		case "-iname":
 			pat := strings.ToLower(next())
+			hasMeta := strings.ContainsAny(pat, "*?[")
+			dotPrefix := strings.HasPrefix(pat, ".") && !hasMeta
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				base := filepath.Base(n.full)
-				if b := pathBase(n.display); b != "" {
-					base = b
+				base := n.name
+				if base == "" {
+					if b := pathBase(n.display); b != "" {
+						base = b
+					} else {
+						base = filepath.Base(n.fullPath())
+					}
 				}
 				name := strings.ToLower(base)
+				if !hasMeta {
+					if name == pat {
+						return true
+					}
+					if dotPrefix {
+						return strings.HasSuffix(name, pat)
+					}
+					return false
+				}
 				if ok, _ := filepath.Match(pat, name); ok {
 					return true
-				}
-				if strings.HasPrefix(pat, ".") && !strings.ContainsAny(pat, "*?[") {
-					return strings.HasSuffix(name, pat)
 				}
 				return false
 			}
@@ -1209,7 +1254,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-empty":
 			return func(n *findNode, _ interp.HandlerContext) bool {
 				if n.isDir() {
-					entries, err := os.ReadDir(n.full)
+					entries, err := os.ReadDir(n.fullPath())
 					return err == nil && len(entries) == 0
 				}
 				return n.stat().Size() == 0
@@ -1333,10 +1378,11 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 				if n.depth == 0 && isDotOperand(n.display) {
 					return true
 				}
-				err := os.Remove(n.full)
+				fp := n.fullPath()
+				err := os.Remove(fp)
 				if err != nil && runtime.GOOS == "windows" {
-					_ = os.Chmod(n.full, 0o666)
-					err = os.Remove(n.full)
+					_ = os.Chmod(fp, 0o666)
+					err = os.Remove(fp)
 				}
 				if err != nil {
 					fmt.Fprintf(hc.Stderr, "find: cannot delete '%s': %v\n", n.display, err)
@@ -1439,10 +1485,14 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	// Buffered output when no actions run: -print is line-per-file and
 	// slow unbuffered. Actions (-exec) must interleave with output in
 	// order, so those runs stay unbuffered.
+	var outBW *bufio.Writer
 	if !hasAction {
-		bw := bufio.NewWriterSize(hc.Stdout, 256*1024)
-		hc.Stdout = bw
-		defer bw.Flush()
+		outBW = getBufWriter64K(hc.Stdout)
+		hc.Stdout = outBW
+		defer func() {
+			_ = outBW.Flush()
+			putBufWriter64K(outBW)
+		}()
 	}
 
 	opts := findWalkOpts{
@@ -1451,13 +1501,15 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		followMode: followMode,
 		depthFirst: depthFirst,
 		hasAction:  hasAction,
+		outBW:      outBW,
 	}
 	for _, p := range paths {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
+		opts.needSlash = strings.ContainsRune(p, '\\')
 		full := resolve(hc.Dir, p)
-		walkFind(ctx, hc, p, full, 0, opts, rootPred, &code, &stop, nil, nil)
+		walkFind(ctx, hc, p, full, "", "", 0, opts, rootPred, &code, &stop, nil, nil)
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -1516,9 +1568,11 @@ type findWalkOpts struct {
 	followMode int
 	depthFirst bool
 	hasAction  bool
+	needSlash  bool
+	outBW      *bufio.Writer
 }
 
-func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth int, opts findWalkOpts, pred findPredicate, code *int, stop *bool, ent os.DirEntry, ancestors []os.FileInfo) {
+func walkFind(ctx context.Context, hc interp.HandlerContext, display, full, dirFull, name string, depth int, opts findWalkOpts, pred findPredicate, code *int, stop *bool, ent os.DirEntry, ancestors []os.FileInfo) {
 	if ctx.Err() != nil || (stop != nil && *stop) {
 		return
 	}
@@ -1526,17 +1580,22 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 	node := findNode{
 		display: display,
 		full:    full,
+		dirFull: dirFull,
+		name:    name,
+		ent:     ent,
 		depth:   depth,
 		follow:  followHere,
 	}
 	if followHere {
-		if ent == nil || ent.Type()&os.ModeSymlink != 0 || ent.Type() == os.ModeIrregular {
-			sfi, serr := os.Stat(full)
+		if ent == nil || !entTypeKnown(ent.Type()) || ent.Type()&os.ModeSymlink != 0 {
+			fp := node.fullPath()
+			sfi, serr := os.Stat(fp)
 			if serr == nil {
 				node.fi = sfi
 				node.typ = sfi.Mode().Type()
+				node.typKnown = true
 			} else {
-				lfi, lerr := os.Lstat(full)
+				lfi, lerr := os.Lstat(fp)
 				if lerr != nil {
 					fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
 					*code = 1
@@ -1550,14 +1609,20 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 				}
 				node.fi = lfi
 				node.typ = lfi.Mode().Type()
+				node.typKnown = true
 			}
 		} else {
 			node.typ = ent.Type()
+			node.typKnown = true
 		}
 	} else if ent != nil {
-		node.typ = ent.Type()
+		if entTypeKnown(ent.Type()) {
+			node.typ = ent.Type()
+			node.typKnown = true
+		}
 	} else {
-		fi, err := os.Lstat(full)
+		fp := node.fullPath()
+		fi, err := os.Lstat(fp)
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
 			*code = 1
@@ -1565,13 +1630,14 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		}
 		node.fi = fi
 		node.typ = fi.Mode().Type()
+		node.typKnown = true
 	}
 
 	var dirFi os.FileInfo
 	if node.isDir() && opts.followMode != 0 {
 		dirFi = node.fi
 		if dirFi == nil {
-			if sfi, err := os.Stat(full); err == nil {
+			if sfi, err := os.Stat(node.fullPath()); err == nil {
 				dirFi = sfi
 			}
 		}
@@ -1592,10 +1658,21 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		}
 		match := pred(&node, hc)
 		if match && !opts.hasAction && (stop == nil || !*stop) {
-			if _, err := fmt.Fprintln(hc.Stdout, filepath.ToSlash(display)); err != nil {
-				if isPipeClosed(err) {
-					*stop = true
+			outDisp := display
+			if opts.needSlash {
+				outDisp = filepath.ToSlash(display)
+			}
+			var err error
+			if opts.outBW != nil {
+				_, err = opts.outBW.WriteString(outDisp)
+				if err == nil {
+					err = opts.outBW.WriteByte('\n')
 				}
+			} else {
+				_, err = fmt.Fprintln(hc.Stdout, outDisp)
+			}
+			if err != nil && isPipeClosed(err) {
+				*stop = true
 			}
 		}
 	}
@@ -1607,7 +1684,8 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		if opts.maxdepth >= 0 && depth >= opts.maxdepth {
 			return
 		}
-		entries, err := os.ReadDir(full)
+		curFull := node.fullPath()
+		entries, err := os.ReadDir(curFull)
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, err)
 			*code = 1
@@ -1617,19 +1695,18 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 		if dirFi != nil {
 			nextAncestors = append(ancestors, dirFi)
 		}
+		dispPrefix := display
+		if dispPrefix == "." {
+			dispPrefix = "./"
+		} else if !strings.HasSuffix(dispPrefix, "/") {
+			dispPrefix = dispPrefix + "/"
+		}
 		for _, e := range entries {
 			if ctx.Err() != nil || (stop != nil && *stop) {
 				return
 			}
-			subDisplay := display
-			if subDisplay == "." {
-				subDisplay = "./" + e.Name()
-			} else if strings.HasSuffix(subDisplay, "/") {
-				subDisplay = subDisplay + e.Name()
-			} else {
-				subDisplay = subDisplay + "/" + e.Name()
-			}
-			walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, opts, pred, code, stop, e, nextAncestors)
+			ename := e.Name()
+			walkFind(ctx, hc, dispPrefix+ename, "", curFull, ename, depth+1, opts, pred, code, stop, e, nextAncestors)
 		}
 	}
 
