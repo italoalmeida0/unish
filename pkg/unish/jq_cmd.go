@@ -41,7 +41,7 @@ type jqCLIOpts struct {
 var errJqPipeClosed = errors.New("jq: pipe closed")
 
 func cmdJq(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	opts, code, err := parseJqCLI(hc, args[1:])
+	opts, code, err := parseJqCLI(ctx, hc, args[1:])
 	if err != nil {
 		if isPipeClosed(err) {
 			return nil
@@ -129,7 +129,7 @@ func cmdJq(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		return nil
 	}
 
-	stream, err := newJqInputStream(hc, opts.files, opts.rawInput)
+	stream, err := newJqInputStream(ctx, hc, opts.files, opts.rawInput)
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "jq: error: %v\n", err)
 		return exitError{2}
@@ -274,7 +274,7 @@ func jqLongFlagShort(name string) byte {
 	return 0
 }
 
-func parseJqCLI(hc interp.HandlerContext, argv []string) (*jqCLIOpts, int, error) {
+func parseJqCLI(ctx context.Context, hc interp.HandlerContext, argv []string) (*jqCLIOpts, int, error) {
 	opts := &jqCLIOpts{
 		indent:    "  ",
 		namedVars: newJqObj(4),
@@ -403,7 +403,7 @@ func parseJqCLI(hc interp.HandlerContext, argv []string) (*jqCLIOpts, int, error
 				if err != nil {
 					return nil, 2, err
 				}
-				arr, err := readSlurpFile(hc, fpath)
+				arr, err := readSlurpFile(ctx, hc, fpath)
 				if err != nil {
 					return nil, 2, err
 				}
@@ -418,8 +418,8 @@ func parseJqCLI(hc interp.HandlerContext, argv []string) (*jqCLIOpts, int, error
 					return nil, 2, err
 				}
 				var data []byte
-				if fpath != "/dev/null" {
-					data, err = os.ReadFile(resolve(hc.Dir, fpath))
+				if !isNullDevPath(fpath) {
+					data, err = fsReadInputFile(ctx, hc.Dir, "jq", fpath)
 					if err != nil {
 						return nil, 2, fmt.Errorf("could not open %s: %v", fpath, err)
 					}
@@ -515,9 +515,13 @@ func parseJqCLI(hc interp.HandlerContext, argv []string) (*jqCLIOpts, int, error
 	}
 
 	if opts.hasFromFile {
-		data, err := os.ReadFile(resolve(hc.Dir, opts.fromFile))
-		if err != nil {
-			return nil, 2, fmt.Errorf("could not open filter file %s: %v", opts.fromFile, err)
+		var data []byte
+		if !isNullDevPath(opts.fromFile) {
+			var err error
+			data, err = fsReadInputFile(ctx, hc.Dir, "jq", opts.fromFile)
+			if err != nil {
+				return nil, 2, fmt.Errorf("could not open filter file %s: %v", opts.fromFile, err)
+			}
 		}
 		// Strip optional UTF-8 BOM on filter file
 		src := string(data)
@@ -542,11 +546,11 @@ func parseJqCLI(hc interp.HandlerContext, argv []string) (*jqCLIOpts, int, error
 	return opts, 0, nil
 }
 
-func readSlurpFile(hc interp.HandlerContext, fpath string) (jqVal, error) {
-	if fpath == "/dev/null" {
+func readSlurpFile(ctx context.Context, hc interp.HandlerContext, fpath string) (jqVal, error) {
+	if isNullDevPath(fpath) {
 		return jqMakeArr(nil), nil
 	}
-	f, err := os.Open(resolve(hc.Dir, fpath))
+	f, err := fsOpenInput(ctx, hc.Dir, "jq", fpath)
 	if err != nil {
 		return jqMakeNull(), fmt.Errorf("could not open %s: %v", fpath, err)
 	}
@@ -587,6 +591,7 @@ func buildJqEnvObj(hc interp.HandlerContext) jqVal {
 // --- Multi-File / Stdin Input Stream ---
 
 type jqInputStream struct {
+	ctx      context.Context
 	hc       interp.HandlerContext
 	files    []string
 	fileIdx  int
@@ -598,13 +603,16 @@ type jqInputStream struct {
 	started   bool
 }
 
-func newJqInputStream(hc interp.HandlerContext, files []string, rawInput bool) (*jqInputStream, error) {
+func newJqInputStream(ctx context.Context, hc interp.HandlerContext, files []string, rawInput bool) (*jqInputStream, error) {
 	for _, fp := range files {
-		if fp == "-" || fp == "/dev/stdin" || fp == "/dev/null" {
+		if fp == "-" || fp == "/dev/stdin" || isNullDevPath(fp) {
 			continue
 		}
-		resolved := resolve(hc.Dir, fp)
-		fi, err := os.Stat(resolved)
+		hostPath := resolveHostPath(hc.Dir, fp)
+		if st := winProcSubstLookup(hostPath); st != nil {
+			continue
+		}
+		fi, err := fsStat(ctx, hc.Dir, "jq", fp)
 		if err != nil {
 			return nil, fmt.Errorf("Could not open file %s: %v", fp, err)
 		}
@@ -613,6 +621,7 @@ func newJqInputStream(hc interp.HandlerContext, files []string, rawInput bool) (
 		}
 	}
 	return &jqInputStream{
+		ctx:      ctx,
 		hc:       hc,
 		files:    files,
 		rawInput: rawInput,
@@ -657,7 +666,7 @@ func (s *jqInputStream) advanceSource() (bool, error) {
 	s.fileIdx++
 	s.started = true
 	var r io.Reader
-	if fp == "/dev/null" {
+	if isNullDevPath(fp) {
 		r = strings.NewReader("")
 	} else if fp == "-" || fp == "/dev/stdin" {
 		r = s.hc.Stdin
@@ -665,7 +674,7 @@ func (s *jqInputStream) advanceSource() (bool, error) {
 			r = strings.NewReader("")
 		}
 	} else {
-		f, err := os.Open(resolve(s.hc.Dir, fp))
+		f, err := fsOpenInput(s.ctx, s.hc.Dir, "jq", fp)
 		if err != nil {
 			return false, fmt.Errorf("Could not open file %s: %v", fp, err)
 		}

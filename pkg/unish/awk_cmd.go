@@ -85,7 +85,7 @@ func cmdAwk(ctx context.Context, hc interp.HandlerContext, args []string) error 
 					fmt.Fprintf(hc.Stderr, "%s: option '--file' requires an argument\n", cmdName)
 					return exitError{code: 2}
 				}
-				src, err := loadAwkProgFile(hc, args[i+1])
+				src, err := loadAwkProgFile(ctx, hc, cmdName, args[i+1])
 				if err != nil {
 					fmt.Fprintf(hc.Stderr, "%s: can't open file %s: %v\n", cmdName, args[i+1], err)
 					return exitError{code: 2}
@@ -96,7 +96,7 @@ func cmdAwk(ctx context.Context, hc interp.HandlerContext, args []string) error 
 				continue
 			case strings.HasPrefix(a, "--file="):
 				fname := strings.TrimPrefix(a, "--file=")
-				src, err := loadAwkProgFile(hc, fname)
+				src, err := loadAwkProgFile(ctx, hc, cmdName, fname)
 				if err != nil {
 					fmt.Fprintf(hc.Stderr, "%s: can't open file %s: %v\n", cmdName, fname, err)
 					return exitError{code: 2}
@@ -178,7 +178,7 @@ func cmdAwk(ctx context.Context, hc interp.HandlerContext, args []string) error 
 					i++
 					fArg = args[i]
 				}
-				src, err := loadAwkProgFile(hc, fArg)
+				src, err := loadAwkProgFile(ctx, hc, cmdName, fArg)
 				if err != nil {
 					fmt.Fprintf(hc.Stderr, "%s: can't open file %s: %v\n", cmdName, fArg, err)
 					return exitError{code: 2}
@@ -279,7 +279,7 @@ func parseAwkFlagAssign(spec string) (awkInitAssign, error) {
 	}, nil
 }
 
-func loadAwkProgFile(hc interp.HandlerContext, path string) (string, error) {
+func loadAwkProgFile(ctx context.Context, hc interp.HandlerContext, cmdName, path string) (string, error) {
 	if path == "-" || path == "/dev/stdin" {
 		if hc.Stdin == nil {
 			return "", nil
@@ -287,8 +287,10 @@ func loadAwkProgFile(hc interp.HandlerContext, path string) (string, error) {
 		data, err := io.ReadAll(hc.Stdin)
 		return string(data), err
 	}
-	p := resolve(hc.Dir, path)
-	data, err := readShellFile(p)
+	if isNullDevPath(path) {
+		return "", nil
+	}
+	data, err := fsReadInputFile(ctx, hc.Dir, cmdName, path)
 	if err != nil {
 		return "", err
 	}

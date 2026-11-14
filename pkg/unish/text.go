@@ -13,7 +13,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"slices"
 	"strconv"
 	"strings"
@@ -318,7 +317,7 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 		return exitError{2}
 	}
 	for _, pf := range patternFiles {
-		data, err := readShellFile(resolve(hc.Dir, pf))
+		data, err := fsReadInputFile(ctx, hc.Dir, "grep", pf)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "grep:", err)
 			return exitError{2}
@@ -390,13 +389,19 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 	var files []string
 	matchedAny := false
 	hadError := false
+	descendedDir := false
+	grepStop := false
+	var pipeStopErr error
 	if recursive {
 		if len(rest) == 0 {
 			rest = []string{"."}
 		}
 		for _, p := range rest {
-			full := resolve(hc.Dir, p)
-			fi, e := os.Stat(full)
+			if p == "" || p == "-" || p == "/dev/stdin" {
+				files = append(files, p)
+				continue
+			}
+			fi, e := fsStat(ctx, hc.Dir, "grep", p)
 			if e != nil {
 				if !noMessages {
 					fmt.Fprintln(hc.Stderr, "grep:", e)
@@ -405,50 +410,111 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 				continue
 			}
 			if fi.IsDir() {
-				filepath.Walk(full, func(path string, info os.FileInfo, e error) error {
-					if e != nil {
-						return nil
+				descendedDir = true
+				baseRoot := filepath.Base(resolveHostPath(hc.Dir, p))
+				skipRoot := false
+				for _, xd := range excludeDirs {
+					if strings.Contains(".", xd) || baseRoot == xd {
+						skipRoot = true
+						break
 					}
-					rel, _ := filepath.Rel(full, path)
-					if info.IsDir() {
-						for _, xd := range excludeDirs {
-							if strings.Contains(rel, xd) || filepath.Base(path) == xd {
-								return filepath.SkipDir
+				}
+				if skipRoot {
+					continue
+				}
+				var walkGrepDir func(rel string)
+				walkGrepDir = func(rel string) {
+					if ctx.Err() != nil {
+						return
+					}
+					curRaw := p
+					if rel != "" && rel != "." {
+						curRaw = filepath.Join(p, rel)
+					}
+					entries, derr := fsReadDir(ctx, hc.Dir, "grep", curRaw)
+					if derr != nil {
+						if errors.Is(derr, os.ErrPermission) {
+							if !noMessages {
+								fmt.Fprintln(hc.Stderr, "grep:", derr)
+							}
+							hadError = true
+						}
+						return
+					}
+					for _, entry := range entries {
+						if ctx.Err() != nil {
+							return
+						}
+						name := entry.Name()
+						relChild := name
+						if rel != "" && rel != "." {
+							relChild = filepath.Join(rel, name)
+						}
+						if entry.IsDir() {
+							skipSub := false
+							for _, xd := range excludeDirs {
+								if strings.Contains(relChild, xd) || name == xd {
+									skipSub = true
+									break
+								}
+							}
+							if !skipSub {
+								walkGrepDir(relChild)
+							}
+							continue
+						}
+						if entry.Type()&os.ModeSymlink != 0 {
+							childRaw := filepath.Join(p, relChild)
+							sfi, serr := fsStat(ctx, hc.Dir, "grep", childRaw)
+							if serr != nil {
+								if errors.Is(serr, os.ErrPermission) {
+									if !noMessages {
+										fmt.Fprintln(hc.Stderr, "grep:", serr)
+									}
+									hadError = true
+								}
+								continue
+							}
+							if sfi.IsDir() {
+								continue
 							}
 						}
-						return nil
-					}
-					base := filepath.Base(path)
-					for _, x := range excludes {
-						if ok, _ := filepath.Match(x, base); ok {
-							return nil
-						}
-					}
-					if len(includes) > 0 {
-						hit := false
-						for _, in := range includes {
-							if ok, _ := filepath.Match(in, base); ok {
-								hit = true
+						excluded := false
+						for _, x := range excludes {
+							if ok, _ := filepath.Match(x, name); ok {
+								excluded = true
 								break
 							}
-							if strings.HasPrefix(in, ".") && strings.HasSuffix(base, in) {
-								hit = true
-								break
+						}
+						if excluded {
+							continue
+						}
+						if len(includes) > 0 {
+							hit := false
+							for _, in := range includes {
+								if ok, _ := filepath.Match(in, name); ok {
+									hit = true
+									break
+								}
+								if strings.HasPrefix(in, ".") && strings.HasSuffix(name, in) {
+									hit = true
+									break
+								}
+							}
+							if !hit {
+								continue
 							}
 						}
-						if !hit {
-							return nil
+						displayPath := ""
+						if p == "." {
+							displayPath = "./" + filepath.ToSlash(relChild)
+						} else {
+							displayPath = filepath.ToSlash(filepath.Join(p, relChild))
 						}
+						files = append(files, displayPath)
 					}
-					displayPath := ""
-					if p == "." {
-						displayPath = "./" + filepath.ToSlash(rel)
-					} else {
-						displayPath = filepath.ToSlash(filepath.Join(p, rel))
-					}
-					files = append(files, displayPath)
-					return nil
-				})
+				}
+				walkGrepDir("")
 			} else {
 				files = append(files, p)
 			}
@@ -460,20 +526,6 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 	// GNU shows filenames only with multiple files or when actually
 	// descending into a directory (-r with a FILE operand behaves like a
 	// direct file search: no filename prefix).
-	descendedDir := false
-	grepStop := false
-	var pipeStopErr error
-	if recursive {
-		for _, f := range rest {
-			if f == "" || f == "-" {
-				continue
-			}
-			if fi, err := os.Stat(resolve(hc.Dir, f)); err == nil && fi.IsDir() {
-				descendedDir = true
-				break
-			}
-		}
-	}
 	showName := (len(files) > 1 || descendedDir) && !noName
 	if withName {
 		showName = true
@@ -576,7 +628,7 @@ func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error
 				emit("", hc.Stdin)
 				continue
 			}
-			fh, e := openShellFile(resolve(hc.Dir, f))
+			fh, e := fsOpenInput(ctx, hc.Dir, "grep", f)
 			if e != nil {
 				if !noMessages {
 					fmt.Fprintln(hc.Stderr, "grep:", e)
@@ -1330,7 +1382,7 @@ func cmdHead(ctx context.Context, hc interp.HandlerContext, args []string) error
 		}
 	}
 	files := fs.Args()
-	readers, names, closeAll, err := openInputs(hc.Dir, files, hc.Stdin)
+	readers, names, closeAll, err := openInputs(ctx, "head", hc.Dir, files, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "head:", err)
 		return exitError{1}
@@ -1564,7 +1616,7 @@ func cmdTail(ctx context.Context, hc interp.HandlerContext, args []string) error
 			n = v
 		}
 	}
-	readers, names, closeAll, err := openInputs(hc.Dir, files, hc.Stdin)
+	readers, names, closeAll, err := openInputs(ctx, "tail", hc.Dir, files, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tail:", err)
 		return exitError{1}
@@ -1698,7 +1750,7 @@ func cmdTail(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return nil
 }
 
-func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdSort(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("sort", hc.Stderr)
 	var keyFlagVals sortKeyFlagList
 	fs.Var(&keyFlagVals, "k", "")
@@ -1789,7 +1841,7 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if len(cfg.specs) == 0 {
 		cfg.specs = []sortKeySpec{{}} // implicit whole-line key
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "sort", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "sort:", err)
 		return exitError{1}
@@ -1807,8 +1859,7 @@ func cmdSort(_ context.Context, hc interp.HandlerContext, args []string) error {
 
 	openSortOut := func() (*bufio.Writer, *os.File, error) {
 		if *outFile != "" {
-			p := resolve(hc.Dir, *outFile)
-			f, err := os.OpenFile(p, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+			f, err := fsOpenFile(ctx, hc.Dir, "sort", *outFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "sort:", err)
 				return nil, nil, exitError{1}
@@ -3708,7 +3759,7 @@ func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error
 	if in != "" {
 		inputs = []string{in}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, inputs, hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "uniq", hc.Dir, inputs, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "uniq:", err)
 		return exitError{1}
@@ -3716,7 +3767,7 @@ func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error
 	defer closeAll()
 	w := io.Writer(hc.Stdout)
 	if out != "" {
-		f, e := os.Create(resolve(hc.Dir, out))
+		f, e := fsCreate(ctx, hc.Dir, "uniq", out)
 		if e != nil {
 			fmt.Fprintln(hc.Stderr, "uniq:", e)
 			return exitError{1}
@@ -3920,7 +3971,7 @@ func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		*lines, *words, *bytes_ = true, true, true
 	}
 	files := fs.Args()
-	readers, names, closeAll, err := openInputs(hc.Dir, files, hc.Stdin)
+	readers, names, closeAll, err := openInputs(ctx, "wc", hc.Dir, files, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "wc:", err)
 		return exitError{1}
@@ -3937,7 +3988,7 @@ func cmdWc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			if fi, ok := readerRegularStat(readers[k]); ok {
 				isReg[k] = true
 				regInfo[k] = fi
-			} else if fi, err := os.Stat(resolve(hc.Dir, files[k])); err == nil && fi.Mode().IsRegular() {
+			} else if fi, err := fsStat(ctx, hc.Dir, "wc", files[k]); err == nil && fi.Mode().IsRegular() {
 				isReg[k] = true
 				regInfo[k] = fi
 			}
@@ -4337,16 +4388,7 @@ func cmdTee(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		} else {
 			fl |= os.O_TRUNC
 		}
-		// /dev/null is a POSIX device that does not exist on Windows:
-		// resolve() would turn it into a relative path. Map it to NUL
-		// (and drop O_TRUNC, which NUL rejects), like the shell's own
-		// open handler does for redirections.
-		path := resolve(hc.Dir, f)
-		if runtime.GOOS == "windows" && (f == "/dev/null" || path == "/dev/null") {
-			path = "NUL"
-			fl &^= os.O_TRUNC
-		}
-		fh, err := os.OpenFile(path, fl, 0644)
+		fh, err := fsOpenOutput(ctx, hc.Dir, "tee", f, fl, 0o644)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "tee:", err)
 			return exitError{1}
@@ -5126,7 +5168,7 @@ func cmdCut(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	if *outDelim != "" {
 		joiner = *outDelim
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "cut", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "cut:", err)
 		return exitError{1}
@@ -5356,7 +5398,7 @@ func cmdCutChars(ctx context.Context, hc interp.HandlerContext, list string, fil
 		}
 		return sel
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, files, hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "cut", hc.Dir, files, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "cut:", err)
 		return exitError{1}
@@ -5477,7 +5519,7 @@ func cmdPaste(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			srcs = append(srcs, stdinSC)
 			continue
 		}
-		fh, err := openShellFile(resolve(hc.Dir, f))
+		fh, err := fsOpenInput(ctx, hc.Dir, "paste", f)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "paste:", err)
 			return exitError{1}
@@ -5550,7 +5592,7 @@ func cmdPaste(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	return nil
 }
 
-func cmdComm(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdComm(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("comm", hc.Stderr)
 	sup1 := fs.Bool("1", false, "")
 	sup2 := fs.Bool("2", false, "")
@@ -5566,7 +5608,7 @@ func cmdComm(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "comm: need 2 files")
 		return flag.ErrHelp
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, files, hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "comm", hc.Dir, files, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "comm:", err)
 		return exitError{1}
@@ -5638,7 +5680,7 @@ func cmdComm(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdSplit(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("split", hc.Stderr)
 	lines := fs.Uint64("l", 1000, "")
 	sufLen := fs.Uint64("a", 2, "")
@@ -5654,7 +5696,7 @@ func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error 
 		return err
 	}
 	if *number != "" {
-		return splitByNumber(hc, *number, fs.Args())
+		return splitByNumber(ctx, hc, *number, fs.Args())
 	}
 	var byteCount int64 = -1
 	if *byteStr != "" {
@@ -5678,7 +5720,7 @@ func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error 
 	if in != "" {
 		inputs = []string{in}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, inputs, hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "split", hc.Dir, inputs, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "split:", err)
 		return exitError{1}
@@ -5707,8 +5749,7 @@ func cmdSplit(_ context.Context, hc interp.HandlerContext, args []string) error 
 	defer closeOut()
 	newPart := func() error {
 		closeOut()
-		p := resolve(hc.Dir, prefix+suffix(part))
-		f, e := os.Create(p)
+		f, e := fsCreate(ctx, hc.Dir, "split", prefix+suffix(part))
 		if e != nil {
 			fmt.Fprintln(hc.Stderr, "split:", e)
 			return e
@@ -5828,7 +5869,7 @@ func cmdDiff(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 			return stdinData, nil
 		}
-		return readShellFile(resolve(hc.Dir, name))
+		return fsReadInputFile(ctx, hc.Dir, "diff", name)
 	}
 	ra, err := readOne(files[0])
 	if err != nil {
@@ -5882,7 +5923,7 @@ func cmdDiff(ctx context.Context, hc interp.HandlerContext, args []string) error
 		ops = append(ops, diffOp{'=', a[i]})
 	}
 	if *unified {
-		emitUnified(hc, files, a, b, ops, labels)
+		emitUnified(ctx, hc, files, a, b, ops, labels)
 		return exitError{1}
 	}
 	la, lb := 0, 0
@@ -6121,7 +6162,7 @@ func myersDiffOps(ctx context.Context, a, b []string, maxEditDist int) ([]diffOp
 	return rev, nil
 }
 
-func emitUnified(hc interp.HandlerContext, files []string, a, b []string, ops []diffOp, labels []string) {
+func emitUnified(ctx context.Context, hc interp.HandlerContext, files []string, a, b []string, ops []diffOp, labels []string) {
 	_ = a
 	_ = b
 	la0, lb0 := files[0], files[1]
@@ -6136,14 +6177,14 @@ func emitUnified(hc interp.HandlerContext, files []string, a, b []string, ops []
 		fmt.Fprintf(hc.Stdout, "--- %s\n", la0)
 		fmt.Fprintf(hc.Stdout, "+++ %s\n", lb0)
 	} else {
-		fmt.Fprintf(hc.Stdout, "--- %s\t%s\n", la0, fileTime(files[0]))
-		fmt.Fprintf(hc.Stdout, "+++ %s\t%s\n", lb0, fileTime(files[1]))
+		fmt.Fprintf(hc.Stdout, "--- %s\t%s\n", la0, fileTime(ctx, hc.Dir, files[0]))
+		fmt.Fprintf(hc.Stdout, "+++ %s\t%s\n", lb0, fileTime(ctx, hc.Dir, files[1]))
 	}
-	const ctx = 3
+	const ctxLines = 3
 	changed := make([]bool, len(ops))
 	for k, o := range ops {
 		if o.kind != '=' {
-			for d := -ctx; d <= ctx; d++ {
+			for d := -ctxLines; d <= ctxLines; d++ {
 				if k+d >= 0 && k+d < len(ops) {
 					changed[k+d] = true
 				}
@@ -6201,14 +6242,17 @@ func hunkRange(start, count int) string {
 	return itoa(start) + "," + itoa(count)
 }
 
-func fileTime(path string) string {
-	if fi, err := os.Stat(path); err == nil {
+func fileTime(ctx context.Context, dir, path string) string {
+	if path == "-" || path == "/dev/stdin" {
+		return ""
+	}
+	if fi, err := fsStat(ctx, dir, "diff", path); err == nil {
 		return fi.ModTime().Format("2006-01-02 15:04:05.000000000 -0700")
 	}
 	return ""
 }
 
-func cmdCmp(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdCmp(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("cmp", hc.Stderr)
 	silent := fs.Bool("s", false, "")
 	listAll := fs.Bool("l", false, "")
@@ -6221,13 +6265,19 @@ func cmdCmp(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "cmp: missing operand")
 		return flag.ErrHelp
 	}
-	fa, err := openShellFile(resolve(hc.Dir, files[0]))
+	openCmp := func(name string) (io.ReadCloser, error) {
+		if name == "-" || name == "/dev/stdin" {
+			return io.NopCloser(hc.Stdin), nil
+		}
+		return fsOpenInput(ctx, hc.Dir, "cmp", name)
+	}
+	fa, err := openCmp(files[0])
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "cmp:", err)
 		return exitError{2}
 	}
 	defer fa.Close()
-	fb, err := openShellFile(resolve(hc.Dir, files[1]))
+	fb, err := openCmp(files[1])
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "cmp:", err)
 		return exitError{2}
@@ -6324,7 +6374,7 @@ func cmdHexdump(ctx context.Context, hc interp.HandlerContext, args []string) er
 		return err
 	}
 	_ = verbose // -v: no line suppression in our output anyway; accept for parity.
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "hexdump", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "hexdump:", err)
 		return exitError{1}
@@ -6474,7 +6524,7 @@ func cmdStrings(ctx context.Context, hc interp.HandlerContext, args []string) er
 	if *offsetFmt != "" {
 		showOff = *offsetFmt
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "strings", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "strings:", err)
 		return exitError{1}
@@ -6572,7 +6622,7 @@ func formatOffset(off int, radix string) string {
 	}
 }
 
-func splitByNumber(hc interp.HandlerContext, spec string, rest []string) error {
+func splitByNumber(ctx context.Context, hc interp.HandlerContext, spec string, rest []string) error {
 	// GNU split -n CHUNKS: N | l/N | r/N (+ K/N variants to stdout).
 	// We implement N, l/N, r/N (write N files, round-robin for r/).
 	var in string
@@ -6587,7 +6637,7 @@ func splitByNumber(hc interp.HandlerContext, spec string, rest []string) error {
 	if in != "" {
 		inputs = []string{in}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, inputs, hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "split", hc.Dir, inputs, hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "split:", err)
 		return exitError{1}
@@ -6651,8 +6701,7 @@ func splitByNumber(hc interp.HandlerContext, spec string, rest []string) error {
 		}
 	}
 	for i, chunk := range outs {
-		p := resolve(hc.Dir, prefix+splitSuffixDefault(i))
-		f, err := openFileRetry(p, 577, 0644)
+		f, err := fsOpenFile(ctx, hc.Dir, "split", prefix+splitSuffixDefault(i), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o644)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "split:", err)
 			return exitError{1}

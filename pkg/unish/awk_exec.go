@@ -11,7 +11,6 @@ import (
 	"math/rand"
 	"os"
 	"regexp"
-	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -495,6 +494,9 @@ func runAwkShellCmd(ctx context.Context, hc interp.HandlerContext, cmd string, s
 		interp.StdIO(stdin, stdout, stderr),
 		interp.CallHandler(callOverride),
 		interp.OpenHandler(shellOpenHandler()),
+		interp.ReadDirHandler2(shellReadDirHandler()),
+		interp.StatHandler(shellStatHandler()),
+		interp.AccessHandler(shellAccessHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
@@ -1802,13 +1804,12 @@ func (vm *awkVM) getInFile(name string) (*awkRecordReader, error) {
 		vm.inFiles[name] = rr
 		return rr, nil
 	}
-	if name == "/dev/null" {
+	if isNullDevPath(name) {
 		rr := newAwkRecordReader(strings.NewReader(""), nil)
 		vm.inFiles[name] = rr
 		return rr, nil
 	}
-	p := resolve(vm.hc.Dir, name)
-	f, err := openShellFile(p)
+	f, err := fsOpenInput(vm.ctx, vm.hc.Dir, "awk", name)
 	if err != nil {
 		return nil, err
 	}
@@ -1827,20 +1828,13 @@ func (vm *awkVM) getOutStream(name string, appendMode bool) (*bufio.Writer, io.W
 	if out, ok := vm.outFiles[name]; ok {
 		return out.bw, nil, nil
 	}
-	var path string
 	flags := os.O_WRONLY | os.O_CREATE
 	if appendMode {
 		flags |= os.O_APPEND
 	} else {
 		flags |= os.O_TRUNC
 	}
-	if runtime.GOOS == "windows" && name == "/dev/null" {
-		path = "NUL"
-		flags &^= os.O_TRUNC
-	} else {
-		path = resolve(vm.hc.Dir, name)
-	}
-	f, err := os.OpenFile(path, flags, 0o666)
+	f, err := fsOpenOutput(vm.ctx, vm.hc.Dir, "awk", name, flags, 0o666)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2292,12 +2286,11 @@ func (vm *awkVM) processInputSource(arg string) error {
 		} else {
 			vm.filename = arg
 		}
-	} else if arg == "/dev/null" {
+	} else if isNullDevPath(arg) {
 		rr = newAwkRecordReader(strings.NewReader(""), nil)
 		vm.filename = arg
 	} else {
-		p := resolve(vm.hc.Dir, arg)
-		f, err := openShellFile(p)
+		f, err := fsOpenInput(vm.ctx, vm.hc.Dir, "awk", arg)
 		if err != nil {
 			fmt.Fprintf(vm.hc.Stderr, "awk: can't open file %s: %v\n", arg, err)
 			return exitError{code: 2}

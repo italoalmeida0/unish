@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -177,7 +179,7 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		src.WriteString("\n")
 	}
 	for _, f := range files {
-		data, err := os.ReadFile(resolvePath(hc, f))
+		data, err := fsReadInputFile(ctx, hc.Dir, "sed", f)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "sed:", err)
 			return exitError{1}
@@ -763,7 +765,7 @@ func (s *sedStream) nextRaw() (string, bool, bool) {
 			s.lr = newLineReader(rd)
 			continue
 		}
-		f, err := openShellFile(resolvePath(s.hc, in))
+		f, err := fsOpenInput(s.ctx, s.hc.Dir, "sed", in)
 		if err != nil {
 			fmt.Fprintln(s.hc.Stderr, "sed:", err)
 			s.openErr = true
@@ -1225,7 +1227,7 @@ func (r *sedRunner) exec(c *sedCmd) int {
 		r.maybeFlush()
 		return jumpToEnd
 	case 'r':
-		if data, err := os.ReadFile(resolvePath(r.hc, c.arg)); err == nil {
+		if data, err := fsReadFile(r.ctx, r.hc.Dir, "sed", c.arg); err == nil {
 			r.pending = append(r.pending, pendingOut{data: string(data), after: true})
 		}
 	case 'w':
@@ -1256,20 +1258,17 @@ func (r *sedRunner) wfile(name string) *os.File {
 	if f, ok := r.wfiles[name]; ok {
 		return f
 	}
-	f, err := os.Create(resolvePath(r.hc, name))
+	f, err := fsOpenFile(r.ctx, r.hc.Dir, "sed", name, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o666)
 	if err != nil {
 		fmt.Fprintln(r.hc.Stderr, "sed:", err)
+		if r.exitCode == 0 {
+			r.exitCode = 1
+		}
+		r.quit = true
 		return nil
 	}
 	r.wfiles[name] = f
 	return f
-}
-
-func resolvePath(hc interp.HandlerContext, p string) string {
-	if p == "" {
-		return p
-	}
-	return resolve(hc.Dir, p)
 }
 
 func (r *sedRunner) doSub(sub *sedSub) {
@@ -1674,7 +1673,7 @@ func sedTryFastStream(ctx context.Context, hc interp.HandlerContext, prog []*sed
 					}
 					continue
 				}
-				f, err := openShellFile(resolvePath(hc, in))
+				f, err := fsOpenInput(ctx, hc.Dir, "sed", in)
 				if err != nil {
 					fmt.Fprintln(hc.Stderr, "sed:", err)
 					openErr = true
@@ -1812,7 +1811,7 @@ func sedTryFastStream(ctx context.Context, hc interp.HandlerContext, prog []*sed
 				}
 				continue
 			}
-			f, err := openShellFile(resolvePath(hc, in))
+			f, err := fsOpenInput(ctx, hc.Dir, "sed", in)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "sed:", err)
 				openErr = true
@@ -2058,12 +2057,26 @@ func sedInplace(ctx context.Context, hc interp.HandlerContext, prog []*sedCmd, q
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		full := resolvePath(hc, in)
-		perm := os.FileMode(0o644)
-		if fi, err := os.Stat(full); err == nil {
-			perm = fi.Mode().Perm()
+		lfi, err := fsLstat(ctx, hc.Dir, "sed", in)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "sed:", err)
+			code = 1
+			continue
 		}
-		data, err := os.ReadFile(full)
+		inFile, err := fsOpen(ctx, hc.Dir, "sed", in)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "sed:", err)
+			code = 1
+			continue
+		}
+		perm := os.FileMode(0o644)
+		if fi, serr := inFile.Stat(); serr == nil {
+			perm = fi.Mode().Perm()
+		} else {
+			perm = lfi.Mode().Perm()
+		}
+		data, err := io.ReadAll(inFile)
+		inFile.Close()
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "sed:", err)
 			code = 1
@@ -2089,15 +2102,48 @@ func sedInplace(ctx context.Context, hc interp.HandlerContext, prog []*sedCmd, q
 		if r.exitCode != 0 && code == 0 {
 			code = r.exitCode
 		}
+		if _, err := checkFS(ctx, hc.Dir, "sed", in, OpWrite); err != nil {
+			fmt.Fprintln(hc.Stderr, "sed:", err)
+			code = 1
+			continue
+		}
 		if suffix != "" {
-			if err := os.WriteFile(full+suffix, data, perm); err != nil {
+			if err := fsWriteFile(ctx, hc.Dir, "sed", in+suffix, data, perm); err != nil {
 				fmt.Fprintln(hc.Stderr, "sed:", err)
 				code = 1
 				continue
 			}
 		}
-		if err := os.WriteFile(full, []byte(out.String()), perm); err != nil {
+		outBytes := []byte(out.String())
+		targetDir := filepath.Dir(in)
+		tf, err := fsCreateTemp(ctx, hc.Dir, "sed", targetDir, ".sed-*")
+		if err != nil {
 			fmt.Fprintln(hc.Stderr, "sed:", err)
+			code = 1
+			continue
+		}
+		tmpPath := tf.Name()
+		_, werr := tf.Write(outBytes)
+		cerr := tf.Close()
+		if werr != nil || cerr != nil {
+			_ = fsRemove(ctx, hc.Dir, "sed", tmpPath)
+			if werr != nil {
+				fmt.Fprintln(hc.Stderr, "sed:", werr)
+			} else {
+				fmt.Fprintln(hc.Stderr, "sed:", cerr)
+			}
+			code = 1
+			continue
+		}
+		_ = fsChmod(ctx, hc.Dir, "sed", tmpPath, perm)
+		if rerr := fsRename(ctx, hc.Dir, "sed", tmpPath, in); rerr != nil {
+			_ = fsRemove(ctx, hc.Dir, "sed", tmpPath)
+			if lfi.Mode()&os.ModeSymlink == 0 && !errors.Is(rerr, os.ErrPermission) {
+				if ferr := fsWriteFile(ctx, hc.Dir, "sed", in, outBytes, perm); ferr == nil {
+					continue
+				}
+			}
+			fmt.Fprintln(hc.Stderr, "sed:", rerr)
 			code = 1
 		}
 	}

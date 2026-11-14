@@ -175,7 +175,7 @@ func cmdOd(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			}
 		}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "od", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "od:", err)
 		return exitError{1}
@@ -508,7 +508,7 @@ func cmdNl(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			return !blank
 		}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "nl", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "nl:", err)
 		return exitError{1}
@@ -565,7 +565,7 @@ func cmdTac(ctx context.Context, hc interp.HandlerContext, args []string) error 
 			return exitError{1}
 		}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "tac", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tac:", err)
 		return exitError{1}
@@ -648,7 +648,7 @@ func cmdRev(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "rev", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "rev:", err)
 		return exitError{1}
@@ -731,7 +731,7 @@ func cmdFold(ctx context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintln(hc.Stderr, "fold: invalid width")
 		return exitError{1}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "fold", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "fold:", err)
 		return exitError{1}
@@ -886,7 +886,7 @@ func cmdExpand(ctx context.Context, hc interp.HandlerContext, args []string) err
 		fmt.Fprintln(hc.Stderr, "expand:", err)
 		return exitError{1}
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "expand", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "expand:", err)
 		return exitError{1}
@@ -955,7 +955,7 @@ func cmdUnexpand(ctx context.Context, hc interp.HandlerContext, args []string) e
 	}
 	// GNU default: convert only LEADING blank runs; -a converts all.
 	convertAll := *all
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "unexpand", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "unexpand:", err)
 		return exitError{1}
@@ -1033,7 +1033,7 @@ func cmdUnexpand(ctx context.Context, hc interp.HandlerContext, args []string) e
 	return nil
 }
 
-func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdJoin(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("join", hc.Stderr)
 	f1 := fs.Uint64("1", 1, "")
 	f2 := fs.Uint64("2", 1, "")
@@ -1139,8 +1139,7 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 			}
 			return rows, sc.Err()
 		}
-		p := resolve(hc.Dir, path)
-		f, err := openShellFile(p)
+		f, err := fsOpenInput(ctx, hc.Dir, "join", path)
 		if err != nil {
 			return nil, err
 		}

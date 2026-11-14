@@ -21,6 +21,7 @@ import (
 	"golang.org/x/term"
 	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 type exitError struct{ code int }
@@ -303,7 +304,13 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	if err != nil {
 		return nil, false
 	}
-	cmd := exec.CommandContext(ctx, path, args[1:]...)
+	checkedBin, err := checkExec(ctx, args[0], path, args, hc.Dir)
+	if err != nil {
+		hc.ReportBgStart(0)
+		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+		return interp.NewExitStatus(126), true
+	}
+	cmd := exec.CommandContext(ctx, checkedBin, args[1:]...)
 	cmd.Dir = hc.Dir
 	cmd.Stdin = hc.Stdin
 	cmd.Stdout = hc.Stdout
@@ -313,6 +320,11 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	afterStart, afterWait := interp.PrepareExecStdio(cmd)
 	if err := cmd.Start(); err != nil {
 		afterWait()
+		if CapabilityHookFromContext(ctx) != nil {
+			hc.ReportBgStart(0)
+			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
+			return interp.NewExitStatus(126), true
+		}
 		return nil, false
 	}
 	afterStart()
@@ -568,7 +580,10 @@ func isOverriddenCall(name string) bool {
 	case 't':
 		return name == "test" || name == "type"
 	case 'p':
-		return name == "printf"
+		if name == "printf" {
+			return true
+		}
+		return hasActiveCapabilityHooks.Load() && (name == "pushd" || name == "popd")
 	case 'u':
 		return name == "umask" || name == "ulimit"
 	case 'k':
@@ -579,8 +594,111 @@ func isOverriddenCall(name string) bool {
 		return name == "jobs"
 	case 'w':
 		return name == "wait"
+	case 'c':
+		return hasActiveCapabilityHooks.Load() && (name == "cd" || name == "command")
+	case 'b':
+		return hasActiveCapabilityHooks.Load() && name == "builtin"
 	}
 	return false
+}
+
+func checkJailedDirBuiltin(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	switch args[0] {
+	case "cd":
+		physical := false
+		hadFlags := false
+		i := 1
+		for i < len(args) {
+			a := args[i]
+			if a == "--" {
+				hadFlags = true
+				i++
+				break
+			}
+			if len(a) < 2 || a[0] != '-' {
+				break
+			}
+			validFlags := true
+			pFlag := physical
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 'L':
+					pFlag = false
+				case 'P':
+					pFlag = true
+				case 'e', '@':
+				default:
+					validFlags = false
+				}
+			}
+			if !validFlags {
+				break
+			}
+			physical = pFlag
+			hadFlags = true
+			i++
+		}
+		rest := args[i:]
+		if len(rest) > 1 {
+			return args, nil
+		}
+		var target string
+		if len(rest) == 0 {
+			target = hc.Env.Get("HOME").String()
+		} else if rest[0] == "-" {
+			target = hc.Env.Get("OLDPWD").String()
+		} else {
+			target = rest[0]
+		}
+		if target == "" {
+			if hadFlags {
+				return append([]string{"cd"}, rest...), nil
+			}
+			return args, nil
+		}
+		checkedDir, err := checkChdir(ctx, hc.Dir, "cd", target)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "cd: %v\n", err)
+			return nil, interp.CallHandled(1)
+		}
+		if physical && (len(rest) == 0 || rest[0] != "-") {
+			return []string{"cd", checkedDir}, nil
+		}
+		if len(rest) == 1 && rest[0] != "-" && runtime.GOOS == "windows" && isRawAbsOrMSYS(rest[0]) {
+			return []string{"cd", resolveHostPath(hc.Dir, rest[0])}, nil
+		}
+		if hadFlags {
+			return append([]string{"cd"}, rest...), nil
+		}
+		return args, nil
+
+	case "pushd":
+		noChange := false
+		i := 1
+		if i < len(args) && args[i] == "-n" {
+			noChange = true
+			i++
+		}
+		if i < len(args) && args[i] == "--" {
+			i++
+		}
+		rest := args[i:]
+		if len(rest) == 1 && rest[0] != "" {
+			if _, err := checkChdir(ctx, hc.Dir, "pushd", rest[0]); err != nil {
+				fmt.Fprintf(hc.Stderr, "pushd: %v\n", err)
+				return nil, interp.CallHandled(1)
+			}
+			if runtime.GOOS == "windows" && isRawAbsOrMSYS(rest[0]) {
+				resolved := resolveHostPath(hc.Dir, rest[0])
+				if noChange {
+					return []string{"pushd", "-n", resolved}, nil
+				}
+				return []string{"pushd", resolved}, nil
+			}
+		}
+		return args, nil
+	}
+	return args, nil
 }
 
 func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
@@ -591,7 +709,7 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 	case "test", "[":
 		// Own GNU test implementation: the /dev/null family always
 		// exists (Windows has no such nodes) and diagnostics match GNU.
-		switch err := runTest(hc, args); {
+		switch err := runTestCtx(ctx, hc, args); {
 		case err == nil:
 			return nil, interp.CallHandled(0)
 		case err == errTestFalse || errors.Is(err, errTestFalse):
@@ -599,6 +717,108 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		default:
 			return nil, interp.CallHandled(2)
 		}
+	case "cd", "pushd", "popd":
+		if CapabilityHookFromContext(ctx) == nil {
+			return args, nil
+		}
+		return checkJailedDirBuiltin(ctx, hc, args)
+	case "builtin":
+		if CapabilityHookFromContext(ctx) == nil || len(args) < 2 {
+			return args, nil
+		}
+		if !interp.IsBuiltin(args[1]) {
+			return args, nil
+		}
+		sub := args[1:]
+		if isOverriddenCall(sub[0]) {
+			replaced, err := fastCallOverride(ctx, hc, sub)
+			if err != nil {
+				return nil, err
+			}
+			if len(replaced) != len(sub) || (len(replaced) > 0 && &replaced[0] != &sub[0]) {
+				return append([]string{"builtin"}, replaced...), nil
+			}
+		}
+		return args, nil
+	case "command":
+		if CapabilityHookFromContext(ctx) == nil || len(args) < 2 {
+			return args, nil
+		}
+		show := false
+		i := 1
+		for i < len(args) {
+			a := args[i]
+			if a == "--" {
+				i++
+				break
+			}
+			if len(a) < 2 || a[0] != '-' {
+				break
+			}
+			for j := 1; j < len(a); j++ {
+				if a[j] == 'v' || a[j] == 'V' {
+					show = true
+				}
+			}
+			i++
+		}
+		if i >= len(args) {
+			return args, nil
+		}
+		if show {
+			// Gate slash-containing path probes (e.g. `command -v /outside/bin`).
+			allOK := true
+			printed := false
+			hasSlash := false
+			for _, q := range args[i:] {
+				if strings.ContainsAny(q, `/\`) {
+					hasSlash = true
+					break
+				}
+			}
+			if !hasSlash {
+				return args, nil
+			}
+			for _, q := range args[i:] {
+				if strings.ContainsAny(q, `/\`) {
+					if fi, err := fsStat(ctx, hc.Dir, "command", q); err == nil && !fi.IsDir() && (runtime.GOOS == "windows" || fi.Mode()&0o111 != 0) {
+						fmt.Fprintln(hc.Stdout, resolveHostPath(hc.Dir, q))
+						printed = true
+					} else {
+						allOK = false
+					}
+					continue
+				}
+				if hc.HasFunc(q) || interp.IsBuiltin(q) || lookupExtra(q) != nil {
+					fmt.Fprintln(hc.Stdout, q)
+					printed = true
+				} else if p, err := findExecCtx(ctx, hc, q); err == nil {
+					fmt.Fprintln(hc.Stdout, p)
+					printed = true
+				} else {
+					allOK = false
+				}
+			}
+			_ = printed
+			if !allOK {
+				return nil, interp.CallHandled(1)
+			}
+			return nil, interp.CallHandled(0)
+		}
+		sub := args[i:]
+		if interp.IsBuiltin(sub[0]) && isOverriddenCall(sub[0]) {
+			replaced, err := fastCallOverride(ctx, hc, sub)
+			if err != nil {
+				return nil, err
+			}
+			if len(replaced) != len(sub) || (len(replaced) > 0 && &replaced[0] != &sub[0]) {
+				out := make([]string, 0, i+len(replaced))
+				out = append(out, args[:i]...)
+				out = append(out, replaced...)
+				return out, nil
+			}
+		}
+		return args, nil
 	case "printf":
 		// Bypass mvdan/sh's printf (no precision specs like %.0s).
 		if err := cmdPrintf(ctx, hc, args); err != nil {
@@ -918,26 +1138,80 @@ func shellGetenv(hc interp.HandlerContext, key string) string {
 	return os.Getenv(key)
 }
 
-// shellOpenHandler is mvdan/sh's DefaultOpenHandler with self-contained
-// MSYS translation: redirections (>, >>, <) and internals that open files
-// go through here, so `/tmp/x`, `/c/...` work in redirections.
-// Keeps the /dev/null -> NUL workaround from the default handler.
+// shellOpenHandler is mvdan/sh's OpenHandler with self-contained MSYS
+// translation, hc.Dir resolution, and capability enforcement: redirections
+// (>, >>, <, <>, exec 3>file) and sourced scripts go through here.
+// Keeps the zero-syscall sharedDevNull fast-path for write-only /dev/null.
 func shellOpenHandlerFn(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
 	if isWriteOnlyDevNull(path, flag) {
 		return sharedDevNull, nil
 	}
 	mc := interp.HandlerCtx(ctx)
-	if runtime.GOOS == "windows" && path == "/dev/null" {
-		path = "NUL"
-		flag &^= os.O_TRUNC
-	} else if path != "" {
-		path = resolve(mc.Dir, path)
+	f, err := fsOpenFile(ctx, mc.Dir, "redirect", path, flag, perm)
+	if err != nil {
+		if _, ok := err.(*os.PathError); !ok {
+			return nil, &os.PathError{Op: "open", Path: path, Err: err}
+		}
+		return nil, err
 	}
-	return os.OpenFile(path, flag, perm)
+	return f, nil
 }
 
 func shellOpenHandler() interp.OpenHandlerFunc {
 	return shellOpenHandlerFn
+}
+
+func shellReadDirHandler() interp.ReadDirHandlerFunc2 {
+	return func(ctx context.Context, path string) ([]os.DirEntry, error) {
+		mc := interp.HandlerCtx(ctx)
+		if CapabilityHookFromContext(ctx) == nil {
+			return os.ReadDir(resolveHostPath(mc.Dir, path))
+		}
+		return fsReadDir(ctx, mc.Dir, "glob", path)
+	}
+}
+
+func shellStatHandler() interp.StatHandlerFunc {
+	return func(ctx context.Context, path string, followSymlinks bool) (os.FileInfo, error) {
+		mc := interp.HandlerCtx(ctx)
+		if CapabilityHookFromContext(ctx) == nil {
+			resolved := resolveHostPath(mc.Dir, path)
+			if !followSymlinks {
+				return os.Lstat(resolved)
+			}
+			return os.Stat(resolved)
+		}
+		if !followSymlinks {
+			return fsLstat(ctx, mc.Dir, "stat", path)
+		}
+		return fsStat(ctx, mc.Dir, "stat", path)
+	}
+}
+
+func shellAccessHandler() interp.AccessHandlerFunc {
+	def := interp.DefaultAccessHandler()
+	return func(ctx context.Context, path string, mode interp.AccessMode) error {
+		mc := interp.HandlerCtx(ctx)
+		if CapabilityHookFromContext(ctx) == nil {
+			return def(ctx, resolveHostPath(mc.Dir, path), mode)
+		}
+		if mode&interp.AccessRead != 0 {
+			if _, err := checkFS(ctx, mc.Dir, "access", path, OpRead); err != nil {
+				return err
+			}
+		}
+		if mode&interp.AccessWrite != 0 {
+			if _, err := checkFS(ctx, mc.Dir, "access", path, OpWrite); err != nil {
+				return err
+			}
+		}
+		if mode&interp.AccessExec != 0 || mode == 0 {
+			if _, err := checkFS(ctx, mc.Dir, "access", path, OpStat); err != nil {
+				return err
+			}
+		}
+		return def(ctx, resolveHostPath(mc.Dir, path), mode)
+	}
 }
 
 type flagSpec struct {
@@ -1408,7 +1682,44 @@ func parseUint(s string) (uint64, error) {
 	return n, nil
 }
 
-func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader, names []string, closeAll func(), err error) {
+// fsOpenInput opens a builtin input file resolved against dir with OpRead
+// capability enforcement, while preserving Windows `<(cmd)` process
+// substitution synchronization on registered in-process temp files.
+func fsOpenInput(ctx context.Context, dir, cmdName, rawPath string) (io.ReadCloser, error) {
+	hostPath := resolveHostPath(dir, rawPath)
+	if st := winProcSubstLookup(hostPath); st != nil && st.op == syntax.CmdIn {
+		return openShellFile(hostPath)
+	}
+	if CapabilityHookFromContext(ctx) == nil {
+		return openShellFile(hostPath)
+	}
+	return fsOpen(ctx, dir, cmdName, rawPath)
+}
+
+func fsReadInputFile(ctx context.Context, dir, cmdName, rawPath string) ([]byte, error) {
+	f, err := fsOpenInput(ctx, dir, cmdName, rawPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+func fsOpenOutput(ctx context.Context, dir, cmdName, rawPath string, flag int, perm os.FileMode) (io.WriteCloser, error) {
+	hostPath := resolveHostPath(dir, rawPath)
+	if st := winProcSubstLookup(hostPath); st != nil && st.op == syntax.CmdOut {
+		w, err := openFileRetry(hostPath, flag, perm)
+		if err != nil {
+			st.finishConsumer()
+			return nil, err
+		}
+		st.consumerOpen()
+		return &countedFile{File: w, onClose: st.consumerWriterClose}, nil
+	}
+	return fsOpenFile(ctx, dir, cmdName, rawPath, flag, perm)
+}
+
+func openInputs(ctx context.Context, cmdName, dir string, args []string, stdin io.Reader) (readers []io.Reader, names []string, closeAll func(), err error) {
 	if stdin == nil {
 		stdin = strings.NewReader("")
 	}
@@ -1427,8 +1738,7 @@ func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader
 			names = append(names, "standard input")
 			continue
 		}
-		p := resolve(dir, a)
-		f, e := openShellFile(p)
+		f, e := fsOpenInput(ctx, dir, cmdName, a)
 		if e != nil {
 			closeAll()
 			return nil, nil, func() {}, e
@@ -1476,7 +1786,7 @@ func cmdCat(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	if *showAll {
 		*showEnds, *showTabs, *showNonprint = true, true, true
 	}
-	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
+	readers, _, closeAll, err := openInputs(ctx, "cat", hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "cat:", err)
 		return exitError{1}
@@ -1698,6 +2008,10 @@ func evalFastTestBinary(a, op, b string) (result bool, handled bool) {
 // the /dev/null device family (which does not exist on Windows).
 // A nil return means the expression is true.
 func runTest(hc interp.HandlerContext, args []string) error {
+	return runTestCtx(context.Background(), hc, args)
+}
+
+func runTestCtx(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	a := args[1:]
 	if args[0] == "[" {
 		if len(a) == 0 || a[len(a)-1] != "]" {
@@ -1751,7 +2065,7 @@ func runTest(hc interp.HandlerContext, args []string) error {
 			}
 		}
 	}
-	t := testParser{hc: hc, toks: a}
+	t := testParser{ctx: ctx, hc: hc, toks: a}
 	ok, err := t.orExpr()
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
@@ -1768,6 +2082,7 @@ func runTest(hc interp.HandlerContext, args []string) error {
 }
 
 type testParser struct {
+	ctx   context.Context
 	hc    interp.HandlerContext
 	toks  []string
 	pos   int
@@ -1887,16 +2202,16 @@ func (t *testParser) primary() (bool, error) {
 			return op != "", nil
 		}
 		t.pos += 2
-		return testUnary(t.hc, op, arg)
+		return testUnary(t.ctx, t.hc, op, arg)
 	default:
 		a, op, b := t.toks[t.pos], t.toks[t.pos+1], t.toks[t.pos+2]
 		if isTestBinaryOp(op) && (rem == 3 || t.toks[t.pos+3] == "-a" || t.toks[t.pos+3] == "-o") {
 			t.pos += 3
-			return testBinary(t.hc, a, op, b)
+			return testBinary(t.ctx, t.hc, a, op, b)
 		}
 		if isTestUnaryOp(a) && (b == "-a" || b == "-o") {
 			t.pos += 2
-			return testUnary(t.hc, a, op)
+			return testUnary(t.ctx, t.hc, a, op)
 		}
 		if op == "-a" || op == "-o" {
 			t.pos++
@@ -1904,7 +2219,7 @@ func (t *testParser) primary() (bool, error) {
 		}
 		if isTestBinaryOp(op) {
 			t.pos += 3
-			return testBinary(t.hc, a, op, b)
+			return testBinary(t.ctx, t.hc, a, op, b)
 		}
 		return false, errors.New("binary operator expected")
 	}
@@ -1912,8 +2227,8 @@ func (t *testParser) primary() (bool, error) {
 
 func isTestUnaryOp(op string) bool {
 	switch op {
-	case "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-L", "-p",
-		"-r", "-s", "-S", "-t", "-w", "-x", "-O", "-G", "-N",
+	case "-b", "-c", "-d", "-e", "-f", "-g", "-h", "-k", "-L", "-p",
+		"-r", "-s", "-S", "-t", "-u", "-w", "-x", "-O", "-G", "-N",
 		"-n", "-z":
 		return true
 	}
@@ -1943,20 +2258,25 @@ type testFile struct {
 	synth   bool // synthesized device node (no real stat)
 }
 
-func testStat(hc interp.HandlerContext, path string) testFile {
+func testStat(ctx context.Context, hc interp.HandlerContext, path string) (testFile, os.FileInfo) {
 	if testDevNodes[strings.ToLower(path)] {
-		if _, err := os.Stat(resolve(hc.Dir, path)); err != nil {
-			return testFile{exists: true, mode: os.ModeDevice | os.ModeCharDevice, synth: true}
+		fi, err := fsStat(ctx, hc.Dir, "test", path)
+		if err == nil {
+			return testFile{exists: true, mode: fi.Mode(), size: fi.Size(), modTime: fi.ModTime()}, fi
 		}
+		if CapabilityHookFromContext(ctx) == nil || !errors.Is(err, os.ErrPermission) {
+			return testFile{exists: true, mode: os.ModeDevice | os.ModeCharDevice, synth: true}, nil
+		}
+		return testFile{}, nil
 	}
-	fi, err := os.Stat(resolve(hc.Dir, path))
+	fi, err := fsStat(ctx, hc.Dir, "test", path)
 	if err != nil {
-		return testFile{}
+		return testFile{}, nil
 	}
-	return testFile{exists: true, mode: fi.Mode(), size: fi.Size(), modTime: fi.ModTime()}
+	return testFile{exists: true, mode: fi.Mode(), size: fi.Size(), modTime: fi.ModTime()}, fi
 }
 
-func testUnary(hc interp.HandlerContext, op, arg string) (bool, error) {
+func testUnary(ctx context.Context, hc interp.HandlerContext, op, arg string) (bool, error) {
 	switch op {
 	case "-n":
 		return arg != "", nil
@@ -1968,8 +2288,21 @@ func testUnary(hc interp.HandlerContext, op, arg string) (bool, error) {
 			return false, errors.New("integer expression expected")
 		}
 		return term.IsTerminal(fd), nil
+	case "-h", "-L":
+		if testDevNodes[strings.ToLower(arg)] {
+			fi, err := fsLstat(ctx, hc.Dir, "test", arg)
+			if err != nil {
+				return false, nil
+			}
+			return fi.Mode()&os.ModeSymlink != 0, nil
+		}
+		fi, err := fsLstat(ctx, hc.Dir, "test", arg)
+		if err != nil {
+			return false, nil
+		}
+		return fi.Mode()&os.ModeSymlink != 0, nil
 	}
-	tf := testStat(hc, arg)
+	tf, _ := testStat(ctx, hc, arg)
 	if op == "-e" {
 		return tf.exists, nil
 	}
@@ -1985,19 +2318,23 @@ func testUnary(hc interp.HandlerContext, op, arg string) (bool, error) {
 		return tf.mode&os.ModeDevice != 0 && tf.mode&os.ModeCharDevice == 0, nil
 	case "-c":
 		return tf.mode&os.ModeCharDevice != 0, nil
-	case "-h", "-L":
-		return tf.mode&os.ModeSymlink != 0, nil
 	case "-p":
 		return tf.mode&os.ModeNamedPipe != 0, nil
 	case "-S":
 		return tf.mode&os.ModeSocket != 0, nil
 	case "-s":
 		return tf.size > 0, nil
+	case "-g":
+		return tf.mode&os.ModeSetgid != 0, nil
+	case "-u":
+		return tf.mode&os.ModeSetuid != 0, nil
+	case "-k":
+		return tf.mode&os.ModeSticky != 0, nil
 	case "-r":
 		if tf.synth {
 			return true, nil
 		}
-		f, err := os.Open(resolve(hc.Dir, arg))
+		f, err := fsOpen(ctx, hc.Dir, "test", arg)
 		if err == nil {
 			f.Close()
 		}
@@ -2006,7 +2343,7 @@ func testUnary(hc interp.HandlerContext, op, arg string) (bool, error) {
 		if tf.synth {
 			return true, nil
 		}
-		f, err := os.OpenFile(resolve(hc.Dir, arg), os.O_WRONLY, 0)
+		f, err := fsOpenFile(ctx, hc.Dir, "test", arg, os.O_WRONLY, 0)
 		if err == nil {
 			f.Close()
 		}
@@ -2026,7 +2363,7 @@ func testUnary(hc interp.HandlerContext, op, arg string) (bool, error) {
 	return false, fmt.Errorf("unary operator expected")
 }
 
-func testBinary(hc interp.HandlerContext, a, op, b string) (bool, error) {
+func testBinary(ctx context.Context, hc interp.HandlerContext, a, op, b string) (bool, error) {
 	switch op {
 	case "=", "==":
 		return a == b, nil
@@ -2056,17 +2393,13 @@ func testBinary(hc interp.HandlerContext, a, op, b string) (bool, error) {
 			return x >= y, nil
 		}
 	case "-nt", "-ot", "-ef":
-		ta, tb := testStat(hc, a), testStat(hc, b)
+		ta, fa := testStat(ctx, hc, a)
+		tb, fb := testStat(ctx, hc, b)
 		if !ta.exists {
 			return false, nil
 		}
 		if op == "-ef" {
-			if !tb.exists {
-				return false, nil
-			}
-			fa, _ := os.Stat(resolve(hc.Dir, a))
-			fb, _ := os.Stat(resolve(hc.Dir, b))
-			if fa == nil || fb == nil {
+			if !tb.exists || fa == nil || fb == nil {
 				return false, nil
 			}
 			return os.SameFile(fa, fb), nil
@@ -2129,10 +2462,11 @@ func cmdClear(_ context.Context, hc interp.HandlerContext, _ []string) error {
 	return nil
 }
 
-func cmdWhich(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdWhich(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	if len(args) < 2 {
 		return flag.ErrHelp
 	}
+	jailed := CapabilityHookFromContext(ctx) != nil
 	// Like /usr/bin/which: when PATH is explicitly set but contains no
 	// existing directory, nothing can be found (exit 1), even builtins.
 	pathSet := false
@@ -2140,19 +2474,44 @@ func cmdWhich(_ context.Context, hc interp.HandlerContext, args []string) error 
 	if v := hc.Env.Get("PATH"); v.IsSet() {
 		pv := v.Str
 		pathSet = true
-		for _, d := range strings.Split(pv, string(os.PathListSeparator)) {
-			if d == "" {
-				d = "."
+		if jailed {
+			for _, d := range strings.Split(pv, string(os.PathListSeparator)) {
+				if strings.TrimSpace(d) != "" {
+					pathUsable = true
+					break
+				}
 			}
-			if fi, err := os.Stat(resolve(hc.Dir, d)); err == nil && fi.IsDir() {
-				pathUsable = true
-				break
+		} else {
+			for _, d := range strings.Split(pv, string(os.PathListSeparator)) {
+				if d == "" {
+					d = "."
+				}
+				if fi, err := fsStat(ctx, hc.Dir, "which", d); err == nil && fi.IsDir() {
+					pathUsable = true
+					break
+				}
 			}
 		}
 	}
 	code := 0
 	for _, name := range args[1:] {
-		if p, err := findExec(hc, name); err == nil {
+		if jailed && !strings.ContainsAny(name, `/\`) {
+			if pathSet && !pathUsable {
+				code = 1
+				continue
+			}
+			if lookupExtra(name) != nil || isKnownCoreutil(name) || interp.IsBuiltin(name) {
+				fmt.Fprintf(hc.Stdout, "%s: unish builtin\n", name)
+				continue
+			}
+			if p, err := findExecCtx(ctx, hc, name); err == nil {
+				fmt.Fprintln(hc.Stdout, p)
+				continue
+			}
+			code = 1
+			continue
+		}
+		if p, err := findExecCtx(ctx, hc, name); err == nil {
 			fmt.Fprintln(hc.Stdout, p)
 			continue
 		}
@@ -2160,7 +2519,7 @@ func cmdWhich(_ context.Context, hc interp.HandlerContext, args []string) error 
 			code = 1
 			continue
 		}
-		if lookupExtra(name) != nil || isKnownCoreutil(name) || interp.IsBuiltin(name) {
+		if !strings.ContainsAny(name, `/\`) && (lookupExtra(name) != nil || isKnownCoreutil(name) || interp.IsBuiltin(name)) {
 			fmt.Fprintf(hc.Stdout, "%s: unish builtin\n", name)
 			continue
 		}
@@ -2183,16 +2542,22 @@ func isKnownCoreutil(name string) bool {
 }
 
 func findExec(hc interp.HandlerContext, name string) (string, error) {
+	return findExecCtx(context.Background(), hc, name)
+}
+
+func findExecCtx(ctx context.Context, hc interp.HandlerContext, name string) (string, error) {
 	if strings.ContainsAny(name, `/\`) {
-		p := resolve(hc.Dir, name)
-		fi, err := os.Stat(p)
+		fi, err := fsStat(ctx, hc.Dir, "which", name)
 		if err != nil {
 			return "", err
 		}
 		if fi.IsDir() {
 			return "", fmt.Errorf("is a directory")
 		}
-		abs, err := filepath.Abs(p)
+		if runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
+			return "", os.ErrPermission
+		}
+		abs, err := filepath.Abs(resolveHostPath(hc.Dir, name))
 		if err != nil {
 			return "", err
 		}
@@ -2204,7 +2569,7 @@ func findExec(hc interp.HandlerContext, name string) (string, error) {
 			continue
 		}
 		for _, cand := range execCandidates(dir, name) {
-			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			if fi, err := fsStat(ctx, hc.Dir, "which", cand); err == nil && !fi.IsDir() && (runtime.GOOS == "windows" || fi.Mode()&0o111 != 0) {
 				return cand, nil
 			}
 		}
