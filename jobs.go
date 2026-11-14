@@ -46,6 +46,7 @@ import (
 
 // trackedJob is one external process started by this shell.
 type trackedJob struct {
+	id      int
 	pid     int
 	argv    []string
 	cmd     *exec.Cmd
@@ -59,7 +60,7 @@ type trackedJob struct {
 // jobTable is the process-wide registry of external children.
 type jobTable struct {
 	mu   sync.Mutex
-	jobs []*trackedJob // launch order; index i == fake id "g{i+1}"
+	jobs []*trackedJob // launch order; each live job keeps a stable id
 }
 
 var globalJobs = &jobTable{}
@@ -75,6 +76,9 @@ func (t *jobTable) track(cmd *exec.Cmd, argv []string) *trackedJob {
 	if cmd == nil || cmd.Process == nil {
 		return nil
 	}
+	// Sweep finished jobs BEFORE assigning the new job ID so the new ID
+	// follows bash's rule: 1 when no active jobs remain, else max(id)+1.
+	t.sweep(0)
 	j := &trackedJob{
 		pid:     cmd.Process.Pid,
 		argv:    append([]string(nil), argv...),
@@ -85,9 +89,14 @@ func (t *jobTable) track(cmd *exec.Cmd, argv []string) *trackedJob {
 		started: time.Now(),
 	}
 	t.mu.Lock()
+	if len(t.jobs) == 0 {
+		j.id = 1
+	} else {
+		j.id = t.jobs[len(t.jobs)-1].id + 1
+	}
 	t.jobs = append(t.jobs, j)
 	t.mu.Unlock()
-	t.sweep(0)
+	interp.NoteBgTrackedPID(j.pid)
 	go func() {
 		err := cmd.Wait()
 		j.err = err
@@ -128,7 +137,6 @@ func (t *jobTable) sweep(keepRecent int) {
 		// Still enforce the hard cap on TOTAL entries.
 		if len(t.jobs) > maxTrackedJobs {
 			kept := t.jobs[len(t.jobs)-maxTrackedJobs:]
-			copy(kept, t.jobs[len(t.jobs)-maxTrackedJobs:])
 			t.jobs = append([]*trackedJob(nil), kept...)
 		}
 		return
@@ -157,12 +165,7 @@ func (t *jobTable) byFakeID(id string) *trackedJob {
 	if err != nil || n < 1 {
 		return nil
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if n > len(t.jobs) {
-		return nil
-	}
-	return t.jobs[n-1]
+	return t.byIndex(n)
 }
 
 // byPID resolves a real pid string to the newest matching job.
@@ -197,14 +200,19 @@ func (t *jobTable) previous() *trackedJob {
 	return t.jobs[len(t.jobs)-2]
 }
 
-// byIndex resolves %n (1-indexed launch order) to a job.
+// byIndex resolves %n to the tracked job carrying job ID n.
 func (t *jobTable) byIndex(n int) *trackedJob {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	if n < 1 || n > len(t.jobs) {
+	if n < 1 {
 		return nil
 	}
-	return t.jobs[n-1]
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, j := range t.jobs {
+		if j.id == n {
+			return j
+		}
+	}
+	return nil
 }
 
 // alive reports whether the job's process is still running.
@@ -220,45 +228,31 @@ func (j *trackedJob) alive() bool {
 	}
 }
 
-// waitForLaunch polls briefly for a background launch to register.
-// `cmd &` continues the main shell immediately while the background
-// goroutine starts (and tracks) the process; without this, `kill $!`
-// right after `&` would race the registration.
+// waitForLaunch waits only while an actual `&` background subshell is in the
+// middle of starting its external process; returns immediately (0ms) when no
+// background launch is in flight.
 func (t *jobTable) waitForLaunch() {
-	for i := 0; i < 50; i++ {
-		t.mu.Lock()
-		n := len(t.jobs)
-		t.mu.Unlock()
-		if n > 0 {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		n, ch := interp.PendingBgStarts()
+		if n <= 0 {
+			return
+		}
+		rem := time.Until(deadline)
+		if rem <= 0 {
 			return
 		}
 		select {
-		case <-time.After(10 * time.Millisecond):
+		case <-ch:
+		case <-time.After(rem):
+			return
 		}
 	}
 }
 
-// resolveJobSpec resolves kill/wait/jobs operands to a tracked job:
-// fake ids ("g1"), real pids ("1234"), and jobspecs ("%1", "%%", "%+",
-// "%-", "%name", "%?substr").
-// waitForFresh polls until the newest job is alive (or 500ms pass).
-// Covers `cmd & kill %%` where the new process hasn't registered yet
-// while the previous newest is already done.
+// waitForFresh waits for any in-flight `&` launch to register before resolving %%/\%+.
 func (t *jobTable) waitForFresh() {
-	for i := 0; i < 50; i++ {
-		t.mu.Lock()
-		var newest *trackedJob
-		if len(t.jobs) > 0 {
-			newest = t.jobs[len(t.jobs)-1]
-		}
-		t.mu.Unlock()
-		if newest != nil && (newest.alive() || time.Since(newest.started) > time.Second) {
-			return
-		}
-		select {
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
+	t.waitForLaunch()
 }
 
 func (t *jobTable) resolveJobSpec(arg string) *trackedJob {
@@ -324,6 +318,9 @@ func (t *jobTable) resolveJobSpec(arg string) *trackedJob {
 // External commands are tracked in extraHandler.runExternalTracked.
 func trackExec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
+		for _, a := range args[1:] {
+			waitProcSubstProducerCtx(ctx, a)
+		}
 		return next(ctx, args)
 	}
 }
@@ -359,7 +356,7 @@ func cmdJobs(hc interp.HandlerContext, args []string) error {
 	}
 	globalJobs.mu.Lock()
 	defer globalJobs.mu.Unlock()
-	for i, j := range globalJobs.jobs {
+	for _, j := range globalJobs.jobs {
 		state := "Done"
 		select {
 		case <-j.done:
@@ -367,9 +364,9 @@ func cmdJobs(hc interp.HandlerContext, args []string) error {
 			state = "Running"
 		}
 		if long {
-			fmt.Fprintf(hc.Stdout, "[%d] %d %s %s\n", i+1, j.pid, state, strings.Join(j.argv, " "))
+			fmt.Fprintf(hc.Stdout, "[%d] %d %s %s\n", j.id, j.pid, state, strings.Join(j.argv, " "))
 		} else {
-			fmt.Fprintf(hc.Stdout, "[%d] %s %s\n", i+1, state, strings.Join(j.argv, " "))
+			fmt.Fprintf(hc.Stdout, "[%d] %s %s\n", j.id, state, strings.Join(j.argv, " "))
 		}
 	}
 	return nil
@@ -382,10 +379,21 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 		return 0, false
 	}
 	hc := interp.HandlerCtx(ctx)
-	if len(args) == 1 {
-		// A background statement registers its job from another goroutine;
-		// give it a moment so `cmd & wait` sees it (otherwise wait returns
-		// before the job was tracked).
+	var operands []string
+	endOpts := false
+	for _, a := range args[1:] {
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if strings.HasPrefix(a, "-") && a != "-" {
+				return 0, false
+			}
+		}
+		operands = append(operands, a)
+	}
+	if len(operands) == 0 {
 		globalJobs.waitForLaunch()
 		globalJobs.mu.Lock()
 		jobs := append([]*trackedJob(nil), globalJobs.jobs...)
@@ -399,30 +407,41 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 			}
 		}
 		globalJobs.sweep(0)
-		return 0, true
+		// Let callOverride pass bare `wait` / `wait --` through to mvdan/sh's
+		// builtin so in-process background goroutines (subshells, procsubst)
+		// are awaited as well.
+		return 0, false
 	}
 	code := 0
-	for _, a := range args[1:] {
-		if a == "-n" || a == "-p" {
-			fmt.Fprintf(hc.Stderr, "wait: unsupported option %q\n", a)
-			return 2, true
+	allInRunner := true
+	for _, a := range operands {
+		inRunner := !strings.HasPrefix(a, "%") && hc.HasBgProc(a)
+		if !inRunner {
+			allInRunner = false
 		}
 		j := globalJobs.resolveJobSpec(a)
 		if j == nil {
+			if inRunner {
+				continue
+			}
 			// Not a tracked external: leave to mvdan/sh's builtin
 			// (in-process jobs like `sleep &`, real pids, errors).
 			return 0, false
 		}
 		select {
 		case <-j.done:
-			if j.code != 0 {
-				code = j.code
-			}
+			code = j.code
 		case <-ctx.Done():
 			fmt.Fprintln(hc.Stderr, "wait:", ctx.Err())
 			return 1, true
 		}
 	}
 	globalJobs.sweep(0)
+	if allInRunner {
+		// Delegate exit-status reporting to mvdan/sh's wait builtin so exact
+		// 0..255 exit statuses (e.g. 42) are preserved instead of collapsing
+		// to callOverride's ["false"] (1).
+		return 0, false
+	}
 	return code, true
 }

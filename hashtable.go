@@ -26,6 +26,7 @@ import (
 	"sync"
 
 	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 // hashEntry is one remembered command location.
@@ -62,21 +63,27 @@ func hashRecord(name, path string) {
 	e.hits++
 }
 
-// cmdHashTable implements `hash [-r] [name...]`.
+// cmdHashTable implements `hash [-r] [-d] [--] [name...]`.
 func cmdHashTable(_ context.Context, hc interp.HandlerContext, args []string) error {
 	reset := false
 	forget := false
 	var names []string
-	for _, a := range args[1:] {
+	argv := args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
 		switch a {
 		case "-r":
 			reset = true
 		case "-d":
 			forget = true
+		case "-rd", "-dr":
+			reset = true
+			forget = true
 		case "--":
-			names = append(names, args[1:]...)
+			names = append(names, argv[i+1:]...)
+			i = len(argv)
 		default:
-			if strings.HasPrefix(a, "-") {
+			if strings.HasPrefix(a, "-") && a != "-" {
 				fmt.Fprintf(hc.Stderr, "hash: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
 				return flag.ErrHelp
 			}
@@ -87,9 +94,15 @@ func cmdHashTable(_ context.Context, hc interp.HandlerContext, args []string) er
 	defer globalHash.mu.Unlock()
 	if reset {
 		globalHash.entries = map[string]*hashEntry{}
-		return nil
+		if len(names) == 0 {
+			return nil
+		}
 	}
 	if forget {
+		if len(names) == 0 {
+			fmt.Fprintln(hc.Stderr, "hash: -d: option requires an argument")
+			return flag.ErrHelp
+		}
 		for _, n := range names {
 			delete(globalHash.entries, n)
 		}
@@ -138,25 +151,154 @@ func cmdHashTable(_ context.Context, hc interp.HandlerContext, args []string) er
 	return nil
 }
 
-// cmdTypeDesc implements `type name...` with GNU/bash-style output.
+// cmdTypeDesc implements `type [-afptP] [--] name...` with GNU/bash-style output.
 func cmdTypeDesc(_ context.Context, hc interp.HandlerContext, args []string) error {
-	if len(args) < 2 {
-		return flag.ErrHelp
+	mode := "" // "", "-t", "-p", "-P"
+	all := false
+	noFuncs := false
+	var names []string
+	argv := args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			names = append(names, argv[i+1:]...)
+			break
+		}
+		if len(a) > 1 && a[0] == '-' {
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 't':
+					mode = "-t"
+				case 'p':
+					mode = "-p"
+				case 'P':
+					mode = "-P"
+				case 'a':
+					all = true
+				case 'f':
+					noFuncs = true
+				default:
+					fmt.Fprintf(hc.Stderr, "type: -%c: invalid option\n", a[j])
+					return flag.ErrHelp
+				}
+			}
+			continue
+		}
+		names = append(names, a)
+	}
+	if len(names) == 0 {
+		return nil
 	}
 	code := 0
-	for _, n := range args[1:] {
-		switch {
-		case isUnishCommand(n):
-			fmt.Fprintf(hc.Stdout, "%s is a unish builtin\n", n)
-		case interp.IsBuiltin(n):
-			fmt.Fprintf(hc.Stdout, "%s is a shell builtin\n", n)
-		default:
+	for _, n := range names {
+		if mode == "-P" {
 			if p, err := findExec(hc, n); err == nil {
-				fmt.Fprintf(hc.Stdout, "%s is %s\n", n, p)
+				fmt.Fprintln(hc.Stdout, p)
 			} else {
-				fmt.Fprintf(hc.Stderr, "type: %s: not found\n", n)
 				code = 1
 			}
+			continue
+		}
+		found := false
+		if def, ok := hc.LookupAlias(n); ok {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "alias")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is aliased to `%s'\n", n, def)
+			}
+			if !all {
+				continue
+			}
+		}
+		if syntax.IsKeyword(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "keyword")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a shell keyword\n", n)
+			}
+			if !all {
+				continue
+			}
+		}
+		if !noFuncs && hc.HasFunc(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "function")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a function\n", n)
+			}
+			if !all {
+				continue
+			}
+		}
+		if isUnishCommand(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "builtin")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a unish builtin\n", n)
+			}
+			if !all {
+				continue
+			}
+		} else if interp.IsBuiltin(n) {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "builtin")
+			case "-p":
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is a shell builtin\n", n)
+			}
+			if !all {
+				continue
+			}
+		}
+		var filePath string
+		isHashed := false
+		if !all {
+			globalHash.mu.Lock()
+			if e := globalHash.entries[n]; e != nil && e.path != "" {
+				filePath = e.path
+				isHashed = true
+			}
+			globalHash.mu.Unlock()
+		}
+		if filePath == "" {
+			if p, err := findExec(hc, n); err == nil {
+				filePath = p
+			}
+		}
+		if filePath != "" {
+			found = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "file")
+			case "-p":
+				fmt.Fprintln(hc.Stdout, filePath)
+			default:
+				if isHashed {
+					fmt.Fprintf(hc.Stdout, "%s is hashed (%s)\n", n, filePath)
+				} else {
+					fmt.Fprintf(hc.Stdout, "%s is %s\n", n, filePath)
+				}
+			}
+		}
+		if !found {
+			if mode == "" {
+				fmt.Fprintf(hc.Stderr, "type: %s: not found\n", n)
+			}
+			code = 1
 		}
 	}
 	if code != 0 {

@@ -372,10 +372,16 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 				return failf(2, "wait: invalid option %q\n", flag)
 			}
 		}
+		args = fp.args()
 		if len(args) == 0 {
 			// Note that "wait" without arguments always returns exit status zero.
 			for _, bg := range r.bgProcs {
-				<-bg.done
+				select {
+				case <-bg.done:
+				case <-ctx.Done():
+					exit.fatal(ctx.Err())
+					return exit
+				}
 			}
 			break
 		}
@@ -384,7 +390,12 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 			if !ok {
 				return failf(1, "wait: pid %s is not a child of this shell\n", arg)
 			}
-			<-bg.done
+			select {
+			case <-bg.done:
+			case <-ctx.Done():
+				exit.fatal(ctx.Err())
+				return exit
+			}
 			exit = *bg.exit
 		}
 	case "builtin":
@@ -1000,13 +1011,16 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 
 	case "trap":
 		fp := flagParser{remaining: args}
-		callback := "-"
+		printMode := false
+		listMode := false
 		for fp.more() {
 			switch flag := fp.flag(); flag {
-			case "-l", "-p":
-				return failf(2, "trap: %q: NOT IMPLEMENTED flag\n", flag)
+			case "-l":
+				listMode = true
+			case "-p":
+				printMode = true
 			case "-":
-				// default signal
+				// legacy: treated as default action below
 			default:
 				r.errf("trap: %q: invalid option\n", flag)
 				r.errf("trap: usage: trap [-lp] [[arg] signal_spec ...]\n")
@@ -1014,39 +1028,142 @@ func (r *Runner) builtin(ctx context.Context, pos syntax.Pos, name string, args 
 				return exit
 			}
 		}
-		args := fp.args()
-		switch len(args) {
-		case 0:
-			// Print non-default signals
-			if r.callbackExit != "" {
-				r.outf("trap -- %q EXIT\n", r.callbackExit)
-			}
-			if r.callbackErr != "" {
-				r.outf("trap -- %q ERR\n", r.callbackErr)
-			}
-		case 1:
-			// assume it's a signal, the default will be restored
-		default:
-			callback = args[0]
-			args = args[1:]
+		if listMode {
+			r.out(" 1) SIGHUP\t 2) SIGINT\t 3) SIGQUIT\t 4) SIGILL\t 5) SIGTRAP\n")
+			r.out(" 6) SIGABRT\t 7) SIGBUS\t 8) SIGFPE\t 9) SIGKILL\t10) SIGUSR1\n")
+			r.out("11) SIGSEGV\t12) SIGUSR2\t13) SIGPIPE\t14) SIGALRM\t15) SIGTERM\n")
+			break
 		}
-		// For now, treat both empty and - the same since ERR and EXIT have no
-		// default callback.
-		if callback == "-" {
-			callback = ""
+		args = fp.args()
+		trapQuote := func(s string) string {
+			return "'" + strings.ReplaceAll(s, "'", `'\''`) + "'"
 		}
-		for _, arg := range args {
-			switch arg {
-			case "ERR":
-				r.callbackErr = callback
-			case "EXIT":
-				r.callbackExit = callback
+		normSigSpec := func(s string) string {
+			u := strings.TrimPrefix(strings.ToUpper(s), "SIG")
+			if u == "0" {
+				return "EXIT"
+			}
+			return u
+		}
+		if printMode || len(args) == 0 {
+			if len(args) == 0 {
+				if r.exitIgnored {
+					r.out("trap -- '' EXIT\n")
+				} else if r.callbackExit != "" {
+					r.outf("trap -- %s EXIT\n", trapQuote(r.callbackExit))
+				}
+				if r.errIgnored {
+					r.out("trap -- '' ERR\n")
+				} else if r.callbackErr != "" {
+					r.outf("trap -- %s ERR\n", trapQuote(r.callbackErr))
+				}
+				r.sigMu.Lock()
+				type sigEntry struct {
+					name string
+					act  string
+				}
+				var entries []sigEntry
+				for sig, cb := range r.sigCallbacks {
+					if cb != "" {
+						entries = append(entries, sigEntry{r.sigNames[sig], cb})
+					}
+				}
+				for sig, ign := range r.sigIgnored {
+					if ign {
+						entries = append(entries, sigEntry{r.sigNames[sig], ""})
+					}
+				}
+				r.sigMu.Unlock()
+				slices.SortFunc(entries, func(a, b sigEntry) int {
+					return strings.Compare(a.name, b.name)
+				})
+				for _, e := range entries {
+					r.outf("trap -- %s %s\n", trapQuote(e.act), e.name)
+				}
+				break
+			}
+			for _, spec := range args {
+				norm := normSigSpec(spec)
+				switch norm {
+				case "EXIT":
+					if r.exitIgnored {
+						r.out("trap -- '' EXIT\n")
+					} else if r.callbackExit != "" {
+						r.outf("trap -- %s EXIT\n", trapQuote(r.callbackExit))
+					}
+				case "ERR":
+					if r.errIgnored {
+						r.out("trap -- '' ERR\n")
+					} else if r.callbackErr != "" {
+						r.outf("trap -- %s ERR\n", trapQuote(r.callbackErr))
+					}
+				default:
+					sig, ok := signalByName(norm)
+					if !ok {
+						return failf(2, "trap: %s: invalid signal specification\n", spec)
+					}
+					r.sigMu.Lock()
+					ign := r.sigIgnored[sig]
+					cb := r.sigCallbacks[sig]
+					r.sigMu.Unlock()
+					if ign {
+						r.outf("trap -- '' %s\n", norm)
+					} else if cb != "" {
+						r.outf("trap -- %s %s\n", trapQuote(cb), norm)
+					}
+				}
+			}
+			break
+		}
+		reset := false
+		ignore := false
+		callback := ""
+		var sigs []string
+		if len(args) == 1 {
+			reset = true
+			sigs = args
+		} else {
+			switch args[0] {
+			case "-":
+				reset = true
+			case "":
+				ignore = true
 			default:
-				sig, ok := signalByName(arg)
+				callback = args[0]
+			}
+			sigs = args[1:]
+		}
+		for _, arg := range sigs {
+			norm := normSigSpec(arg)
+			switch norm {
+			case "ERR":
+				if reset {
+					r.callbackErr = ""
+					r.errIgnored = false
+				} else if ignore {
+					r.callbackErr = ""
+					r.errIgnored = true
+				} else {
+					r.callbackErr = callback
+					r.errIgnored = false
+				}
+			case "EXIT":
+				if reset {
+					r.callbackExit = ""
+					r.exitIgnored = false
+				} else if ignore {
+					r.callbackExit = ""
+					r.exitIgnored = true
+				} else {
+					r.callbackExit = callback
+					r.exitIgnored = false
+				}
+			default:
+				sig, ok := signalByName(norm)
 				if !ok {
 					return failf(2, "trap: %s: invalid signal specification\n", arg)
 				}
-				r.setSigCallback(sig, arg, callback)
+				r.setSigTrap(sig, norm, callback, ignore, reset)
 			}
 		}
 

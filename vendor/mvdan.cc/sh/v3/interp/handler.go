@@ -44,6 +44,49 @@ func (hc HandlerContext) ReportBgStart(pid int) {
 	}
 }
 
+// NoteBgTracked notifies an enclosing background subshell that its external OS
+// process has been registered in the caller's job table.
+func (hc HandlerContext) NoteBgTracked() {
+	if hc.runner != nil {
+		noteBgStartDone(hc.runner.bgTrackOnce)
+	}
+}
+
+// HasBgProc reports whether arg matches a background subshell or process tracked
+// directly by this Runner (e.g. $! from a builtin/subshell `&` or real PID).
+func (hc HandlerContext) HasBgProc(arg string) bool {
+	if hc.runner == nil {
+		return false
+	}
+	_, ok := hc.runner.lookupBgProc(arg)
+	return ok
+}
+
+// HasFunc reports whether name is currently defined as a shell function.
+func (hc HandlerContext) HasFunc(name string) bool {
+	return hc.runner != nil && hc.runner.Funcs[name] != nil
+}
+
+// LookupAlias returns the expanded alias definition for name if alias expansion
+// is enabled and name is defined.
+func (hc HandlerContext) LookupAlias(name string) (string, bool) {
+	if hc.runner == nil || !hc.runner.opts[optExpandAliases] {
+		return "", false
+	}
+	als, ok := hc.runner.alias[name]
+	if !ok {
+		return "", false
+	}
+	var buf bytes.Buffer
+	if len(als.args) > 0 {
+		syntax.NewPrinter().Print(&buf, &syntax.CallExpr{Args: als.args})
+	}
+	if als.blank {
+		buf.WriteByte(' ')
+	}
+	return buf.String(), true
+}
+
 func HandlerCtx(ctx context.Context) HandlerContext {
 	hc, ok := ctx.Value(handlerCtxKey{}).(HandlerContext)
 	if !ok {
@@ -593,6 +636,10 @@ type ProcSubstFile struct {
 	// such as in a redirection. If nil, [OpenHandlerFunc] is used.
 	OpenConsumer func(ctx context.Context, flag int) (io.ReadWriteCloser, error)
 
+	// StmtDone, if not nil, is called once the statement that expanded
+	// this process substitution finishes executing.
+	StmtDone func()
+
 	// Cleanup, if not nil, is called once the subshell has finished
 	// and its file has been closed.
 	// A non-nil error is printed to the shell's standard error.
@@ -662,6 +709,7 @@ func DefaultProcSubstHandler() ProcSubstHandlerFunc {
 type procSubstRegistry struct {
 	mu    sync.Mutex
 	files map[string]*ProcSubstFile
+	refs  map[string]int
 }
 
 func (reg *procSubstRegistry) add(psf *ProcSubstFile) {
@@ -669,15 +717,26 @@ func (reg *procSubstRegistry) add(psf *ProcSubstFile) {
 	defer reg.mu.Unlock()
 	if reg.files == nil {
 		reg.files = make(map[string]*ProcSubstFile)
+		reg.refs = make(map[string]int)
 	}
 	reg.files[psf.Path] = psf
+	// Held by both the subshell goroutine and the enclosing statement so a
+	// fast producer exiting before r.redir still resolves via OpenConsumer.
+	reg.refs[psf.Path] = 2
 }
 
-// remove unregisters a process substitution.
-func (reg *procSubstRegistry) remove(psf *ProcSubstFile) {
+// release drops one reference (subshell or enclosing statement) and removes
+// the entry once both have finished.
+func (reg *procSubstRegistry) release(psf *ProcSubstFile) {
 	reg.mu.Lock()
-	delete(reg.files, psf.Path)
-	reg.mu.Unlock()
+	defer reg.mu.Unlock()
+	n := reg.refs[psf.Path] - 1
+	if n <= 0 {
+		delete(reg.files, psf.Path)
+		delete(reg.refs, psf.Path)
+	} else {
+		reg.refs[psf.Path] = n
+	}
 }
 
 // lookup returns the consumer open function for an active process

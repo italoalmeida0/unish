@@ -41,15 +41,28 @@ func cmdTimeout(ctx context.Context, hc interp.HandlerContext, args []string) er
 	}
 	cmdArgs := rest[1:]
 	if dur == 0 {
-		// GNU: DURATION 0 disables the timeout; run directly.
+		// GNU: DURATION 0 disables the timeout; run directly while still
+		// honoring parent context cancellation.
 		if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
 			return cmd.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
 		}
-		tp, err := startTimeoutProc(hc, cmdArgs)
+		tp, err := startTimeoutProc(ctx, hc, cmdArgs)
 		if err != nil {
 			return err
 		}
-		return tp.wait()
+		res := make(chan error, 1)
+		go func() { res <- tp.wait() }()
+		select {
+		case err := <-res:
+			return err
+		case <-ctx.Done():
+			_ = tp.signal("KILL")
+			select {
+			case <-res:
+			case <-time.After(2 * time.Second):
+			}
+			return ctx.Err()
+		}
 	}
 	sig := strings.ToUpper(strings.TrimPrefix(strings.TrimPrefix(*sigName, "-"), "SIG"))
 
@@ -84,7 +97,7 @@ func cmdTimeout(ctx context.Context, hc interp.HandlerContext, args []string) er
 		}
 	}
 
-	tp, err := startTimeoutProc(hc, cmdArgs)
+	tp, err := startTimeoutProc(ctx, hc, cmdArgs)
 	if err != nil {
 		return err
 	}
@@ -177,6 +190,7 @@ func gracePeriod(s string) time.Duration {
 
 type timeoutProc struct {
 	cmd *exec.Cmd
+	job *trackedJob
 }
 
 // epipeErr is returned by gateWriter after the timeout trips, so
@@ -189,9 +203,10 @@ func (epipeErr) Error() string { return "write |1: broken pipe" }
 // Write fails, unblocking write-loop builtins after a timeout.
 type gateWriter struct {
 	mu      sync.Mutex
-	dst       io.Writer
-	tripped   bool
-	closed    bool
+	dst     io.Writer
+	peer    *gateWriter
+	tripped bool
+	closed  bool
 }
 
 func (w *gateWriter) Write(p []byte) (int, error) {
@@ -205,29 +220,44 @@ func (w *gateWriter) Write(p []byte) (int, error) {
 
 func (w *gateWriter) trip() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.tripped = true
+	peer := w.peer
+	w.mu.Unlock()
+	if peer != nil {
+		peer.mu.Lock()
+		peer.tripped = true
+		peer.mu.Unlock()
+	}
 }
 
 func (w *gateWriter) close() {
 	w.mu.Lock()
-	defer w.mu.Unlock()
 	w.closed = true
+	peer := w.peer
+	w.mu.Unlock()
+	if peer != nil {
+		peer.mu.Lock()
+		peer.closed = true
+		peer.mu.Unlock()
+	}
 }
 
 // gateHCOnDone copies hc with stdout/stderr wrapped so a timeout can
-// fail further writes. Returns the wrapped context and the output gate
-// (trip it on deadline; close it on clean return).
+// fail further writes on both streams. Returns the wrapped context and
+// the linked gate (trip it on deadline; close it on clean return).
 func gateHCOnDone(hc interp.HandlerContext) (interp.HandlerContext, *gateWriter) {
-	og := &gateWriter{dst: hc.Stdout}
 	eg := &gateWriter{dst: hc.Stderr}
+	og := &gateWriter{dst: hc.Stdout, peer: eg}
 	ghc := hc
 	ghc.Stdout = og
 	ghc.Stderr = eg
 	return ghc, og
 }
 
-func startTimeoutProc(hc interp.HandlerContext, cmdArgs []string) (*timeoutProc, error) {
+func startTimeoutProc(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) (*timeoutProc, error) {
+	for _, a := range cmdArgs[1:] {
+		waitProcSubstProducerCtx(ctx, a)
+	}
 	path := cmdArgs[0]
 	if !isAbsOrRel(path) {
 		lp, err := findExec(hc, path)
@@ -247,12 +277,19 @@ func startTimeoutProc(hc interp.HandlerContext, cmdArgs []string) (*timeoutProc,
 		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", cmdArgs[0], err)
 		return nil, exitError{127}
 	}
-	globalJobs.track(c, cmdArgs)
-	return &timeoutProc{cmd: c}, nil
+	j := globalJobs.track(c, cmdArgs)
+	return &timeoutProc{cmd: c, job: j}, nil
 }
 
 func (p *timeoutProc) wait() error {
-	if err := p.cmd.Wait(); err != nil {
+	var err error
+	if p.job != nil {
+		<-p.job.done
+		err = p.job.err
+	} else {
+		err = p.cmd.Wait()
+	}
+	if err != nil {
 		if ee, ok := err.(*exec.ExitError); ok {
 			if code := signalExitCode(ee); code >= 0 {
 				return exitError{code}

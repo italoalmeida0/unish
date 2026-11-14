@@ -61,11 +61,6 @@ func main() {
 			os.Exit(0)
 		}
 	default:
-		// No args and stdin is a TTY: start the interactive shell
-		// (like bash with no args). Piped stdin keeps old behavior.
-		if isInteractive(os.Stdin) {
-			os.Exit(runInteractive())
-		}
 		rest := flag.Args()
 		if len(rest) > 0 {
 			data, err := os.ReadFile(rest[0])
@@ -76,6 +71,11 @@ func main() {
 			src = string(data)
 			name = rest[0]
 			params = rest[1:]
+		} else if termIsTTY(os.Stdin) {
+			// No args and stdin is a real terminal TTY: start the interactive
+			// shell (like bash with no args). Non-TTY char devices such as
+			// /dev/null or NUL must NOT enter the interactive REPL.
+			os.Exit(runInteractive())
 		} else {
 			if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
 				fmt.Fprintln(os.Stderr, "usage: unish -c \"command\" | unish script.sh [args] | unish < script")
@@ -118,7 +118,7 @@ func main() {
 		interp.ProcSubstHandler(procSubstHandler),
 	}
 	if len(params) > 0 {
-		runnerOpts = append(runnerOpts, interp.Params(params...))
+		runnerOpts = append(runnerOpts, interp.Params(append([]string{"--"}, params...)...))
 	}
 	r, err := interp.New(runnerOpts...)
 	if err != nil {
@@ -139,7 +139,9 @@ func main() {
 	defer signal.Stop(sigCh)
 	go func() {
 		for sig := range sigCh {
-			if r.QueueSignal(sig) {
+			// setSigTrap already registered signal.Notify(r.sigCh, sig);
+			// checking TrapRegistered avoids queueing OS signals twice.
+			if r.TrapRegistered(sig) {
 				continue
 			}
 			cancel()

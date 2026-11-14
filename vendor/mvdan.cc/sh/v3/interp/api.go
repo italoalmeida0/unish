@@ -184,7 +184,13 @@ type Runner struct {
 	// bgStarted is non-nil when this runner is a background subshell
 	// whose statement may amount to starting one external program;
 	// the runner reports through it once via [Runner.reportBgStart].
-	bgStarted chan int
+	bgStarted   chan int
+	bgTrackOnce *sync.Once
+
+	// stmtProcSubsts holds process substitutions expanded while running
+	// the current foreground statement so StmtDone can be signalled when
+	// that statement finishes.
+	stmtProcSubsts []*ProcSubstFile
 
 	// pipeStatusCodes accumulates the stages of the current pipeline so a
 	// left-nested `a | b | c` keeps all three, like bash.
@@ -219,11 +225,14 @@ type Runner struct {
 	// Fake signal callbacks
 	callbackErr  string
 	callbackExit string
+	errIgnored   bool
+	exitIgnored  bool
 
 	// Signal traps registered via the trap builtin; like bash, they run
 	// between commands rather than re-entrantly.
 	sigMu        sync.Mutex
 	sigCallbacks map[os.Signal]string
+	sigIgnored   map[os.Signal]bool
 	sigNames     map[os.Signal]string
 	sigCh        chan os.Signal
 }
@@ -995,6 +1004,9 @@ func (r *Runner) Reset() {
 		}
 		// Clean it as we will later do a string prefix match.
 		r.tempDir = filepath.Clean(r.tempDir)
+	} else {
+		r.closeOwnedExtraFds()
+		r.resetSignals()
 	}
 	// reset the internal state
 	*r = Runner{
@@ -1192,6 +1204,11 @@ func (r *Runner) Run(ctx context.Context, node syntax.Node) error {
 		r.stmt(ctx, node)
 	case syntax.Command:
 		r.cmd(ctx, node)
+		if len(r.stmtProcSubsts) > 0 {
+			psfs := r.stmtProcSubsts
+			r.stmtProcSubsts = nil
+			r.finishStmtProcSubsts(psfs)
+		}
 	default:
 		return fmt.Errorf("node can only be File, Stmt, or Command: %T", node)
 	}
@@ -1276,10 +1293,24 @@ func (r *Runner) subshell(background bool) *Runner {
 		lastExit:             r.lastExit,
 
 		origStdout: r.origStdout, // used for process substitutions
-
-		extraFds:   r.extraFds,
-		extraInFds: r.extraInFds,
 	}
+	if len(r.extraFds) > 0 {
+		r2.extraFds = make(map[int]io.Writer, len(r.extraFds))
+		for fd, w := range r.extraFds {
+			r2.extraFds[fd] = nopCloseWriter{w: w}
+		}
+	}
+	if len(r.extraInFds) > 0 {
+		r2.extraInFds = make(map[int]io.Reader, len(r.extraInFds))
+		for fd, rd := range r.extraInFds {
+			r2.extraInFds[fd] = nopCloseReader{r: rd}
+		}
+	}
+	r.sigMu.Lock()
+	if len(r.sigIgnored) > 0 {
+		r2.sigIgnored = maps.Clone(r.sigIgnored)
+	}
+	r.sigMu.Unlock()
 	r2.writeEnv = newOverlayEnviron(r.writeEnv, background)
 	// Funcs are copied, since they might be modified.
 	r2.Funcs = maps.Clone(r.Funcs)
@@ -1290,4 +1321,34 @@ func (r *Runner) subshell(background bool) *Runner {
 	r2.fillExpandConfig(r.ectx)
 	r2.didReset = true
 	return r2
+}
+
+type nopCloseWriter struct{ w io.Writer }
+
+func (n nopCloseWriter) Write(p []byte) (int, error) { return n.w.Write(p) }
+
+type nopCloseReader struct{ r io.Reader }
+
+func (n nopCloseReader) Read(p []byte) (int, error) { return n.r.Read(p) }
+
+func (r *Runner) closeOwnedExtraFds() {
+	seen := make(map[io.Closer]struct{})
+	for _, w := range r.extraFds {
+		if c, ok := w.(io.Closer); ok {
+			if _, dup := seen[c]; !dup {
+				seen[c] = struct{}{}
+				_ = c.Close()
+			}
+		}
+	}
+	for _, in := range r.extraInFds {
+		if c, ok := in.(io.Closer); ok {
+			if _, dup := seen[c]; !dup {
+				seen[c] = struct{}{}
+				_ = c.Close()
+			}
+		}
+	}
+	r.extraFds = nil
+	r.extraInFds = nil
 }

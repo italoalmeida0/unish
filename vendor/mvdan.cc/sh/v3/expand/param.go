@@ -382,13 +382,17 @@ func (cfg *Config) replaceElems(repl *syntax.Replace, elems []string) ([]string,
 		return elems, nil // nothing to replace
 	}
 	// bash/GNU anchors: ${var/#pat/rep} only matches at the start of the
-	// value, ${var/%pat/rep} only at the end.
+	// value, ${var/%pat/rep} only at the end. Only an unquoted, unescaped
+	// leading '#' or '%' acts as an anchor; "${var/"#"/rep}" and
+	// "${var/\#/rep}" match literal '#' characters.
 	var anchor byte
-	if orig[0] == '#' || orig[0] == '%' {
-		anchor = orig[0]
-		orig = orig[1:]
-		if orig == "" {
-			return elems, nil
+	if repl.Orig != nil && len(repl.Orig.Parts) > 0 {
+		if lit, ok := repl.Orig.Parts[0].(*syntax.Lit); ok && len(lit.Value) > 0 && (lit.Value[0] == '#' || lit.Value[0] == '%') {
+			anchor = orig[0]
+			orig = orig[1:]
+			if orig == "" {
+				return elems, nil
+			}
 		}
 	}
 	with, err := literalReplace(cfg, repl.With)
@@ -439,21 +443,122 @@ func (cfg *Config) replaceElems(repl *syntax.Replace, elems []string) ([]string,
 const replaceEscAmp = "\x01"
 
 // literalReplace expands the replacement word of ${var/pat/rep}, keeping
-// \& distinguishable from a plain '&' (bash matched-text syntax).
+// \& and quoted '&' distinguishable from an unquoted '&' (bash matched-text syntax).
 func literalReplace(cfg *Config, w *syntax.Word) (string, error) {
+	if w == nil {
+		return "", nil
+	}
 	cloned := *w
-	parts := make([]syntax.WordPart, len(w.Parts))
-	for i, p := range w.Parts {
-		if lit, ok := p.(*syntax.Lit); ok {
-			nl := *lit
-			nl.Value = strings.ReplaceAll(nl.Value, `\&`, replaceEscAmp)
-			parts[i] = &nl
-		} else {
-			parts[i] = p
+	cloned.Parts = escapeReplaceParts(cfg, w.Parts, false)
+	return Literal(cfg, &cloned)
+}
+
+func escapeReplaceParts(cfg *Config, parts []syntax.WordPart, quoted bool) []syntax.WordPart {
+	out := make([]syntax.WordPart, len(parts))
+	for i, p := range parts {
+		switch pt := p.(type) {
+		case *syntax.Lit:
+			nl := *pt
+			if quoted {
+				nl.Value = strings.ReplaceAll(pt.Value, "&", replaceEscAmp)
+			} else {
+				var sb strings.Builder
+				s := pt.Value
+				sb.Grow(len(s))
+				for j := 0; j < len(s); j++ {
+					if s[j] == '\\' && j+1 < len(s) {
+						switch s[j+1] {
+						case '&':
+							sb.WriteString(replaceEscAmp)
+							j++
+							continue
+						case '\\':
+							sb.WriteByte('\\')
+							j++
+							continue
+						}
+					}
+					sb.WriteByte(s[j])
+				}
+				nl.Value = sb.String()
+			}
+			out[i] = &nl
+		case *syntax.SglQuoted:
+			ns := *pt
+			if ns.Dollar {
+				val, _, _ := Format(cfg, ns.Value, nil)
+				val, _, _ = strings.Cut(val, "\x00")
+				ns.Dollar = false
+				ns.Value = strings.ReplaceAll(val, "&", replaceEscAmp)
+			} else {
+				ns.Value = strings.ReplaceAll(ns.Value, "&", replaceEscAmp)
+			}
+			out[i] = &ns
+		case *syntax.DblQuoted:
+			nd := *pt
+			nd.Parts = escapeReplaceParts(cfg, pt.Parts, true)
+			out[i] = &nd
+		default:
+			out[i] = p
 		}
 	}
-	cloned.Parts = parts
-	return Literal(cfg, &cloned)
+	return out
+}
+
+// AssocKey expands an associative-array subscript expression as a string key,
+// handling both [*syntax.Word] subscripts (e.g. m[foo], m["a-b"]) and
+// subscripts tokenized as arithmetic expressions due to unquoted operators
+// such as '-' or '+' (e.g. m[foo-bar], m[$k-port]).
+func AssocKey(cfg *Config, idx syntax.ArithmExpr) (string, error) {
+	if idx == nil {
+		return "", nil
+	}
+	switch x := idx.(type) {
+	case *syntax.Word:
+		return Literal(cfg, x)
+	case *syntax.ParenArithm:
+		inner, err := AssocKey(cfg, x.X)
+		if err != nil {
+			return "", err
+		}
+		return "(" + inner + ")", nil
+	case *syntax.UnaryArithm:
+		inner, err := AssocKey(cfg, x.X)
+		if err != nil {
+			return "", err
+		}
+		if x.Post {
+			return inner + x.Op.String(), nil
+		}
+		return x.Op.String() + inner, nil
+	case *syntax.BinaryArithm:
+		left, err := AssocKey(cfg, x.X)
+		if err != nil {
+			return "", err
+		}
+		right, err := AssocKey(cfg, x.Y)
+		if err != nil {
+			return "", err
+		}
+		op := x.Op.String()
+		var lpad, rpad string
+		if x.OpPos.IsValid() && x.X.End().IsValid() && x.OpPos.Offset() > x.X.End().Offset() {
+			if n := int(x.OpPos.Offset() - x.X.End().Offset()); n > 0 && n <= 64 {
+				lpad = strings.Repeat(" ", n)
+			}
+		}
+		if x.OpPos.IsValid() && x.Y.Pos().IsValid() {
+			opEnd := x.OpPos.Offset() + uint(len(op))
+			if x.Y.Pos().Offset() > opEnd {
+				if n := int(x.Y.Pos().Offset() - opEnd); n > 0 && n <= 64 {
+					rpad = strings.Repeat(" ", n)
+				}
+			}
+		}
+		return left + lpad + op + rpad + right, nil
+	default:
+		return "", fmt.Errorf("unsupported associative subscript: %T", idx)
+	}
 }
 
 // removePatternElems applies a pattern removal operator to each element.
@@ -563,7 +668,7 @@ func (cfg *Config) varInd(vr Variable, idx syntax.ArithmExpr) (string, bool, err
 			}
 			return strings.Join(strs, " "), vr.IsSet(), nil
 		}
-		val, err := Literal(cfg, idx.(*syntax.Word))
+		val, err := AssocKey(cfg, idx)
 		if err != nil {
 			return "", false, err
 		}
@@ -597,7 +702,7 @@ func (cfg *Config) assignElem(name string, vr Variable, idx syntax.ArithmExpr, v
 		key := "0"
 		if idx != nil {
 			var err error
-			if key, err = Literal(cfg, idx.(*syntax.Word)); err != nil {
+			if key, err = AssocKey(cfg, idx); err != nil {
 				return err
 			}
 		}

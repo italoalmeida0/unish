@@ -7,35 +7,62 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"mvdan.cc/sh/v3/interp"
 )
 
-var shellUmask = 0o022
+var shellUmask atomic.Int32
+
+func init() {
+	shellUmask.Store(0o022)
+}
 
 // cmdUmask implements `umask [MODE]`: prints the current mask (0022) or
 // sets it. Mirrors bash behavior for the common forms.
 func cmdUmask(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if len(args) == 1 {
-		fmt.Fprintf(hc.Stdout, "%04o\n", shellUmask)
+		fmt.Fprintf(hc.Stdout, "%04o\n", shellUmask.Load())
 		return nil
 	}
+	endOpts := false
+	printed := false
+	var modes []string
 	for _, a := range args[1:] {
-		if a == "-S" {
-			fmt.Fprintln(hc.Stdout, umaskSymbolic(shellUmask))
-			continue
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if a == "-S" {
+				printed = true
+				fmt.Fprintln(hc.Stdout, umaskSymbolic(int(shellUmask.Load())))
+				continue
+			}
+			if a == "-p" {
+				printed = true
+				fmt.Fprintf(hc.Stdout, "umask %04o\n", shellUmask.Load())
+				continue
+			}
+			if strings.HasPrefix(a, "-") && len(a) > 1 {
+				fmt.Fprintf(hc.Stderr, "umask: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+				return flag.ErrHelp
+			}
 		}
-		if strings.HasPrefix(a, "-") {
-			fmt.Fprintf(hc.Stderr, "umask: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
-			return flag.ErrHelp
-		}
+		modes = append(modes, a)
+	}
+	if len(modes) == 0 && !printed {
+		fmt.Fprintf(hc.Stdout, "%04o\n", shellUmask.Load())
+		return nil
+	}
+	for _, a := range modes {
 		v, err := strconv.ParseUint(a, 8, 32)
 		if err != nil || v > 0o777 {
 			fmt.Fprintf(hc.Stderr, "umask: '%s': invalid octal number\n", a)
 			return exitError{1}
 		}
-		shellUmask = int(v)
-		applyUmask(shellUmask)
+		shellUmask.Store(int32(v))
+		applyUmask(int(v))
 	}
 	return nil
 }
@@ -69,30 +96,39 @@ func cmdUlimit(_ context.Context, hc interp.HandlerContext, args []string) error
 	resource := "n"
 	var setVal *uint64
 	argv := args[1:]
+	endOpts := false
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
-		switch {
-		case a == "-a":
-			showAll = true
-		case a == "-n" || a == "-u" || a == "-f" || a == "-c" || a == "-d" || a == "-s" || a == "-v" || a == "-m":
-			resource = strings.TrimPrefix(a, "-")
-		case (len(a) == 3 && a[0] == '-' && (a[1] == 'H' || a[1] == 'S')) ||
-			(len(a) == 4 && a[0] == '-' && a[1] == 'H' && a[2] == 'S') ||
-			(len(a) == 4 && a[0] == '-' && a[1] == 'S' && a[2] == 'H'):
-			// Combined hardness+resource like -Sn/-Hn/-HSn: hardness
-			// is accepted and ignored; resource is the last letter.
-			resource = a[len(a)-1:]
-		case a == "-H" || a == "-S":
-		case strings.HasPrefix(a, "-"):
-			fmt.Fprintf(hc.Stderr, "ulimit: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
-			return flag.ErrHelp
-		default:
-			if v, err := strconv.ParseUint(a, 10, 64); err == nil {
-				setVal = &v
-			} else {
-				fmt.Fprintf(hc.Stderr, "ulimit: '%s': invalid number\n", a)
-				return exitError{1}
+		if !endOpts {
+			switch {
+			case a == "--":
+				endOpts = true
+				continue
+			case a == "-a":
+				showAll = true
+				continue
+			case a == "-n" || a == "-u" || a == "-f" || a == "-c" || a == "-d" || a == "-s" || a == "-v" || a == "-m":
+				resource = strings.TrimPrefix(a, "-")
+				continue
+			case (len(a) == 3 && a[0] == '-' && (a[1] == 'H' || a[1] == 'S')) ||
+				(len(a) == 4 && a[0] == '-' && a[1] == 'H' && a[2] == 'S') ||
+				(len(a) == 4 && a[0] == '-' && a[1] == 'S' && a[2] == 'H'):
+				// Combined hardness+resource like -Sn/-Hn/-HSn: hardness
+				// is accepted and ignored; resource is the last letter.
+				resource = a[len(a)-1:]
+				continue
+			case a == "-H" || a == "-S":
+				continue
+			case strings.HasPrefix(a, "-"):
+				fmt.Fprintf(hc.Stderr, "ulimit: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+				return flag.ErrHelp
 			}
+		}
+		if v, err := strconv.ParseUint(a, 10, 64); err == nil {
+			setVal = &v
+		} else {
+			fmt.Fprintf(hc.Stderr, "ulimit: '%s': invalid number\n", a)
+			return exitError{1}
 		}
 	}
 	if showAll {

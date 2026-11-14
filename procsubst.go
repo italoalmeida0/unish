@@ -74,17 +74,22 @@ func winProcSubstRemove(name string) {
 	winProcSubstRegistry.mu.Unlock()
 }
 
-// waitProcSubstProducer blocks until the producer of a process-
-// substitution temp file finishes (no-op for ordinary paths).
+// waitProcSubstProducer blocks until the producer of a `<(cmd)` process-
+// substitution temp file finishes (no-op for ordinary paths or `>(cmd)`).
 func waitProcSubstProducer(path string) {
+	waitProcSubstProducerCtx(context.Background(), path)
+}
+
+func waitProcSubstProducerCtx(ctx context.Context, path string) {
 	if !strings.Contains(path, "unish-procsub-") {
 		return
 	}
-	if st := winProcSubstLookup(path); st != nil {
+	if st := winProcSubstLookup(path); st != nil && st.op == syntax.CmdIn {
 		// Bounded: a dead producer must not hang the consumer
 		// forever (30s backstop; producers are local commands).
 		select {
 		case <-st.producerDone:
+		case <-ctx.Done():
 		case <-time.After(30 * time.Second):
 		}
 	}
@@ -100,6 +105,8 @@ type winProcSubst struct {
 	consOnce     sync.Once
 	mu           sync.Mutex
 	openCount    int
+	stmtEnded    bool
+	prodDoneFlag bool
 	deleted      bool
 }
 
@@ -110,34 +117,68 @@ func (s *winProcSubst) consumerOpen() {
 	s.mu.Unlock()
 }
 
-// consumerClose records a closed consumer fd and deletes the temp file
-// once the producer is done and no consumer fds remain.
+// tryDeleteLocked removes the CmdIn temp file once the producer has finished,
+// the enclosing statement has finished, and all opened consumer handles are closed.
+// Caller must hold s.mu; unlocks s.mu before filesystem removal.
+func (s *winProcSubst) tryDeleteLocked() {
+	if s.op != syntax.CmdIn || !s.prodDoneFlag || !s.stmtEnded || s.openCount > 0 || s.deleted {
+		s.mu.Unlock()
+		return
+	}
+	s.deleted = true
+	name := s.name
+	s.mu.Unlock()
+	_ = os.Remove(name)
+	winProcSubstRemove(name)
+}
+
+// consumerClose records a closed CmdIn consumer fd and deletes the temp file
+// once all conditions are satisfied.
 func (s *winProcSubst) consumerClose() {
 	s.mu.Lock()
 	s.openCount--
-	done := s.openCount <= 0
-	if done {
+	if s.openCount < 0 {
 		s.openCount = 0
 	}
-	name, del := s.name, done && !s.deleted
-	if del {
-		s.deleted = true
+	s.tryDeleteLocked()
+}
+
+// consumerWriterClose records a closed CmdOut consumer writer (`> >(cmd)` or
+// `exec 3> >(cmd)` followed by `exec 3>&-`) and unblocks the reader subshell
+// once no open consumer writers remain.
+func (s *winProcSubst) consumerWriterClose() {
+	s.mu.Lock()
+	s.openCount--
+	if s.openCount < 0 {
+		s.openCount = 0
 	}
+	done := s.openCount == 0
 	s.mu.Unlock()
-	select {
-	case <-s.producerDone:
-		if del {
-			os.Remove(name)
-			winProcSubstRemove(name)
-		}
-	default:
+	if done {
+		s.finishConsumer()
 	}
+}
+
+// noteStmtDone is invoked when the statement that expanded `<(...)` or `>(...)`
+// finishes executing.
+func (s *winProcSubst) noteStmtDone() {
+	s.mu.Lock()
+	s.stmtEnded = true
+	if s.op == syntax.CmdOut {
+		unblock := s.openCount == 0
+		s.mu.Unlock()
+		if unblock {
+			s.finishConsumer()
+		}
+		return
+	}
+	s.tryDeleteLocked()
 }
 
 // refcountedFile is an *os.File that releases a substitution ref on Close.
 type refcountedFile struct {
 	*os.File
-	st *winProcSubst
+	st   *winProcSubst
 	once sync.Once
 }
 
@@ -190,23 +231,21 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 	openSubshell := func(ctx context.Context) (io.ReadWriteCloser, error) {
 		switch op {
 		case syntax.CmdIn:
-			// Producer writes; signal completion on close.
+			// Producer writes; signal completion on close (or open failure).
 			w, err := openFileRetry(name, os.O_WRONLY|os.O_TRUNC, 0o600)
 			if err != nil {
+				st.finishProducer()
 				return nil, err
 			}
 			return &countedFile{File: w, onClose: st.finishProducer}, nil
 		default:
 			// Producer reads; wait for the consumer to finish first.
-			// Bounded: if the consumer never opens (early error on
-			// the other side), give up on ctx cancel instead of
-			// blocking forever and leaking the producer + temp.
 			select {
 			case <-st.consumerDone:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
-			r, err := os.Open(name)
+			r, err := openRetry(name)
 			if err != nil {
 				return nil, err
 			}
@@ -217,49 +256,46 @@ func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.Proc
 		_ = flag
 		switch op {
 		case syntax.CmdIn:
-			// Consumer reads; wait for the producer to finish first.
-			// The file is deleted when the consumer closes it (the
-			// runner's Cleanup may run before the consumer is done,
-			// so Cleanup must NOT delete for this direction).
-			// Bounded: a dead producer no longer hangs us forever.
 			select {
 			case <-st.producerDone:
 			case <-ctx.Done():
 				return nil, ctx.Err()
 			}
-			r, err := os.Open(name)
+			r, err := openRetry(name)
 			if err != nil {
 				return nil, err
 			}
-			return &countedFile{File: r, onClose: func() { os.Remove(name) }}, nil
+			st.consumerOpen()
+			return &refcountedFile{File: r, st: st}, nil
 		default:
-			// Consumer writes; signal completion on close so the
-			// producer (blocked above) can proceed. Deletion happens
-			// in Cleanup (after the producer is done).
 			w, err := openFileRetry(name, os.O_WRONLY|os.O_TRUNC, 0o600)
 			if err != nil {
+				st.finishConsumer()
 				return nil, err
 			}
-			return &countedFile{File: w, onClose: st.finishConsumer}, nil
+			st.consumerOpen()
+			return &countedFile{File: w, onClose: st.consumerWriterClose}, nil
 		}
 	}
 	cleanup := func() error {
-		// Must not delete or deregister here: the consumer typically
-		// opens the path AFTER the producer finishes (which is when
-		// this runs). Deletion happens on consumer close (CmdIn) or
-		// here for CmdOut (producer already consumed the input).
-		if op != syntax.CmdIn {
-			if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
-				return err
-			}
-			winProcSubstRemove(name)
+		st.finishProducer()
+		if op == syntax.CmdIn {
+			st.mu.Lock()
+			st.prodDoneFlag = true
+			st.tryDeleteLocked()
+			return nil
 		}
+		if err := os.Remove(name); err != nil && !os.IsNotExist(err) {
+			return err
+		}
+		winProcSubstRemove(name)
 		return nil
 	}
 	return &interp.ProcSubstFile{
 		Path:         name,
 		OpenSubshell: openSubshell,
 		OpenConsumer: openConsumer,
+		StmtDone:     st.noteStmtDone,
 		Cleanup:      cleanup,
 	}, nil
 }
@@ -275,7 +311,7 @@ func openShellFile(path string) (io.ReadWriteCloser, error) {
 	// hc.Stdin through devStdinReader instead of openShellFile, so this
 	// is only reached on unix (real /dev/stdin) or odd spellings —
 	// keep the direct open so the true OS error surfaces.
-	if st := winProcSubstLookup(path); st != nil {
+	if st := winProcSubstLookup(path); st != nil && st.op == syntax.CmdIn {
 		select {
 		case <-st.producerDone:
 		case <-time.After(30 * time.Second):

@@ -5,6 +5,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+
+	"mvdan.cc/sh/v3/interp"
 )
 
 // activeRunner is the interpreter currently running the script, so `kill`
@@ -34,15 +36,18 @@ func selfPID(operand string) bool {
 		return false
 	}
 	me := os.Getpid()
-	if operand == strconv.Itoa(me) {
-		return true
-	}
-	return false
+	return operand == strconv.Itoa(me)
 }
 
 // queueSelfSignal hands the signal to the running interpreter's trap queue.
-// It reports whether a trap was registered (and thus queued).
+// It reports whether a trap or ignore disposition handled the signal.
 func queueSelfSignal(sig string) bool {
+	if sig == "0" {
+		return true
+	}
+	if handled, hasActive := interp.QueueActiveSignalByName(sig); hasActive {
+		return handled
+	}
 	activeRunnerMu.Lock()
 	r := activeRunner
 	activeRunnerMu.Unlock()

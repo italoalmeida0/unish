@@ -12,6 +12,7 @@ import (
 	"io"
 	"io/fs"
 	"iter"
+	"maps"
 	"math"
 	"os"
 	"os/signal"
@@ -19,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -65,6 +67,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r2 := r.subshell(false)
 			r2.stdout = w
 			r2.stmts(ctx, cs.Stmts)
+			r2.closeOwnedExtraFds()
 			r2.exit.exiting = false // subshells don't exit the parent shell
 			r.lastExpandExit = r2.exit
 			if r2.exit.fatalExit {
@@ -85,6 +88,7 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 				return "", err
 			}
 			r.procSubsts.add(psf)
+			r.stmtProcSubsts = append(r.stmtProcSubsts, psf)
 
 			r2 := r.subshell(true)
 			stdout := r.origStdout
@@ -94,11 +98,12 @@ func (r *Runner) fillExpandConfig(ctx context.Context) {
 			r.bgProcs = append(r.bgProcs, bg)
 			go func() {
 				defer func() {
+					r2.closeOwnedExtraFds()
 					*bg.exit = r2.exit
 					close(bg.done)
 				}()
 				defer func() {
-					r.procSubsts.remove(psf)
+					r.procSubsts.release(psf)
 					if psf.Cleanup == nil {
 						return
 					}
@@ -310,24 +315,119 @@ func (r *Runner) stmt(ctx context.Context, st *syntax.Stmt) {
 		if ce, ok := st.Cmd.(*syntax.CallExpr); ok && len(ce.Args) > 0 {
 			bg.started = make(chan int, 1)
 			r2.bgStarted = bg.started
+			r2.bgTrackOnce = noteBgStartBegin()
 		}
 		r.bgProcs = append(r.bgProcs, bg)
 		go func() {
+			defer func() {
+				noteBgStartDone(r2.bgTrackOnce)
+				r2.closeOwnedExtraFds()
+				*bg.exit = r2.exit
+				close(bg.done)
+			}()
 			r2.Run(ctx, &st2)
 			r2.reportBgStart(0)     // in case we didn't get to start a program
 			r2.exit.exiting = false // subshells don't exit the parent shell
-			*bg.exit = r2.exit
-			close(bg.done)
 		}()
 	} else {
 		r.stmtSync(ctx, st)
 	}
+	r.deliverSignals(ctx)
 	r.lastExit = r.exit
 	// bash keeps PIPESTATUS in sync with the most recent pipeline or command.
 	if bc, ok := st.Cmd.(*syntax.BinaryCmd); !ok ||
 		(bc.Op != syntax.Pipe && bc.Op != syntax.PipeAll) {
 		r.setPipeStatus(int(r.exit.code))
 	}
+}
+
+var (
+	pendingBgStarts atomic.Int32
+	bgStartNotifyMu sync.Mutex
+	bgStartNotifyCh = make(chan struct{})
+	pendingBgPIDs   = map[int]*sync.Once{}
+
+	activeRunnersMu sync.Mutex
+	activeRunners   []*Runner
+)
+
+func noteBgStartBegin() *sync.Once {
+	pendingBgStarts.Add(1)
+	return &sync.Once{}
+}
+
+func noteBgStartDone(once *sync.Once) {
+	if once == nil {
+		return
+	}
+	once.Do(func() {
+		pendingBgStarts.Add(-1)
+		bgStartNotifyMu.Lock()
+		for pid, o := range pendingBgPIDs {
+			if o == once {
+				delete(pendingBgPIDs, pid)
+			}
+		}
+		close(bgStartNotifyCh)
+		bgStartNotifyCh = make(chan struct{})
+		bgStartNotifyMu.Unlock()
+	})
+}
+
+// NoteBgTrackedPID notifies a pending background launch (identified by its
+// reported OS PID) that the process has been added to the host job table.
+func NoteBgTrackedPID(pid int) {
+	bgStartNotifyMu.Lock()
+	once := pendingBgPIDs[pid]
+	if once != nil {
+		delete(pendingBgPIDs, pid)
+	}
+	bgStartNotifyMu.Unlock()
+	noteBgStartDone(once)
+}
+
+// PendingBgStarts reports the count of background `&` subshells currently in
+// flight before registering an OS process (or entering a non-exec command)
+// along with a channel closed on the next transition.
+func PendingBgStarts() (int32, <-chan struct{}) {
+	bgStartNotifyMu.Lock()
+	ch := bgStartNotifyCh
+	n := pendingBgStarts.Load()
+	bgStartNotifyMu.Unlock()
+	return n, ch
+}
+
+func pushActiveRunner(r *Runner) {
+	activeRunnersMu.Lock()
+	activeRunners = append(activeRunners, r)
+	activeRunnersMu.Unlock()
+}
+
+func popActiveRunner(r *Runner) {
+	activeRunnersMu.Lock()
+	for i := len(activeRunners) - 1; i >= 0; i-- {
+		if activeRunners[i] == r {
+			activeRunners = append(activeRunners[:i], activeRunners[i+1:]...)
+			break
+		}
+	}
+	activeRunnersMu.Unlock()
+}
+
+// QueueActiveSignalByName delivers a self-targeted signal to the innermost
+// Runner currently inside a CallHandler, reporting whether an active Runner
+// existed and whether it trapped or ignored the signal.
+func QueueActiveSignalByName(name string) (handled, hasActive bool) {
+	activeRunnersMu.Lock()
+	var r *Runner
+	if len(activeRunners) > 0 {
+		r = activeRunners[len(activeRunners)-1]
+	}
+	activeRunnersMu.Unlock()
+	if r == nil {
+		return false, false
+	}
+	return r.QueueSignalByName(name), true
 }
 
 // setPipeStatus updates the PIPESTATUS array, like bash.
@@ -344,7 +444,7 @@ func signalByName(name string) (os.Signal, bool) {
 	if n, err := strconv.Atoi(name); err == nil && n > 0 && n < 65 {
 		return syscall.Signal(n), true
 	}
-	switch strings.ToUpper(name) {
+	switch strings.TrimPrefix(strings.ToUpper(name), "SIG") {
 	case "HUP":
 		return syscall.SIGHUP, true
 	case "INT":
@@ -407,34 +507,61 @@ func signalByName(name string) (os.Signal, bool) {
 	return nil, false
 }
 
-// setSigCallback registers (or clears, with an empty callback) a signal
-// trap, keeping the notification plumbing in place.
-func (r *Runner) setSigCallback(sig os.Signal, name, callback string) {
+// setSigTrap registers, ignores, or resets a signal trap, keeping OS signal
+// notifications synchronized with active/ignored traps.
+func (r *Runner) setSigTrap(sig os.Signal, name, callback string, ignore, reset bool) {
 	r.sigMu.Lock()
 	defer r.sigMu.Unlock()
+	if reset {
+		delete(r.sigCallbacks, sig)
+		delete(r.sigIgnored, sig)
+		delete(r.sigNames, sig)
+		if r.sigCh != nil {
+			signal.Stop(r.sigCh)
+			for s := range r.sigCallbacks {
+				signal.Notify(r.sigCh, s)
+			}
+			for s := range r.sigIgnored {
+				signal.Notify(r.sigCh, s)
+			}
+		}
+		return
+	}
 	if r.sigCh == nil {
 		r.sigCh = make(chan os.Signal, 8)
 	}
 	if r.sigCallbacks == nil {
 		r.sigCallbacks = map[os.Signal]string{}
+		r.sigIgnored = map[os.Signal]bool{}
 		r.sigNames = map[os.Signal]string{}
 	}
+	wasWatched := r.sigCallbacks[sig] != "" || r.sigIgnored[sig]
 	r.sigNames[sig] = name
-	if callback == "" {
+	if ignore {
 		delete(r.sigCallbacks, sig)
-		return
+		r.sigIgnored[sig] = true
+	} else {
+		delete(r.sigIgnored, sig)
+		r.sigCallbacks[sig] = callback
 	}
-	if r.sigCallbacks[sig] == "" {
+	if !wasWatched {
 		signal.Notify(r.sigCh, sig)
 	}
-	r.sigCallbacks[sig] = callback
 }
 
-// TrapRegistered reports whether a trap handler is installed for sig.
+func (r *Runner) resetSignals() {
+	r.sigMu.Lock()
+	if r.sigCh != nil {
+		signal.Stop(r.sigCh)
+	}
+	r.sigMu.Unlock()
+}
+
+// TrapRegistered reports whether a trap handler or ignore disposition is installed for sig.
 func (r *Runner) TrapRegistered(sig os.Signal) bool {
 	r.sigMu.Lock()
 	defer r.sigMu.Unlock()
-	return r.sigCallbacks[sig] != ""
+	return r.sigCallbacks[sig] != "" || r.sigIgnored[sig]
 }
 
 // QueueSignalByName queues a signal given by name (TERM, INT, HUP, ...),
@@ -448,12 +575,17 @@ func (r *Runner) QueueSignalByName(name string) bool {
 }
 
 // QueueSignal schedules sig to run its trap handler at the next statement
-// boundary, the way bash defers traps. It reports whether a handler exists.
+// boundary, the way bash defers traps. It reports whether a handler or ignore
+// disposition exists.
 func (r *Runner) QueueSignal(sig os.Signal) bool {
 	r.sigMu.Lock()
+	ignored := r.sigIgnored[sig]
 	registered := r.sigCallbacks[sig] != ""
 	ch := r.sigCh
 	r.sigMu.Unlock()
+	if ignored {
+		return true
+	}
 	if !registered {
 		return false
 	}
@@ -466,6 +598,9 @@ func (r *Runner) QueueSignal(sig os.Signal) bool {
 
 // deliverSignals runs pending signal traps between commands.
 func (r *Runner) deliverSignals(ctx context.Context) {
+	if r.handlingTrap {
+		return
+	}
 	r.sigMu.Lock()
 	ch := r.sigCh
 	r.sigMu.Unlock()
@@ -476,16 +611,43 @@ func (r *Runner) deliverSignals(ctx context.Context) {
 		select {
 		case sig := <-ch:
 			r.sigMu.Lock()
+			ign := r.sigIgnored[sig]
 			cb := r.sigCallbacks[sig]
 			name := r.sigNames[sig]
 			r.sigMu.Unlock()
-			if cb != "" {
+			if !ign && cb != "" {
 				r.trapCallback(ctx, cb, name)
 			}
 		default:
 			return
 		}
 	}
+}
+
+func (r *Runner) finishStmtProcSubsts(psfs []*ProcSubstFile) {
+	for _, psf := range psfs {
+		if psf.StmtDone != nil {
+			psf.StmtDone()
+		}
+		r.procSubsts.release(psf)
+	}
+}
+
+func (r *Runner) stillReferenced(c io.Closer) bool {
+	if any(r.stdin) == any(c) || any(r.stdout) == any(c) || any(r.stderr) == any(c) {
+		return true
+	}
+	for _, w := range r.extraFds {
+		if any(w) == any(c) {
+			return true
+		}
+	}
+	for _, in := range r.extraInFds {
+		if any(in) == any(c) {
+			return true
+		}
+	}
+	return false
 }
 
 // reportBgStart is called by a background subshell once we first know whether
@@ -500,17 +662,37 @@ func (r *Runner) deliverSignals(ctx context.Context) {
 // a custom handler, or opening a redirection file, given that e.g. a FIFO
 // opened for writing blocks until a reader opens the other end.
 func (r *Runner) reportBgStart(pid int) {
-	if r.bgStarted != nil {
-		r.bgStarted <- pid
-		r.bgStarted = nil
+	if r.bgStarted == nil {
+		return
 	}
+	if pid == 0 || r.execHandlerIsDefault {
+		noteBgStartDone(r.bgTrackOnce)
+	} else if r.bgTrackOnce != nil {
+		bgStartNotifyMu.Lock()
+		pendingBgPIDs[pid] = r.bgTrackOnce
+		bgStartNotifyMu.Unlock()
+	}
+	r.bgStarted <- pid
+	r.bgStarted = nil
 }
 
 func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
+	savedProcSubsts := r.stmtProcSubsts
+	r.stmtProcSubsts = nil
+	defer func() {
+		psfs := r.stmtProcSubsts
+		r.stmtProcSubsts = savedProcSubsts
+		r.finishStmtProcSubsts(psfs)
+	}()
+
 	oldIn, oldOut, oldErr := r.stdin, r.stdout, r.stderr
+	var oldExtraFds map[int]io.Writer
+	var oldExtraInFds map[int]io.Reader
 	var closers []io.Closer
 	if len(st.Redirs) > 0 {
 		r.reportBgStart(0) // opening a file may block
+		oldExtraFds = maps.Clone(r.extraFds)
+		oldExtraInFds = maps.Clone(r.extraInFds)
 	}
 	for _, rd := range st.Redirs {
 		cls, err := r.redir(ctx, rd)
@@ -549,10 +731,37 @@ func (r *Runner) stmtSync(ctx context.Context, st *syntax.Stmt) {
 	}
 	if r.keepRedirs {
 		// The exec builtin made this statement's redirections apply to the
-		// shell itself, so don't undo them and keep their files open.
+		// shell itself, so keep active targets open and close any replaced
+		// or explicitly closed (>&- / <&-) descriptors owned by this Runner.
 		r.keepRedirs = false
+		closed := make(map[io.Closer]struct{})
+		closeIfUnref := func(c io.Closer) {
+			if c == nil || r.stillReferenced(c) {
+				return
+			}
+			if _, dup := closed[c]; dup {
+				return
+			}
+			closed[c] = struct{}{}
+			_ = c.Close()
+		}
+		for _, w := range oldExtraFds {
+			if c, ok := w.(io.Closer); ok {
+				closeIfUnref(c)
+			}
+		}
+		for _, in := range oldExtraInFds {
+			if c, ok := in.(io.Closer); ok {
+				closeIfUnref(c)
+			}
+		}
+		for _, cls := range closers {
+			closeIfUnref(cls)
+		}
 	} else if len(st.Redirs) > 0 {
 		r.stdin, r.stdout, r.stderr = oldIn, oldOut, oldErr
+		r.extraFds = oldExtraFds
+		r.extraInFds = oldExtraInFds
 		for _, cls := range closers {
 			cls.Close()
 		}
@@ -573,6 +782,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 	case *syntax.Subshell:
 		r2 := r.subshell(false)
 		r2.stmts(ctx, cm.Stmts)
+		r2.closeOwnedExtraFds()
 		r2.exit.exiting = false // subshells don't exit the parent shell
 		r.exit = r2.exit
 	case *syntax.CallExpr:
@@ -691,6 +901,7 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 			var wg sync.WaitGroup
 			wg.Go(func() {
 				r2.stmt(ctx, cm.X)
+				r2.closeOwnedExtraFds()
 				r2.exit.exiting = false // subshells don't exit the parent shell
 				pw.Close()
 			})
@@ -903,7 +1114,9 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 	assignLoop:
 		for as := range r.flattenAssigns(cm.Args) {
 			fp := flagParser{remaining: []string{as.Name.Value}}
+			hadFlag := false
 			for fp.more() {
+				hadFlag = true
 				switch flag := fp.flag(); flag {
 				case "-x", "-r":
 					modes = append(modes, flag)
@@ -922,6 +1135,8 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 					r.exit.code = 2
 					return
 				}
+			}
+			if hadFlag {
 				continue assignLoop
 			}
 			name := as.Name.Value
@@ -997,16 +1212,15 @@ func (r *Runner) cmd(ctx context.Context, cm syntax.Command) {
 				// declare -i: the value is an arithmetic expression.
 				// Expand the word, then evaluate it as arithmetic.
 				lit := r.literal(as.Value)
-				if n, aerr := arithmEval(r.ecfg, lit); aerr == nil {
-					vr.Set = true
-					vr.Kind = expand.String
-					vr.Str = strconv.FormatInt(n, 10)
-					r.setVar(name, vr)
-				} else {
+				n, aerr := arithmEval(r.ecfg, lit)
+				if aerr != nil {
 					r.errf("declare: %v\n", aerr)
 					r.exit.code = 1
+					continue
 				}
-				continue
+				vr.Set = true
+				vr.Kind = expand.String
+				vr.Str = strconv.FormatInt(n, 10)
 			} else {
 				name, vr = r.assignVal(name, vr, as, valType)
 			}
@@ -1069,6 +1283,9 @@ func (r *Runner) trapCallback(ctx context.Context, callback, name string) {
 	oldExit, oldLastExit := r.exit, r.lastExit
 	r.lastExit = r.exit
 	r.stmts(ctx, file.Stmts)
+	if r.exit.exiting {
+		oldExit = r.exit
+	}
 	r.exit, r.lastExit = oldExit, oldLastExit // traps on EXIT or ERR should not modify the result
 }
 
@@ -1318,11 +1535,6 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 			setOut(r.stderr)
 		case "-":
 			if fdNum > 2 {
-				if w, ok := r.extraFds[fdNum]; ok {
-					if c, ok := w.(io.Closer); ok {
-						_ = c.Close()
-					}
-				}
 				delete(r.extraFds, fdNum)
 				return nil, nil
 			}
@@ -1347,11 +1559,6 @@ func (r *Runner) redir(ctx context.Context, rd *syntax.Redirect) (io.Closer, err
 		switch arg {
 		case "-":
 			if fdNum > 2 {
-				if in, ok := r.extraInFds[fdNum]; ok {
-					if c, ok := in.(io.Closer); ok {
-						_ = c.Close()
-					}
-				}
 				delete(r.extraInFds, fdNum)
 				return nil, nil
 			}
@@ -1428,7 +1635,9 @@ func (r *Runner) call(ctx context.Context, pos syntax.Pos, args []string) {
 	}
 	if r.callHandler != nil {
 		var err error
+		pushActiveRunner(r)
 		args, err = r.callHandler(r.handlerCtx(ctx, handlerKindCall, pos), args)
+		popActiveRunner(r)
 		if err != nil {
 			// Status errors are non-fatal, like bash builtins; custom
 			// errors still halt the shell.

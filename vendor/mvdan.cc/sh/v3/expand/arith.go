@@ -6,10 +6,13 @@ package expand
 import (
 	"errors"
 	"fmt"
+	"maps"
 	"math"
+	"slices"
 	"strconv"
 	"strings"
 
+	"mvdan.cc/sh/v3/internal"
 	"mvdan.cc/sh/v3/syntax"
 )
 
@@ -37,8 +40,15 @@ func Arithm(cfg *Config, expr syntax.ArithmExpr) (int, error) {
 	case *syntax.UnaryArithm:
 		switch expr.Op {
 		case syntax.Inc, syntax.Dec:
-			name := expr.X.(*syntax.Word).Lit()
-			old, err := atoi(cfg.envGet(name))
+			lv, err := cfg.resolveArithLval(expr.X)
+			if err != nil {
+				return 0, err
+			}
+			oldStr, err := lv.get(cfg)
+			if err != nil {
+				return 0, err
+			}
+			old, err := atoi(oldStr)
 			if err != nil {
 				return 0, err
 			}
@@ -48,7 +58,7 @@ func Arithm(cfg *Config, expr syntax.ArithmExpr) (int, error) {
 			} else {
 				val--
 			}
-			if err := cfg.envSet(name, strconv.FormatInt(val, 10)); err != nil {
+			if err := lv.set(cfg, strconv.FormatInt(val, 10)); err != nil {
 				return 0, err
 			}
 			if expr.Post {
@@ -274,11 +284,156 @@ func atoiLargeBase(s string, base int64) (int64, bool) {
 	return n, true
 }
 
+type arithLval struct {
+	name     string
+	indexed  bool
+	assoc    bool
+	elemIdx  int
+	assocKey string
+}
+
+func (cfg *Config) resolveArithLval(expr syntax.ArithmExpr) (arithLval, error) {
+	for {
+		p, ok := expr.(*syntax.ParenArithm)
+		if !ok {
+			break
+		}
+		expr = p.X
+	}
+	w, ok := expr.(*syntax.Word)
+	if !ok {
+		return arithLval{}, fmt.Errorf("attempted assignment to non-variable")
+	}
+	if len(w.Parts) == 1 {
+		if pe, ok := w.Parts[0].(*syntax.ParamExp); ok && pe.Short && pe.Index != nil && pe.Param != nil &&
+			!pe.Excl && !pe.Length && pe.Repl == nil && pe.Exp == nil && pe.Slice == nil {
+			name := pe.Param.Value
+			if !syntax.ValidName(name) {
+				return arithLval{}, fmt.Errorf("attempted assignment to non-variable (error token is %q)", name)
+			}
+			vr := cfg.Env.Get(name)
+			if wenv, ok := cfg.Env.(WriteEnviron); ok {
+				if n, v := vr.Resolve(wenv); n != "" {
+					name, vr = n, v
+				}
+			}
+			if vr.Kind == Associative {
+				key, err := AssocKey(cfg, pe.Index)
+				if err != nil {
+					return arithLval{}, err
+				}
+				return arithLval{name: name, assoc: true, assocKey: key}, nil
+			}
+			idx, err := Arithm(cfg, pe.Index)
+			if err != nil {
+				return arithLval{}, err
+			}
+			if idx < 0 {
+				var list []string
+				var indexes []int
+				switch vr.Kind {
+				case String:
+					if vr.IsSet() {
+						list = []string{vr.Str}
+					}
+				case Indexed:
+					list, indexes = vr.List, vr.Indexes
+				}
+				if idx += internal.IndexedMax(list, indexes) + 1; idx < 0 {
+					return arithLval{}, fmt.Errorf("%s: bad array subscript", name)
+				}
+			}
+			return arithLval{name: name, indexed: true, elemIdx: idx}, nil
+		}
+	}
+	name := w.Lit()
+	if name == "" {
+		var err error
+		name, err = Literal(cfg, w)
+		if err != nil {
+			return arithLval{}, err
+		}
+	}
+	if !syntax.ValidName(name) {
+		return arithLval{}, fmt.Errorf("attempted assignment to non-variable (error token is %q)", name)
+	}
+	return arithLval{name: name}, nil
+}
+
+func (lv arithLval) get(cfg *Config) (string, error) {
+	if !lv.indexed && !lv.assoc {
+		return cfg.envGet(lv.name), nil
+	}
+	vr := cfg.Env.Get(lv.name)
+	if wenv, ok := cfg.Env.(WriteEnviron); ok {
+		if _, v := vr.Resolve(wenv); v.IsSet() || v.Kind != Unknown {
+			vr = v
+		}
+	}
+	if lv.assoc {
+		return vr.Map[lv.assocKey], nil
+	}
+	switch vr.Kind {
+	case String:
+		if lv.elemIdx == 0 {
+			return vr.Str, nil
+		}
+	case Indexed:
+		if s, ok := vr.indexedVal(lv.elemIdx); ok {
+			return s, nil
+		}
+	}
+	return "", nil
+}
+
+func (lv arithLval) set(cfg *Config, val string) error {
+	if !lv.indexed && !lv.assoc {
+		return cfg.envSet(lv.name, val)
+	}
+	wenv, ok := cfg.Env.(WriteEnviron)
+	if !ok {
+		return fmt.Errorf("environment is read-only")
+	}
+	name := lv.name
+	vr := cfg.Env.Get(name)
+	if n, v := vr.Resolve(wenv); n != "" {
+		name, vr = n, v
+	}
+	if lv.assoc {
+		vr.Kind = Associative
+		vr.Map = maps.Clone(vr.Map)
+		if vr.Map == nil {
+			vr.Map = make(map[string]string, 1)
+		}
+		vr.Map[lv.assocKey] = val
+		vr.Set = true
+		return wenv.Set(name, vr)
+	}
+	list, indexes := slices.Clone(vr.List), slices.Clone(vr.Indexes)
+	if vr.Kind == String && vr.IsSet() {
+		list, indexes = []string{vr.Str}, nil
+	}
+	list, indexes = internal.SetIndexedElem(list, indexes, lv.elemIdx, val)
+	vr.Kind, vr.Str, vr.List, vr.Indexes = Indexed, "", list, indexes
+	vr.Set = true
+	return wenv.Set(name, vr)
+}
+
 func (cfg *Config) assgnArit(b *syntax.BinaryArithm) (int, error) {
-	name := b.X.(*syntax.Word).Lit()
-	val, err := atoi(cfg.envGet(name))
+	lv, err := cfg.resolveArithLval(b.X)
 	if err != nil {
 		return 0, err
+	}
+	var val int64
+	if b.Op != syntax.Assgn {
+		oldStr, err := lv.get(cfg)
+		if err != nil {
+			return 0, err
+		}
+		val, err = atoi(oldStr)
+		if err != nil {
+			return 0, err
+		}
 	}
 	arg_, err := Arithm(cfg, b.Y)
 	if err != nil {
@@ -315,7 +470,7 @@ func (cfg *Config) assgnArit(b *syntax.BinaryArithm) (int, error) {
 	case syntax.ShrAssgn:
 		val >>= uint(arg)
 	}
-	if err := cfg.envSet(name, strconv.FormatInt(val, 10)); err != nil {
+	if err := lv.set(cfg, strconv.FormatInt(val, 10)); err != nil {
 		return 0, err
 	}
 	return int(val), nil

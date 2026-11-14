@@ -310,11 +310,11 @@ func (r *Runner) setVarWithIndex(prev expand.Variable, name string, index syntax
 	case expand.Associative:
 		// if the existing variable is already an AssocArray, try our
 		// best to convert the key to a string
-		w, ok := index.(*syntax.Word)
-		if !ok {
+		k, err := expand.AssocKey(r.ecfg, index)
+		if err != nil {
+			r.expandErr(err)
 			return
 		}
-		k := r.literal(w)
 
 		// TODO: only clone when inside a subshell and getting a var from outside for the first time
 		prev.Map = maps.Clone(prev.Map)
@@ -479,7 +479,14 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 	if valType == "-A" {
 		amap := make(map[string]string, len(elems))
 		for _, elem := range elems {
-			k := r.literal(elem.Index.(*syntax.Word))
+			if elem.Index == nil {
+				continue
+			}
+			k, err := expand.AssocKey(r.ecfg, elem.Index)
+			if err != nil {
+				r.expandErr(err)
+				continue
+			}
 			amap[k] = r.literal(elem.Value)
 		}
 		if !as.Append {
@@ -487,7 +494,13 @@ func (r *Runner) assignVal(name string, prev expand.Variable, as *syntax.Assign,
 			prev.Map = amap
 			return name, prev
 		}
-		// TODO
+		prev.Kind = expand.Associative
+		prev.Map = maps.Clone(prev.Map)
+		if prev.Map == nil {
+			prev.Map = amap
+		} else {
+			maps.Copy(prev.Map, amap)
+		}
 		return name, prev
 	}
 	// The base array which the new elements are set on; empty unless
