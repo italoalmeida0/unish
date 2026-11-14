@@ -454,7 +454,9 @@ func TestAwkDifferentialParityWithGawk(t *testing.T) {
 		`BEGIN { printf "before "; rc = system("echo mid"); print "after", rc }`,
 		`BEGIN { printf "c\na\nb\n" | "sort"; rc = close("sort"); print "rc=" rc }`,
 		`BEGIN { cmd = "printf '10\n20\n30\n'"; while ((cmd | getline v) > 0) s += v; print s, close(cmd) }`,
-		`BEGIN { inf = 1e300*1e300; printf "%s %s %g %G [%8f]\n", inf, -inf, inf, inf, inf }`,
+		// Note: gawk <= 5.2 ignored field width on inf/nan (fixed in gawk 5.3+);
+		// padded [%6f] width is asserted deterministically in TestAwkPipesSystemFSAndLargeInts.
+		`BEGIN { inf = 1e300*1e300; printf "%s %s %g %G %f\n", inf, -inf, inf, inf, inf }`,
 	}
 
 	for idx, prog := range programs {
@@ -465,10 +467,12 @@ func TestAwkDifferentialParityWithGawk(t *testing.T) {
 			// Run external GNU gawk via -f so Windows MSYS2 argv escaping never mangles backslashes
 			cmd := exec.Command(gawkBin, "-f", progPath)
 			cmd.Dir = dir
+			env := append(os.Environ(), "LC_ALL=C.UTF-8", "LANG=C.UTF-8")
 			if runtime.GOOS == "windows" {
 				// Ensure external gawk finds POSIX coreutils (e.g. sort) ahead of C:\Windows\System32
-				cmd.Env = append(os.Environ(), "PATH="+filepath.Dir(gawkBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
+				env = append(env, "PATH="+filepath.Dir(gawkBin)+string(os.PathListSeparator)+os.Getenv("PATH"))
 			}
+			cmd.Env = env
 			cmd.Stdin = strings.NewReader(sampleInput)
 			var gOut, gErr bytes.Buffer
 			cmd.Stdout = &gOut
