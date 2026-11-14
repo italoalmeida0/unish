@@ -1,5 +1,92 @@
 # Changelog
 
+## 1.0.2 — 2026-11-14
+
+### Fixed
+
+- **Shell engine, subshells, descriptors, process substitution & traps.**
+  Patched vendored `mvdan/sh` parameter and arithmetic expansion to fix
+  `${var/pat}` nil-replacement panics, quoted/escaped `#`/`%` non-anchors,
+  `&`/`\&` replacement semantics, `(( arr[i] = ... ))` array assignments,
+  arithmetic-tokenized associative subscripts (`expand.AssocKey`), and
+  `declare -i` / `local -i` attribute preservation (`-ir`, `-ix`).
+  Isolated FDs > 2 (`extraFds`/`extraInFds`) per statement unless `exec`
+  and across subshells without closing parent descriptors; synchronized
+  `>(cmd)` write-side drain at statement boundaries and unblocked
+  unconsumed `<(cmd)`/`>(cmd)` POSIX FIFOs with refcounted cleanup.
+  Normalized `SIG`-prefixed `trap` names and `trap -p`, separated
+  `trap ''` ignore from `trap -` reset, inherited ignored traps and ran
+  `EXIT` traps inside subshells (`(...)`, `$(...)`, `<(...)`, pipelines,
+  `&`) while stopping `os/signal` channels on teardown, delivered
+  `kill -<sig> $$` self-signals in-process (exiting `128+sig` on
+  untrapped fatal signals), stabilized job IDs and `wait`/`timeout`/
+  `kill -0` races, and fixed dash-prefixed script/`-c` positional args
+  plus `type`/`which`/`hash --`/`umask`/`ulimit`.
+- **Interactive REPL, raw-mode lifecycle, stdin isolation, UTF-8
+  completion & history.** Replaced `bufio.Scanner` read-ahead in non-TTY
+  `plainLoop` with a 1-byte reader so child processes never lose stdin;
+  restored terminal mode cleanly on `exit 0`; preserved `$?` across
+  `PROMPT_COMMAND` and ran `EXIT` traps on `EOF`/`Ctrl+D`; synchronized
+  `rawOn`, `promptSigCh`, and history slices across raw-mode suspend/
+  resume; and aborted unsubmitted partial input (`PS1`/`PS2`) on PTY
+  hangup without spinning on read errors. Fixed `Alt+Backspace` and
+  `Alt+Y` (`yank-pop`) empty-state panics, CSI private-mode (`\x1b[?2004h`)
+  sequence leaks, bracketed-paste tab/CRLF handling, multi-byte UTF-8
+  cursor slicing and escaped spaces in tab completion, trailing-backslash
+  line continuations, `HISTCONTROL` (`erasedups`/`ignorespace`),
+  `HISTFILESIZE=0` / `HISTFILE=/dev/null`, `history -a/-n/-r/-w/-d`,
+  `Ctrl+R` reverse-search cycling, and `\!` history-expansion escaping.
+- **Filesystem, `tar`/`gzip`, `find` & concurrent `xargs -P`.** Guarded
+  `cp -r` against directory/symlink self-recursion and destination-symlink
+  source truncation; checked source `Lstat`/`os.SameFile` before `-f`
+  unlinks targets in `mv` and `ln`; restricted `mv` cross-device
+  copy-delete fallback to `EXDEV` with synced atomic temp rename,
+  case-only NTFS/APFS renames, and Windows read-only `-f` handling; and
+  fixed `chmod` `-r`/`-w`/`-x` symbolic modes, `X`/`s`/`t`/`ugo` bits,
+  and `-R` symlink skipping. Hardened `tar` against archive
+  self-inclusion, symlink/hardlink Zip-Slip escapes, out-of-order
+  hardlinks, symlink body writes, and `-cvf -` stdout pollution; wrapped
+  corrupt `gzip`/`gunzip` streams as `exitError{1}` with atomic writes
+  and prompt Windows handle closes; fixed `find` `-mindepth` gating,
+  post-order `-delete`, `-L`/`-H` cycle detection, and `-exec ... {} +`
+  batching; bounded `xargs -P` worker concurrency with serialized output,
+  POSIX quote/`-d` parsing, and child stdin isolation; and tightened
+  `readlink -f/-m`, `mktemp -u`/`TMPDIR`, `base64`,
+  `sha256sum -c --strict`, `ls -R`, and `scanlines` partial-EOF reads.
+- **Streaming text/`sed`/`printf`/`test` builtins & pipeline
+  cancellation.** Replaced whole-input slurping with bounded streaming,
+  context cancellation, and `EPIPE` handling across `sed` (1-line `$`
+  lookahead across files, flattened `{...}` block compiler without global
+  range-state races, `D` line-number preservation, UTF-8 `s///`/`y///`,
+  and clobber-safe `-i`/`-Ei`/`-ni`), `grep`, `seq`, `tr`, `cut`, `uniq`,
+  `paste`, `tail`, `hexdump`, `strings`, `od`, `fold`, and `cat`,
+  alongside bounded Myers/1D-DP `diff`, UTF-8 `unexpand`, `join` unpaired
+  column alignment, `tac -r`, and `sort -h`. Fixed `printf` dynamic `*`
+  width/precision (`MinInt64`-safe negative width, omitted negative
+  precision, and `%0.s` bare-dot parity), `test`/`[` POSIX `!`/`-a`/`-o`/
+  parentheses precedence, unified `invokeExtra` builtin dispatch and
+  mutex-guarded `lsColorMode` across `xargs`/`find`/`env`/`nice`/
+  `timeout`, and `--`-aware flag/`--version` parsing.
+- **Networking (`nc`), process tools (`ps`/`pgrep`/`pkill`) &
+  cross-platform syscalls.** Fixed `nc` nil-stdin panics, TCP half-close
+  response truncation (`CloseWrite` + drain), remote-EOF unblock, `-l`
+  listener leaks on cancellation, and UDP (`nc -u`) client/listen modes.
+  Fixed `pgrep`/`pkill` self-matching, basename vs `-f` matching, split
+  signal flags (`-term`, `-stop`, `-segv`, `-sys`, `-usr1`, etc.), and OS
+  process-group `pkill -g` targeting; hardened Linux `/proc/[pid]/stat`
+  comm-with-parens parsing, dynamic page-size RSS scaling, `/proc/stat`
+  `btime` bounds, `/proc/net/{tcp6,udp6}` IPv6 word endianness with
+  bracketed `ss` `[ipv6]:port` output, and Darwin `KERN_PROCARGS2` argv
+  boundaries. Fixed `env -u PATH` resurrection and case-insensitive
+  Windows `Path=` deduplication, isolated `nice -n` priority changes to
+  child processes, and corrected `ps -p`, `df` missing-path exit status,
+  `stat` symlink `Lstat`, and `uname -i/-p` / Windows ARM64 detection.
+- **CI & release infrastructure.** Ensured GNU `coreutils-from-gnu` on
+  Ubuntu 25.10+ runners (where `coreutils` defaults to `uutils`), accepted
+  all 12 calendar months in `TestParityLsTimeStyle`, and migrated the
+  release build matrix from retired `macos-14` runners to
+  `macos-15-intel` / `macos-latest` with explicit `-mod=vendor`.
+
 ## 1.0.1 — 2026-09-26
 
 ### Fixed
