@@ -5,21 +5,26 @@ package main
 // file paths. Single Tab completes (common prefix), double Tab lists.
 
 import (
+	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
+	"unicode/utf8"
 
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
 
 // completeWord returns (replacement, alternatives) for the word under
-// the cursor. replacement is "" when ambiguous (caller rings bell /
-// shows alternatives on second Tab).
+// the cursor (pos is a rune index into line). replacement is "" when
+// ambiguous (caller rings bell / shows alternatives on second Tab).
 func completeWord(line string, pos int, r *interp.Runner, hcArgs func() []string) (string, []string) {
+	rr := []rune(line)
 	wordStart, word := wordAt(line, pos)
-	cands := candidatesFor(word, wordStart == 0, r)
+	cands := candidatesFor(word, isCommandPos(rr, wordStart), r)
 	if len(cands) == 0 {
 		return "", nil
 	}
@@ -27,29 +32,56 @@ func completeWord(line string, pos int, r *interp.Runner, hcArgs func() []string
 		return cands[0], []string{cands[0]}
 	}
 	prefix := commonPrefix(cands)
-	_ = wordStart
 	if len(prefix) > len(word) {
 		return prefix, cands
 	}
 	return "", cands
 }
 
-// wordAt finds the start of the word containing pos (space/tab and
-// shell operators delimit; quotes group).
-func wordAt(line string, pos int) (int, string) {
-	if pos > len(line) {
-		pos = len(line)
+func isWordDelimRune(c rune) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')' || c == '<' || c == '>'
+}
+
+func isEscapedAt(rr []rune, idx int) bool {
+	bs := 0
+	for j := idx - 1; j >= 0 && rr[j] == '\\'; j-- {
+		bs++
 	}
-	// Scan back to delimiter.
+	return bs%2 == 1
+}
+
+// isCommandPos reports whether wordStart sits in command position
+// (start of line or immediately following |, &, ;, (, or newline).
+func isCommandPos(rr []rune, wordStart int) bool {
+	i := wordStart - 1
+	for i >= 0 && (rr[i] == ' ' || rr[i] == '\t') && !isEscapedAt(rr, i) {
+		i--
+	}
+	if i < 0 {
+		return true
+	}
+	c := rr[i]
+	return !isEscapedAt(rr, i) && (c == ';' || c == '|' || c == '&' || c == '(' || c == '\n')
+}
+
+// wordAt finds the rune start index and text of the word containing rune
+// index pos (unescaped space/tab and shell operators delimit).
+func wordAt(line string, pos int) (int, string) {
+	rr := []rune(line)
+	if pos < 0 {
+		pos = 0
+	}
+	if pos > len(rr) {
+		pos = len(rr)
+	}
 	i := pos
 	for i > 0 {
-		c := line[i-1]
-		if c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')' || c == '<' || c == '>' {
+		if isWordDelimRune(rr[i-1]) && !isEscapedAt(rr, i-1) {
 			break
 		}
 		i--
 	}
-	return i, line[i:pos]
+	return i, string(rr[i:pos])
 }
 
 func commonPrefix(ss []string) string {
@@ -61,6 +93,15 @@ func commonPrefix(ss []string) string {
 		n := 0
 		for n < len(p) && n < len(s) && p[n] == s[n] {
 			n++
+		}
+		if n < len(p) {
+			for n > 0 && !utf8.RuneStart(p[n]) {
+				n--
+			}
+		} else if n < len(s) {
+			for n > 0 && !utf8.RuneStart(s[n]) {
+				n--
+			}
 		}
 		p = p[:n]
 		if p == "" {
@@ -112,19 +153,19 @@ func candidatesFor(word string, firstWord bool, r *interp.Runner) []string {
 			}
 		}
 		// PATH executables.
-		for _, n := range pathCommands(word) {
+		for _, n := range pathCommands(word, r) {
 			add(n)
 		}
 	}
 	// File paths always (commands take args; later words are files).
-	for _, n := range fileMatches(word) {
+	for _, n := range fileMatchesWithRunner(word, r) {
 		add(n)
 	}
 	sort.Strings(out)
 	return out
 }
 
-// builtinNames merges mvdan/sh builtins, unish extras and declared funcs.
+// builtinNames merges mvdan/sh builtins, unish extras, declared funcs and aliases.
 func builtinNames(r *interp.Runner) []string {
 	var out []string
 	// Static list mirrors interp builtin table + our extras.
@@ -138,7 +179,7 @@ func builtinNames(r *interp.Runner) []string {
 		"mapfile", "popd", "printf", "pushd", "pwd", "read", "readarray",
 		"return", "select", "set", "shift", "shopt", "suspend", "test",
 		"time", "times", "trap", "true", "type", "typeset", "ulimit",
-		"umask", "unalias", "unset", "until", "wait", "while",
+		"umask", "unset", "until", "wait", "while",
 	} {
 		if interp.IsBuiltin(n) || isUnishCommand(n) || lookupExtra(n) != nil {
 			out = append(out, n)
@@ -151,8 +192,35 @@ func builtinNames(r *interp.Runner) []string {
 		for n := range r.Funcs {
 			out = append(out, n)
 		}
+		out = append(out, aliasNames(r)...)
 	}
 	return out
+}
+
+func aliasNames(r *interp.Runner) []string {
+	if r == nil {
+		return nil
+	}
+	var out strings.Builder
+	r2 := r.Subshell()
+	_ = interp.StdIO(nil, &out, io.Discard)(r2)
+	prog, err := syntax.NewParser().Parse(strings.NewReader("compgen -a"), "")
+	if err != nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := r2.Run(ctx, prog); err != nil {
+		return nil
+	}
+	var names []string
+	for _, line := range strings.Split(out.String(), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			names = append(names, line)
+		}
+	}
+	return names
 }
 
 func extraCommandNames() []string {
@@ -173,21 +241,33 @@ func shellVarNames(r *interp.Runner) []string {
 		}
 		return out
 	}
-	// r.Vars holds shell vars; writeEnv overlays Env — read via Params?
-	// Use Funcs-adjacent exported map: Vars is exported on Runner.
-	for n := range r.Vars {
-		out = append(out, n)
+	for n, v := range r.Vars {
+		if v.IsSet() {
+			out = append(out, n)
+		}
 	}
 	for _, e := range os.Environ() {
 		if i := strings.IndexByte(e, '='); i > 0 {
-			out = append(out, e[:i])
+			name := e[:i]
+			if v, exists := r.Vars[name]; exists && !v.IsSet() {
+				continue
+			}
+			out = append(out, name)
 		}
 	}
 	return out
 }
 
-func pathCommands(prefix string) []string {
-	path := os.Getenv("PATH")
+func pathCommands(prefix string, r *interp.Runner) []string {
+	path := ""
+	if r != nil && r.Vars != nil {
+		if v, ok := r.Vars["PATH"]; ok && v.IsSet() {
+			path = v.Str
+		}
+	}
+	if path == "" {
+		path = os.Getenv("PATH")
+	}
 	if path == "" {
 		return nil
 	}
@@ -213,21 +293,52 @@ func pathCommands(prefix string) []string {
 	return out
 }
 
-// fileMatches completes word as a path (handles ~/ and dir/ prefix,
-// appends / to directories like bash).
+const compQuoteMeta = " \t'\"()[]{}&;|$<>!#^*?"
+
+func unescapeCompWord(s string) string {
+	if !strings.ContainsRune(s, '\\') {
+		return s
+	}
+	rr := []rune(s)
+	var sb strings.Builder
+	for i := 0; i < len(rr); i++ {
+		if rr[i] == '\\' && i+1 < len(rr) && (rr[i+1] == '\\' || strings.ContainsRune(compQuoteMeta, rr[i+1])) {
+			i++
+			sb.WriteRune(rr[i])
+			continue
+		}
+		sb.WriteRune(rr[i])
+	}
+	return sb.String()
+}
+
+// fileMatches completes word as a path against CWD (kept for callers without Runner).
 func fileMatches(word string) []string {
-	dir, base := ".", word
-	if i := strings.LastIndexAny(word, "/\\"); i >= 0 {
-		dir, base = word[:i+1], word[i+1:]
+	return fileMatchesWithRunner(word, nil)
+}
+
+// fileMatchesWithRunner completes word as a path relative to r.Dir
+// (handles ~/ and dir/ prefix, escaped spaces, and appends / to dirs).
+func fileMatchesWithRunner(word string, r *interp.Runner) []string {
+	rawWord := unescapeCompWord(word)
+	dir, base := ".", rawWord
+	if i := strings.LastIndexAny(rawWord, "/\\"); i >= 0 {
+		dir, base = rawWord[:i+1], rawWord[i+1:]
 		if dir == "" {
 			dir = "/"
 		}
 	}
-	// ~ expansion for completion scan only.
+	// ~ expansion and Runner.Dir resolution for completion scan.
 	scanDir := dir
-	if strings.HasPrefix(dir, "~/") || dir == "~" {
-		if h, err := os.UserHomeDir(); err == nil {
+	if strings.HasPrefix(dir, "~/") || strings.HasPrefix(dir, "~\\") || dir == "~" {
+		if h, err := os.UserHomeDir(); err == nil && h != "" {
 			scanDir = h + dir[1:]
+		}
+	} else if !filepath.IsAbs(scanDir) && r != nil && r.Dir != "" {
+		if scanDir == "." {
+			scanDir = r.Dir
+		} else {
+			scanDir = filepath.Join(r.Dir, scanDir)
 		}
 	}
 	ents, err := os.ReadDir(scanDir)
@@ -244,12 +355,24 @@ func fileMatches(word string) []string {
 		if dir == "." {
 			s = n
 		}
-		if e.IsDir() {
+		isDir := e.IsDir()
+		if !isDir && e.Type()&os.ModeSymlink != 0 {
+			if fi, err := os.Stat(filepath.Join(scanDir, n)); err == nil && fi.IsDir() {
+				isDir = true
+			}
+		}
+		if isDir {
 			s += "/"
 		}
-		// Quote names with spaces like bash does (backslash).
-		if strings.ContainsAny(n, " \t'\"()[]{}&;|$<>!#^*?") {
-			s = dirQuote(s)
+		// Quote shell metacharacters (preserving leading ~/ unescaped).
+		tildePrefix := ""
+		rest := s
+		if strings.HasPrefix(s, "~/") || strings.HasPrefix(s, "~\\") {
+			tildePrefix = s[:2]
+			rest = s[2:]
+		}
+		if strings.ContainsAny(rest, compQuoteMeta) {
+			s = tildePrefix + dirQuote(rest)
 		}
 		out = append(out, s)
 	}
@@ -259,7 +382,7 @@ func fileMatches(word string) []string {
 func dirQuote(s string) string {
 	var sb strings.Builder
 	for _, r := range s {
-		if strings.ContainsRune(" \t'\"()[]{}&;|$<>!#^*?", r) {
+		if strings.ContainsRune(compQuoteMeta, r) {
 			sb.WriteByte('\\')
 		}
 		sb.WriteRune(r)

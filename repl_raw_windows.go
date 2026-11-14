@@ -19,6 +19,7 @@ package main
 
 import (
 	"os"
+	"sync"
 
 	"golang.org/x/sys/windows"
 	"golang.org/x/term"
@@ -28,9 +29,30 @@ func termIsTTY(f *os.File) bool {
 	return term.IsTerminal(int(f.Fd()))
 }
 
-func termRawOn() (func(), bool) {
-	inH := windows.Handle(os.Stdin.Fd())
+type rawSession struct {
+	mu      sync.Mutex
+	inH     windows.Handle
+	inMode  uint32
+	rawIn   uint32
+	outH    windows.Handle
+	haveOut bool
+	outMode uint32
+	rawOut  uint32
+	oldTerm *term.State
+	stdinFd int
+	conFile *os.File
+	active  bool
+	closed  bool
+}
+
+func startRawSession(in *os.File) (*rawSession, bool) {
+	if in == nil {
+		in = os.Stdin
+	}
+	stdinFd := int(in.Fd())
+	inH := windows.Handle(in.Fd())
 	var inMode uint32
+	own := false
 	if err := windows.GetConsoleMode(inH, &inMode); err != nil {
 		// Piped stdin but a real console exists (e.g. child with
 		// redirected pipes): open CONIN$ directly so the REPL still
@@ -43,9 +65,18 @@ func termRawOn() (func(), bool) {
 			_ = windows.CloseHandle(conH)
 			return nil, false
 		}
-		return rawOnHandle(conH, inMode, true)
+		inH = conH
+		own = true
 	}
-	return rawOnHandle(inH, inMode, false)
+	return newWinRawSession(inH, inMode, stdinFd, own)
+}
+
+func termRawOn() (func(), bool) {
+	s, ok := startRawSession(os.Stdin)
+	if !ok {
+		return nil, false
+	}
+	return s.close, true
 }
 
 func openConIn() (windows.Handle, error) {
@@ -59,11 +90,8 @@ func openConIn() (windows.Handle, error) {
 		nil, windows.OPEN_EXISTING, 0, 0)
 }
 
-// rawOnHandle puts an input console handle in raw VT mode. When own is
-// true the handle came from openConIn: reads use it too (rp.inFile is
-// swapped by the caller) and it is closed on restore.
-func rawOnHandle(inH windows.Handle, inMode uint32, own bool) (func(), bool) {
-	var outH = windows.Handle(os.Stdout.Fd())
+func newWinRawSession(inH windows.Handle, inMode uint32, stdinFd int, own bool) (*rawSession, bool) {
+	outH := windows.Handle(os.Stdout.Fd())
 	var outMode uint32
 	haveOut := windows.GetConsoleMode(outH, &outMode) == nil
 
@@ -77,50 +105,139 @@ func rawOnHandle(inH windows.Handle, inMode uint32, own bool) (func(), bool) {
 		ENABLE_PROCESSED_OUTPUT            = 0x0001
 		ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
 	)
-	newIn := inMode
-	newIn &^= ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT
-	newIn |= ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT
-	if err := windows.SetConsoleMode(inH, newIn); err != nil {
+	rawIn := inMode
+	rawIn &^= ENABLE_LINE_INPUT | ENABLE_ECHO_INPUT | ENABLE_PROCESSED_INPUT | ENABLE_MOUSE_INPUT
+	rawIn |= ENABLE_WINDOW_INPUT | ENABLE_VIRTUAL_TERMINAL_INPUT
+	if err := windows.SetConsoleMode(inH, rawIn); err != nil {
 		if own {
 			_ = windows.CloseHandle(inH)
 		}
 		return nil, false
 	}
-	var prevOut uint32
+	rawOut := outMode
 	if haveOut {
-		prevOut = outMode
-		newOut := outMode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
-		_ = windows.SetConsoleMode(outH, newOut)
+		rawOut = outMode | ENABLE_PROCESSED_OUTPUT | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+		_ = windows.SetConsoleMode(outH, rawOut)
 	}
-	oldTerm, _ := term.MakeRaw(int(os.Stdin.Fd()))
-	restored := false
-	restore := func() {
-		if restored {
-			return
-		}
-		restored = true
-		if oldTerm != nil {
-			_ = term.Restore(int(os.Stdin.Fd()), oldTerm)
-		}
-		_ = windows.SetConsoleMode(inH, inMode)
-		if haveOut {
-			_ = windows.SetConsoleMode(outH, prevOut)
-		}
-		if own {
-			_ = windows.CloseHandle(inH)
-		}
+	var oldTerm *term.State
+	if !own {
+		oldTerm, _ = term.MakeRaw(stdinFd)
+	}
+	s := &rawSession{
+		inH:     inH,
+		inMode:  inMode,
+		rawIn:   rawIn,
+		outH:    outH,
+		haveOut: haveOut,
+		outMode: outMode,
+		rawOut:  rawOut,
+		oldTerm: oldTerm,
+		stdinFd: stdinFd,
+		active:  true,
 	}
 	if own {
 		conFile := os.NewFile(uintptr(inH), "CONIN$")
 		if conFile == nil {
-			restore()
+			_ = windows.SetConsoleMode(inH, inMode)
+			if haveOut {
+				_ = windows.SetConsoleMode(outH, outMode)
+			}
+			_ = windows.CloseHandle(inH)
 			return nil, false
 		}
-		// Caller swaps rp.inFile to conFile and closes it via restore.
-		// Stash it in the package var consumed below.
+		s.conFile = conFile
 		conInFile = conFile
 	}
-	return restore, true
+	return s, true
+}
+
+func (s *rawSession) suspend() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.active || s.closed {
+		return
+	}
+	if s.oldTerm != nil {
+		_ = term.Restore(s.stdinFd, s.oldTerm)
+		s.oldTerm = nil
+	}
+	_ = windows.SetConsoleMode(s.inH, s.inMode)
+	if s.haveOut {
+		_ = windows.SetConsoleMode(s.outH, s.outMode)
+	}
+	s.active = false
+}
+
+func (s *rawSession) resume() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.active || s.closed {
+		return
+	}
+	if err := windows.SetConsoleMode(s.inH, s.rawIn); err != nil {
+		return
+	}
+	if s.haveOut {
+		_ = windows.SetConsoleMode(s.outH, s.rawOut)
+	}
+	if s.conFile == nil {
+		s.oldTerm, _ = term.MakeRaw(s.stdinFd)
+	}
+	s.active = true
+}
+
+func (s *rawSession) close() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.closed {
+		return
+	}
+	if s.active {
+		if s.oldTerm != nil {
+			_ = term.Restore(s.stdinFd, s.oldTerm)
+			s.oldTerm = nil
+		}
+		_ = windows.SetConsoleMode(s.inH, s.inMode)
+		if s.haveOut {
+			_ = windows.SetConsoleMode(s.outH, s.outMode)
+		}
+		s.active = false
+	}
+	s.closed = true
+	if s.conFile != nil {
+		if conInFile == s.conFile {
+			conInFile = nil
+		}
+		_ = s.conFile.Close()
+		s.conFile = nil
+	}
+}
+
+func (s *rawSession) inFile() *os.File {
+	if s == nil {
+		return nil
+	}
+	return s.conFile
+}
+
+// rawOnHandle puts an input console handle in raw VT mode. When own is
+// true the handle came from openConIn: reads use it too (rp.inFile is
+// swapped by the caller) and it is closed on restore.
+func rawOnHandle(inH windows.Handle, inMode uint32, own bool) (func(), bool) {
+	s, ok := newWinRawSession(inH, inMode, int(os.Stdin.Fd()), own)
+	if !ok {
+		return nil, false
+	}
+	return s.close, true
 }
 
 // conInFile is set by rawOnHandle when stdin was piped but CONIN$

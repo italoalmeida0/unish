@@ -77,7 +77,7 @@ func (k *keyReader) next() (vtKey, bool) {
 	switch b0 {
 	case '\r', '\n':
 		k.buf = k.buf[1:]
-		return vtKey{code: keyEnter}, true
+		return vtKey{code: keyEnter, bytes: []byte{b0}}, true
 	case 0x01:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlA}, true
@@ -99,9 +99,12 @@ func (k *keyReader) next() (vtKey, bool) {
 	case 0x07:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlL}, true // Ctrl-G: redraw like clear-screen-lite
+	case 0x08:
+		k.buf = k.buf[1:]
+		return vtKey{code: keyBackspace}, true
 	case 0x09:
 		k.buf = k.buf[1:]
-		return vtKey{code: keyTab}, true
+		return vtKey{code: keyTab, bytes: []byte{b0}}, true
 	case 0x0b:
 		k.buf = k.buf[1:]
 		return vtKey{code: keyCtrlK}, true
@@ -141,6 +144,10 @@ func (k *keyReader) next() (vtKey, bool) {
 	case 0x1b:
 		return k.nextEsc()
 	}
+	if b0 < 0x20 {
+		k.buf = k.buf[1:]
+		return vtKey{code: keyUnknown, bytes: []byte{b0}}, true
+	}
 	if b0 < 0x80 {
 		k.buf = k.buf[1:]
 		return vtKey{r: rune(b0)}, true
@@ -174,9 +181,7 @@ func (k *keyReader) nextEsc() (vtKey, bool) {
 				return vtKey{code: keyAltD}, true
 			case 'y', 'Y':
 				return vtKey{code: keyAltY}, true
-			case 0x7f:
-				k.buf = k.buf[1:] // already consumed ESC; fix below
-				// consumed ESC + DEL
+			case 0x7f, 0x08:
 				return vtKey{code: keyAltBackspace}, true
 			}
 			return vtKey{r: rune(rest[0]), code: keyEscape}, true
@@ -188,14 +193,19 @@ func (k *keyReader) nextEsc() (vtKey, bool) {
 		k.buf = k.buf[1+size:]
 		return vtKey{r: r, code: keyEscape}, true
 	}
-	// CSI: ESC [ params final
+	// CSI: ESC [ params/intermediates (0x20..0x3f) final (0x40..0x7e)
 	if k.buf[1] == '[' {
 		i := 2
-		for i < len(k.buf) && (k.buf[i] >= '0' && k.buf[i] <= '9' || k.buf[i] == ';') {
+		for i < len(k.buf) && k.buf[i] >= 0x20 && k.buf[i] <= 0x3f {
 			i++
 		}
 		if i >= len(k.buf) {
 			return vtKey{}, false
+		}
+		if k.buf[i] < 0x40 || k.buf[i] > 0x7e {
+			raw := append([]byte(nil), k.buf[:i]...)
+			k.buf = k.buf[i:]
+			return vtKey{code: keyUnknown, bytes: raw}, true
 		}
 		params := string(k.buf[2:i])
 		final := k.buf[i]
@@ -269,7 +279,16 @@ type lineBuf struct {
 	pos  int // 0..len(text)
 }
 
+func (l *lineBuf) clamp() {
+	if l.pos < 0 {
+		l.pos = 0
+	} else if l.pos > len(l.text) {
+		l.pos = len(l.text)
+	}
+}
+
 func (l *lineBuf) insert(r rune) {
+	l.clamp()
 	l.text = append(l.text[:l.pos], append([]rune{r}, l.text[l.pos:]...)...)
 	l.pos++
 }
@@ -281,6 +300,7 @@ func (l *lineBuf) insertStr(s string) {
 }
 
 func (l *lineBuf) backspace() bool {
+	l.clamp()
 	if l.pos == 0 {
 		return false
 	}
@@ -290,6 +310,7 @@ func (l *lineBuf) backspace() bool {
 }
 
 func (l *lineBuf) deleteAt() bool {
+	l.clamp()
 	if l.pos >= len(l.text) {
 		return false
 	}
@@ -298,6 +319,7 @@ func (l *lineBuf) deleteAt() bool {
 }
 
 func (l *lineBuf) killToEnd() string {
+	l.clamp()
 	if l.pos >= len(l.text) {
 		return ""
 	}
@@ -307,6 +329,7 @@ func (l *lineBuf) killToEnd() string {
 }
 
 func (l *lineBuf) killToStart() string {
+	l.clamp()
 	if l.pos == 0 {
 		return ""
 	}
@@ -317,6 +340,7 @@ func (l *lineBuf) killToStart() string {
 }
 
 func (l *lineBuf) killWordBack() string {
+	l.clamp()
 	if l.pos == 0 {
 		return ""
 	}
@@ -335,6 +359,7 @@ func (l *lineBuf) killWordBack() string {
 }
 
 func (l *lineBuf) killWordFwd() string {
+	l.clamp()
 	if l.pos >= len(l.text) {
 		return ""
 	}
@@ -352,6 +377,7 @@ func (l *lineBuf) killWordFwd() string {
 }
 
 func (l *lineBuf) moveWordBack() {
+	l.clamp()
 	i := l.pos
 	for i > 0 && isSpaceRune(l.text[i-1]) {
 		i--
@@ -363,6 +389,7 @@ func (l *lineBuf) moveWordBack() {
 }
 
 func (l *lineBuf) moveWordFwd() {
+	l.clamp()
 	i := l.pos
 	for i < len(l.text) && isSpaceRune(l.text[i]) {
 		i++
@@ -374,6 +401,7 @@ func (l *lineBuf) moveWordFwd() {
 }
 
 func (l *lineBuf) transpose() {
+	l.clamp()
 	if len(l.text) < 2 || l.pos == 0 {
 		return
 	}

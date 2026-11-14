@@ -14,10 +14,11 @@ const defaultHistFile = ".unish_history"
 
 // histStore is the interactive history list (oldest..newest).
 type histStore struct {
-	items []string
-	file  string
-	maxIn int // HISTSIZE cap for memory (0 = default 500)
-	maxF  int // HISTFILESIZE cap for file (0 = default: same as maxIn)
+	items         []string
+	file          string
+	maxIn         int // HISTSIZE cap for memory (default 500; <0 = unlimited, 0 = disabled)
+	maxF          int // HISTFILESIZE cap for file (<0 = unset, 0 = empty file)
+	fileLinesRead int // total lines tracked in file (for `history -n`)
 }
 
 func defaultHistPath() string {
@@ -28,7 +29,7 @@ func defaultHistPath() string {
 }
 
 func newHistStore() *histStore {
-	return &histStore{maxIn: 500}
+	return &histStore{maxIn: 500, maxF: -1}
 }
 
 // shouldSave reports HISTCONTROL filtering (ignorespace/ignoredups,
@@ -50,16 +51,15 @@ func shouldSaveCtl(line, ctl string) bool {
 	return true
 }
 
-// add appends line honoring HISTCONTROL (caller passes current last for
-// ignoredups; erasedups removes older dups).
-func (h *histStore) add(line, histControl string) {
-	if line == "" {
-		return
+// add appends line honoring HISTCONTROL, reporting whether the entry was kept.
+func (h *histStore) add(line, histControl string) bool {
+	if line == "" || h.maxIn == 0 {
+		return false
 	}
 	ctl := strings.ToLower(histControl)
 	if strings.Contains(ctl, "ignorespace") || strings.Contains(ctl, "ignoreboth") {
 		if line[0] == ' ' || line[0] == '\t' {
-			return
+			return false
 		}
 	}
 	if strings.Contains(ctl, "erasedups") {
@@ -72,39 +72,90 @@ func (h *histStore) add(line, histControl string) {
 		h.items = kept
 	} else if strings.Contains(ctl, "ignoredups") || strings.Contains(ctl, "ignoreboth") {
 		if len(h.items) > 0 && h.items[len(h.items)-1] == line {
-			return
+			return false
 		}
 	}
 	h.items = append(h.items, line)
 	if h.maxIn > 0 && len(h.items) > h.maxIn {
 		h.items = h.items[len(h.items)-h.maxIn:]
 	}
+	return true
 }
 
-// load reads the histfile (tolerates missing file).
-func (h *histStore) load(path string, maxFile int) {
-	h.file = path
-	h.maxF = maxFile
-	if path == "" {
-		return
-	}
+func readHistLines(path string) ([]string, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
-		return
+		return nil, err
+	}
+	if len(data) == 0 {
+		return nil, nil
 	}
 	lines := strings.Split(string(data), "\n")
 	// Drop trailing empty from final newline.
 	if len(lines) > 0 && lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
 	}
-	if maxFile > 0 && len(lines) > maxFile {
-		lines = lines[len(lines)-maxFile:]
-	}
 	// Strip \r (file written with \n; tolerate CRLF).
 	for i, l := range lines {
 		lines[i] = strings.TrimSuffix(l, "\r")
 	}
+	return lines, nil
+}
+
+// load reads the histfile (tolerates missing file). Pass maxFile < 0 to
+// keep the existing h.maxF cap.
+func (h *histStore) load(path string, maxFile int) {
+	h.file = path
+	if maxFile >= 0 {
+		h.maxF = maxFile
+	}
+	if path == "" {
+		return
+	}
+	lines, err := readHistLines(path)
+	if err != nil {
+		return
+	}
+	h.fileLinesRead = len(lines)
+	if h.maxF == 0 {
+		lines = nil
+	} else if h.maxF > 0 && len(lines) > h.maxF {
+		lines = lines[len(lines)-h.maxF:]
+	}
+	if h.maxIn == 0 {
+		h.items = nil
+		return
+	}
 	h.items = append(h.items, lines...)
+	if h.maxIn > 0 && len(h.items) > h.maxIn {
+		h.items = h.items[len(h.items)-h.maxIn:]
+	}
+}
+
+// loadUnread appends only lines from path not yet read in this session
+// (used by `history -n`).
+func (h *histStore) loadUnread(path string) {
+	if path == "" {
+		return
+	}
+	lines, err := readHistLines(path)
+	if err != nil {
+		return
+	}
+	added := lines
+	if path == h.file {
+		start := h.fileLinesRead
+		if start > len(lines) {
+			start = len(lines)
+		}
+		added = lines[start:]
+		h.fileLinesRead = len(lines)
+	}
+	if h.maxIn == 0 {
+		h.items = nil
+		return
+	}
+	h.items = append(h.items, added...)
 	if h.maxIn > 0 && len(h.items) > h.maxIn {
 		h.items = h.items[len(h.items)-h.maxIn:]
 	}
@@ -113,7 +164,19 @@ func (h *histStore) load(path string, maxFile int) {
 // save appends new items to the histfile (bash histappend semantics:
 // never truncates existing content except HISTFILESIZE cap).
 func (h *histStore) save(newItems []string) {
-	if h.file == "" || len(newItems) == 0 {
+	h.saveTo(h.file, newItems)
+}
+
+func (h *histStore) saveTo(path string, newItems []string) {
+	if path == "" {
+		return
+	}
+	if path == h.file && h.maxF == 0 {
+		_ = os.WriteFile(path, nil, 0o600)
+		h.fileLinesRead = 0
+		return
+	}
+	if len(newItems) == 0 {
 		return
 	}
 	var sb strings.Builder
@@ -121,30 +184,34 @@ func (h *histStore) save(newItems []string) {
 		sb.WriteString(l)
 		sb.WriteByte('\n')
 	}
-	f, err := os.OpenFile(h.file, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
 	if err != nil {
 		return
 	}
 	_, _ = f.WriteString(sb.String())
 	_ = f.Close()
-	if h.maxF > 0 {
-		h.capFile()
+	if path == h.file {
+		h.fileLinesRead += len(newItems)
+		if h.maxF > 0 {
+			h.capFile()
+		}
 	}
 }
 
 func (h *histStore) capFile() {
-	data, err := os.ReadFile(h.file)
+	lines, err := readHistLines(h.file)
 	if err != nil {
 		return
 	}
-	lines := strings.Split(string(data), "\n")
-	if len(lines) > 0 && lines[len(lines)-1] == "" {
-		lines = lines[:len(lines)-1]
-	}
 	if len(lines) > h.maxF {
 		lines = lines[len(lines)-h.maxF:]
-		_ = os.WriteFile(h.file, []byte(strings.Join(lines, "\n")+"\n"), 0o600)
+		var content string
+		if len(lines) > 0 {
+			content = strings.Join(lines, "\n") + "\n"
+		}
+		_ = os.WriteFile(h.file, []byte(content), 0o600)
 	}
+	h.fileLinesRead = len(lines)
 }
 
 // expandBang implements bash ! history expansion on the raw line.
@@ -156,16 +223,63 @@ func expandBang(line string, items []string) (string, string, error) {
 		return line, "", nil
 	}
 	var sb strings.Builder
+	inS, inD := false, false
+	atWordBoundary := true
 	i := 0
 	for i < len(line) {
 		c := line[i]
-		if c != '!' {
+		if inS {
+			if c == '\'' {
+				inS = false
+			}
 			sb.WriteByte(c)
 			i++
 			continue
 		}
-		// Inside single quotes: literal.
-		if inSingleQuotes(line, i) {
+		if c == '\\' && i+1 < len(line) {
+			if line[i+1] == '!' {
+				sb.WriteByte('!')
+				atWordBoundary = false
+				i += 2
+				continue
+			}
+			sb.WriteByte(c)
+			sb.WriteByte(line[i+1])
+			atWordBoundary = line[i+1] == '\n'
+			i += 2
+			continue
+		}
+		if c == '\'' && !inD {
+			inS = true
+			atWordBoundary = false
+			sb.WriteByte(c)
+			i++
+			continue
+		}
+		if c == '"' {
+			inD = !inD
+			atWordBoundary = false
+			sb.WriteByte(c)
+			i++
+			continue
+		}
+		if !inD && c == '#' && atWordBoundary {
+			for i < len(line) && line[i] != '\n' {
+				sb.WriteByte(line[i])
+				i++
+			}
+			atWordBoundary = true
+			continue
+		}
+		if c != '!' {
+			sb.WriteByte(c)
+			atWordBoundary = !inD && (c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')')
+			i++
+			continue
+		}
+		atWordBoundary = false
+		// Exempt $! (last background PID) and ${!...} (indirect expansion).
+		if (i >= 1 && line[i-1] == '$') || (i >= 2 && line[i-2] == '$' && line[i-1] == '{') {
 			sb.WriteByte(c)
 			i++
 			continue
@@ -187,7 +301,7 @@ func expandBang(line string, items []string) (string, string, error) {
 			// !# = line so far.
 			sb.WriteString(sb.String())
 			i += 2
-		case n == ' ' || n == '\t' || n == '=' || n == '(':
+		case n == ' ' || n == '\t' || n == '\n' || n == '=' || n == '(':
 			sb.WriteByte(c)
 			i++
 		case n == '-' || (n >= '0' && n <= '9'):
@@ -200,6 +314,34 @@ func expandBang(line string, items []string) (string, string, error) {
 			k := j
 			for k < len(line) && line[k] >= '0' && line[k] <= '9' {
 				k++
+			}
+			if k == j {
+				// Bare "!-" (not followed by digits): literal unless prefix match?
+				// In bash at end/delim, "!-" is literal.
+				if j >= len(line) || isBangDelim(line[j]) {
+					sb.WriteByte(c)
+					i++
+					continue
+				}
+				// Otherwise treat "-..." as a prefix event search (e.g. !-foo).
+				k = j
+				for k < len(line) && !isBangDelim(line[k]) {
+					k++
+				}
+				pat := line[i+1 : k]
+				found := -1
+				for x := len(items) - 1; x >= 0; x-- {
+					if strings.HasPrefix(strings.TrimLeft(items[x], " \t"), pat) {
+						found = x
+						break
+					}
+				}
+				if found < 0 {
+					return "", "", errNoHist(line[i:k])
+				}
+				sb.WriteString(items[found])
+				i = k
+				continue
 			}
 			num, _ := strconv.Atoi(line[j:k])
 			var idx int

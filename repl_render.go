@@ -64,6 +64,11 @@ func layoutCells(prompt string, line []rune, pos, width int) (rows, crow, ccol i
 			i++
 			continue
 		}
+		if c == '\r' {
+			col = 0
+			i++
+			continue
+		}
 		if c == 0x1b && i+1 < len(prompt) {
 			switch prompt[i+1] {
 			case '[':
@@ -110,6 +115,14 @@ func layoutCells(prompt string, line []rune, pos, width int) (rows, crow, ccol i
 		i += size
 	}
 	for idx, r := range line {
+		w := 0
+		if r != '\n' {
+			w = runeWidth(r)
+			if w > 0 && col+w > width {
+				rows++
+				col = 0
+			}
+		}
 		if idx == pos {
 			crow, ccol = rows-1, col
 		}
@@ -117,7 +130,7 @@ func layoutCells(prompt string, line []rune, pos, width int) (rows, crow, ccol i
 			newline()
 			continue
 		}
-		place(runeWidth(r))
+		place(w)
 	}
 	if pos == len(line) {
 		crow, ccol = rows-1, col

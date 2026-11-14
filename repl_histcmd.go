@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"os"
 	"strconv"
 	"strings"
 
@@ -14,6 +15,44 @@ import (
 
 // replHist points at the live REPL (nil in -c/script mode).
 var replHist *repl
+
+func (rp *repl) syncHistBounds() {
+	rp.histIdx = len(rp.hist.items)
+	if rp.searchIdx >= len(rp.hist.items) {
+		rp.searchIdx = len(rp.hist.items) - 1
+	}
+}
+
+func (rp *repl) recordHist(line string) {
+	ctl := rp.getenv("HISTCONTROL")
+	if !rp.hist.add(line, ctl) {
+		return
+	}
+	if strings.Contains(strings.ToLower(ctl), "erasedups") {
+		kept := rp.histNew[:0]
+		for _, it := range rp.histNew {
+			if it != line {
+				kept = append(kept, it)
+			}
+		}
+		rp.histNew = kept
+	}
+	rp.histNew = append(rp.histNew, line)
+}
+
+func (rp *repl) targetHistFile(explicit string) string {
+	if explicit != "" {
+		return resolve(rp.rDir(), explicit)
+	}
+	if envF := rp.getenv("HISTFILE"); envF != "" {
+		if envF == "/dev/null" {
+			return ""
+		}
+		rp.hist.file = envF
+		return envF
+	}
+	return rp.hist.file
+}
 
 func cmdHistory(_ context.Context, hc interp.HandlerContext, args []string) error {
 	rp := replHist
@@ -37,13 +76,19 @@ func cmdHistory(_ context.Context, hc interp.HandlerContext, args []string) erro
 			fmt.Fprintf(hc.Stdout, "%5d  %s\n", i+1, rp.hist.items[i])
 		}
 	}
+	optFileArg := func(idx int) string {
+		if idx+1 < len(a) && !strings.HasPrefix(a[idx+1], "-") {
+			return a[idx+1]
+		}
+		return ""
+	}
 	i := 0
 	for i < len(a) {
 		switch a[i] {
 		case "-c":
 			rp.hist.items = nil
 			rp.histNew = nil
-			rp.histIdx = 0
+			rp.syncHistBounds()
 			return nil
 		case "-d":
 			i++
@@ -52,18 +97,31 @@ func cmdHistory(_ context.Context, hc interp.HandlerContext, args []string) erro
 				return exitError{1}
 			}
 			idx, err := strconv.Atoi(a[i])
+			if err == nil && idx < 0 {
+				idx = n + 1 + idx
+			}
 			if err != nil || idx < 1 || idx > n {
 				fmt.Fprintf(hc.Stderr, "history: %s: history position out of range\n", a[i])
 				return exitError{1}
 			}
+			deleted := rp.hist.items[idx-1]
 			rp.hist.items = append(rp.hist.items[:idx-1], rp.hist.items[idx:]...)
+			if idx-1 >= n-len(rp.histNew) {
+				for j := len(rp.histNew) - 1; j >= 0; j-- {
+					if rp.histNew[j] == deleted {
+						rp.histNew = append(rp.histNew[:j], rp.histNew[j+1:]...)
+						break
+					}
+				}
+			}
+			rp.syncHistBounds()
 			return nil
 		case "-s":
 			i++
 			for ; i < len(a); i++ {
-				rp.hist.add(a[i], rp.getenv("HISTCONTROL"))
-				rp.histNew = append(rp.histNew, a[i])
+				rp.recordHist(a[i])
 			}
+			rp.syncHistBounds()
 			return nil
 		case "-p":
 			i++
@@ -81,24 +139,49 @@ func cmdHistory(_ context.Context, hc interp.HandlerContext, args []string) erro
 			}
 			return nil
 		case "-a":
-			rp.hist.save(rp.histNew)
-			rp.histNew = nil
+			explicit := optFileArg(i)
+			target := rp.targetHistFile(explicit)
+			rp.hist.saveTo(target, rp.histNew)
+			if explicit == "" || target == rp.hist.file {
+				rp.histNew = nil
+			}
 			return nil
 		case "-n":
-			// Re-read file additions (append-only).
-			before := len(rp.hist.items)
-			rp.hist.load(rp.hist.file, 0)
-			_ = before
+			target := rp.targetHistFile(optFileArg(i))
+			rp.hist.loadUnread(target)
+			rp.syncHistBounds()
 			return nil
 		case "-r":
-			rp.hist.items = nil
-			rp.hist.load(rp.hist.file, 0)
-			rp.histIdx = len(rp.hist.items)
+			explicit := optFileArg(i)
+			target := rp.targetHistFile(explicit)
+			if explicit == "" {
+				rp.hist.items = nil
+				rp.hist.load(target, -1)
+			} else {
+				lines, err := readHistLines(target)
+				if err == nil && rp.hist.maxIn != 0 {
+					rp.hist.items = append(rp.hist.items, lines...)
+					if rp.hist.maxIn > 0 && len(rp.hist.items) > rp.hist.maxIn {
+						rp.hist.items = rp.hist.items[len(rp.hist.items)-rp.hist.maxIn:]
+					}
+				}
+			}
+			rp.syncHistBounds()
 			return nil
 		case "-w":
 			// Write whole history to file (truncate + write).
-			if rp.hist.file != "" {
-				_ = writeFileTrunc(rp.hist.file, strings.Join(rp.hist.items, "\n")+"\n")
+			explicit := optFileArg(i)
+			target := rp.targetHistFile(explicit)
+			if target != "" {
+				var content string
+				if len(rp.hist.items) > 0 {
+					content = strings.Join(rp.hist.items, "\n") + "\n"
+				}
+				_ = writeFileTrunc(target, content)
+				if target == rp.hist.file {
+					rp.hist.fileLinesRead = len(rp.hist.items)
+					rp.histNew = nil
+				}
 			}
 			return nil
 		default:
@@ -125,7 +208,7 @@ func cmdHistory(_ context.Context, hc interp.HandlerContext, args []string) erro
 }
 
 func writeFileTrunc(path, content string) error {
-	f, err := openFileRetry(path, 577, 0o600)
+	f, err := openFileRetry(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 	if err != nil {
 		return err
 	}

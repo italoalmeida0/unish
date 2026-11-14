@@ -23,6 +23,14 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
+// rawModeCtl abstracts OS terminal raw-mode suspend/resume across prompts and commands.
+type rawModeCtl interface {
+	suspend()
+	resume()
+	close()
+	inFile() *os.File
+}
+
 // repl holds interactive state shared across loop iterations.
 type repl struct {
 	r              *interp.Runner
@@ -40,7 +48,9 @@ type repl struct {
 	out            io.Writer
 	errOut         io.Writer
 	inFile         *os.File
+	raw            rawModeCtl
 	rawOn          bool
+	inTTY          bool
 	width          int
 	exitCode       int
 	shouldExit     bool
@@ -58,6 +68,20 @@ type repl struct {
 	killLastLen    int      // runes inserted by last yank (for Alt-Y replace)
 	undoStack      []undoState
 	mu             sync.Mutex
+}
+
+func (rp *repl) suspendRaw() {
+	if rp.raw != nil {
+		rp.raw.suspend()
+	}
+	rp.rawOn = false
+}
+
+func (rp *repl) resumeRaw() {
+	if rp.raw != nil {
+		rp.raw.resume()
+	}
+	rp.rawOn = true
 }
 
 // undoState snapshots the line for Ctrl-_ undo.
@@ -110,7 +134,11 @@ func (rp *repl) prompt(primary bool) (display, raw string) {
 	// PROMPT_COMMAND don't get unexpected output/side effects.
 	if primary && !rp.plainNoPC {
 		if pc := rp.getenv("PROMPT_COMMAND"); pc != "" {
+			savedCode := rp.exitCode
 			_ = rp.execLine(pc)
+			if !rp.shouldExit {
+				rp.exitCode = savedCode
+			}
 		}
 	}
 	rp.lineNo++
@@ -297,7 +325,7 @@ func (rp *repl) expandPromptVars(s string) string {
 	r2, err := interp.New(
 		interp.Env(expand.ListEnviron()),
 		interp.StdIO(nil, &out, io.Discard),
-		interp.CallHandler(callOverride),
+		interp.CallHandler(rp.callHandler),
 		interp.OpenHandler(shellOpenHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
@@ -362,66 +390,179 @@ func promptEscape(s string) string {
 // execLine parses + runs one accepted (possibly multiline) line,
 // returning the exit code. History-expand already applied by caller.
 func (rp *repl) execLine(line string) int {
+	wasRaw := rp.rawOn || rp.raw != nil
+	if wasRaw {
+		rp.suspendRaw()
+		defer func() {
+			if !rp.shouldExit {
+				rp.resumeRaw()
+			}
+		}()
+	}
 	prog, err := syntax.NewParser().Parse(strings.NewReader(line), "")
 	if err != nil {
 		fmt.Fprintln(rp.errOut, "bash:", err)
+		rp.exitCode = 2
 		return 2
 	}
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
-	defer stop()
-	err = rp.r.Run(ctx, prog)
+	if len(prog.Stmts) == 0 {
+		return rp.exitCode
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, trapSignals()...)
+	done := make(chan struct{})
+	defer func() {
+		signal.Stop(sigCh)
+		close(done)
+	}()
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case sig := <-sigCh:
+				if rp.r != nil && rp.r.QueueSignal(sig) {
+					continue
+				}
+				if sig == os.Interrupt {
+					cancel()
+				}
+			}
+		}
+	}()
+
 	code := 0
-	if err != nil {
-		var es interp.ExitStatus
-		if errors.As(err, &es) {
-			code = int(es)
-		} else if errors.Is(err, context.Canceled) {
-			code = 130
-		} else if errors.Is(err, context.DeadlineExceeded) {
-			code = 124
-		} else {
-			fmt.Fprintln(rp.errOut, "bash:", err)
-			code = 1
+	for _, stmt := range prog.Stmts {
+		err = rp.r.Run(ctx, stmt)
+		code = 0
+		if err != nil {
+			var es interp.ExitStatus
+			if errors.As(err, &es) {
+				code = int(es)
+			} else if errors.Is(err, context.Canceled) {
+				code = 130
+			} else if errors.Is(err, context.DeadlineExceeded) {
+				code = 124
+			} else {
+				fmt.Fprintln(rp.errOut, "bash:", err)
+				code = 1
+			}
 		}
 		if rp.r.Exited() {
 			rp.shouldExit = true
+			break
+		}
+		if ctx.Err() != nil {
+			break
 		}
 	}
 	rp.exitCode = code
 	return code
 }
 
+// runExitTrap triggers any registered EXIT trap once when the REPL terminates
+// via EOF/Ctrl-D (when exit/errexit has not already fired it).
+func (rp *repl) runExitTrap() {
+	if rp.r == nil || rp.shouldExit {
+		return
+	}
+	wasRaw := rp.rawOn || rp.raw != nil
+	if wasRaw {
+		rp.suspendRaw()
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := rp.r.Run(ctx, &syntax.File{}); err != nil {
+		var es interp.ExitStatus
+		if errors.As(err, &es) {
+			rp.exitCode = int(es)
+		}
+	}
+}
+
+// hasTrailingBackslashContinuation reports whether src ends with an unescaped
+// line-continuation backslash outside single quotes and `#` comments.
+func hasTrailingBackslashContinuation(src string) bool {
+	s := strings.TrimSuffix(src, "\r")
+	if !strings.HasSuffix(s, `\`) {
+		return false
+	}
+	inSingle, inDouble, inComment, escaped := false, false, false, false
+	atWordBoundary := true
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inComment {
+			if c == '\n' {
+				inComment = false
+				atWordBoundary = true
+			}
+			continue
+		}
+		if escaped {
+			escaped = false
+			atWordBoundary = (c == '\n')
+			continue
+		}
+		if inSingle {
+			if c == '\'' {
+				inSingle = false
+			}
+			continue
+		}
+		if c == '\\' {
+			escaped = true
+			continue
+		}
+		if inDouble {
+			if c == '"' {
+				inDouble = false
+			}
+			continue
+		}
+		if c == '#' && atWordBoundary {
+			inComment = true
+			continue
+		}
+		if c == '\'' {
+			inSingle = true
+			atWordBoundary = false
+			continue
+		}
+		if c == '"' {
+			inDouble = true
+			atWordBoundary = false
+			continue
+		}
+		atWordBoundary = (c == ' ' || c == '\t' || c == '\n' || c == ';' || c == '&' || c == '|' || c == '(' || c == ')')
+	}
+	return escaped
+}
+
 // incomplete reports whether src needs more input (unclosed quote,
-// bracket, or trailing operator), via parser error text.
+// compound command, heredoc, trailing operator, or trailing backslash).
 func incomplete(src string) bool {
+	if hasTrailingBackslashContinuation(src) {
+		return true
+	}
 	_, err := syntax.NewParser().Parse(strings.NewReader(src), "")
 	if err == nil {
 		return false
+	}
+	if syntax.IsIncomplete(err) {
+		return true
 	}
 	msg := err.Error()
 	for _, sub := range []string{
 		"reached EOF without",
 		"reached end of file",
-		"must be followed by",
-		"unexpected token \";\"",
-		"expected a command",
 		"unclosed here-document",
-		"must be followed by a statement list", // if/while/for/select/func bodies
-		"must end with",                        // case...esac, coproc...}
-		"must be followed by a case list",      // case x in <newline>
-		"reached EOF in",                       // $(, $((, backquote, quotes variants
+		"reached EOF in",
 	} {
 		if strings.Contains(msg, sub) {
 			return true
 		}
-	}
-	// Trailing pipe/and/or/backslash continuations.
-	t := strings.TrimRight(src, " \t\n")
-	if strings.HasSuffix(t, "|") || strings.HasSuffix(t, "&&") || strings.HasSuffix(t, "||") {
-		return true
-	}
-	if strings.HasSuffix(t, "\\") && !strings.HasSuffix(t, "\\\\") {
-		return true
 	}
 	return false
 }
@@ -506,7 +647,16 @@ func (rp *repl) rcFile() {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	_ = rp.r.Run(ctx, prog)
+	for _, stmt := range prog.Stmts {
+		_ = rp.r.Run(ctx, stmt)
+		if rp.r.Exited() {
+			rp.shouldExit = true
+			break
+		}
+		if ctx.Err() != nil {
+			break
+		}
+	}
 }
 
 var _ = filepath.Separator
