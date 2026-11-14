@@ -2,8 +2,10 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/md5"
+	"crypto/rand"
 	"crypto/sha1"
 	"crypto/sha256"
 	"crypto/sha512"
@@ -100,44 +102,136 @@ func gnuBasename(p string) string {
 	return trimmed
 }
 
+const (
+	canonAllExist = iota
+	canonAllButLast
+	canonMissingOK
+)
+
+func canonicalizePath(abs string, mode int) (string, error) {
+	abs = filepath.Clean(abs)
+	if rp, err := filepath.EvalSymlinks(abs); err == nil {
+		return rp, nil
+	}
+	if mode == canonAllExist {
+		_, err := os.Stat(abs)
+		if err != nil {
+			return "", err
+		}
+		return filepath.EvalSymlinks(abs)
+	}
+	if mode == canonAllButLast {
+		cur := abs
+		for hops := 0; hops < 40; hops++ {
+			lfi, lerr := os.Lstat(cur)
+			if lerr != nil {
+				if !os.IsNotExist(lerr) {
+					return "", lerr
+				}
+				parent := filepath.Dir(cur)
+				if parent == cur {
+					return "", lerr
+				}
+				rpParent, perr := filepath.EvalSymlinks(parent)
+				if perr != nil {
+					return "", perr
+				}
+				pfi, serr := os.Stat(rpParent)
+				if serr != nil || !pfi.IsDir() {
+					return "", os.ErrNotExist
+				}
+				return filepath.Join(rpParent, filepath.Base(cur)), nil
+			}
+			if lfi.Mode()&os.ModeSymlink == 0 {
+				return filepath.EvalSymlinks(cur)
+			}
+			target, rerr := os.Readlink(cur)
+			if rerr != nil {
+				return "", rerr
+			}
+			if filepath.IsAbs(target) {
+				cur = filepath.Clean(target)
+			} else {
+				cur = filepath.Clean(filepath.Join(filepath.Dir(cur), target))
+			}
+			if rp, err := filepath.EvalSymlinks(cur); err == nil {
+				return rp, nil
+			}
+		}
+		return "", fmt.Errorf("too many levels of symbolic links")
+	}
+
+	// canonMissingOK: resolve symlinks on the deepest existing prefix, then append cleaned tail.
+	cur := abs
+	var tail []string
+	for {
+		if rp, err := filepath.EvalSymlinks(cur); err == nil {
+			for i := len(tail) - 1; i >= 0; i-- {
+				rp = filepath.Join(rp, tail[i])
+			}
+			return filepath.Clean(rp), nil
+		}
+		// If cur itself is a dangling symlink, expand it and restart.
+		if lfi, lerr := os.Lstat(cur); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
+			if link, rerr := os.Readlink(cur); rerr == nil {
+				var next string
+				if filepath.IsAbs(link) {
+					next = link
+				} else {
+					next = filepath.Join(filepath.Dir(cur), link)
+				}
+				for i := len(tail) - 1; i >= 0; i-- {
+					next = filepath.Join(next, tail[i])
+				}
+				// Guard against symlink cycles in -m mode by falling back lexically after one pass.
+				next = filepath.Clean(next)
+				if rp, err := filepath.EvalSymlinks(filepath.Dir(next)); err == nil {
+					return filepath.Join(rp, filepath.Base(next)), nil
+				}
+				return next, nil
+			}
+		}
+		parent := filepath.Dir(cur)
+		if parent == cur {
+			return abs, nil
+		}
+		tail = append(tail, filepath.Base(cur))
+		cur = parent
+	}
+}
+
 func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("realpath", hc.Stderr)
 	missing := fs.Bool("m", false, "")
+	fs.BoolVar(missing, "canonicalize-missing", false, "")
 	exists := fs.Bool("e", false, "")
+	fs.BoolVar(exists, "canonicalize-existing", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if len(fs.Args()) == 0 {
 		return flag.ErrHelp
 	}
-	// GNU realpath resolves the lexical path even when the target does
-	// not exist (like `realpath -m`); only -e requires existence.
+	mode := canonMissingOK
+	if *exists && !*missing {
+		mode = canonAllExist
+	}
 	code := 0
 	for _, p := range fs.Args() {
 		full := resolve(hc.Dir, p)
-		if *exists {
-			if _, err := os.Stat(full); err != nil {
-				fmt.Fprintln(hc.Stderr, "realpath:", err)
-				code = 1
-				continue
-			}
-		}
 		abs, err := filepath.Abs(full)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "realpath:", err)
 			code = 1
 			continue
 		}
-		if *exists || !*missing {
-			if rp, err := filepath.EvalSymlinks(abs); err == nil {
-				abs = rp
-			} else if *exists {
-				fmt.Fprintln(hc.Stderr, "realpath:", err)
-				code = 1
-				continue
-			}
+		rp, err := canonicalizePath(abs, mode)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "realpath:", err)
+			code = 1
+			continue
 		}
-		fmt.Fprintln(hc.Stdout, abs)
+		fmt.Fprintln(hc.Stdout, rp)
 	}
 	if code != 0 {
 		return exitError{code}
@@ -148,7 +242,13 @@ func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) err
 func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("readlink", hc.Stderr)
 	canonical := fs.Bool("f", false, "")
-	_ = fs.Bool("m", false, "")
+	fs.BoolVar(canonical, "canonicalize", false, "")
+	missing := fs.Bool("m", false, "")
+	fs.BoolVar(missing, "canonicalize-missing", false, "")
+	exists := fs.Bool("e", false, "")
+	fs.BoolVar(exists, "canonicalize-existing", false, "")
+	noNewline := fs.Bool("n", false, "")
+	fs.BoolVar(noNewline, "no-newline", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -159,14 +259,20 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 	for _, p := range fs.Args() {
 		full := resolve(hc.Dir, p)
 		var dst string
-		if *canonical {
+		if *canonical || *missing || *exists {
 			abs, err := filepath.Abs(full)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "readlink:", err)
 				code = 1
 				continue
 			}
-			rp, err := filepath.EvalSymlinks(abs)
+			mode := canonAllButLast
+			if *missing {
+				mode = canonMissingOK
+			} else if *exists {
+				mode = canonAllExist
+			}
+			rp, err := canonicalizePath(abs, mode)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "readlink:", err)
 				code = 1
@@ -182,7 +288,11 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 				continue
 			}
 		}
-		fmt.Fprintln(hc.Stdout, dst)
+		if *noNewline && len(fs.Args()) == 1 {
+			fmt.Fprint(hc.Stdout, dst)
+		} else {
+			fmt.Fprintln(hc.Stdout, dst)
+		}
 	}
 	if code != 0 {
 		return exitError{code}
@@ -193,7 +303,9 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("ln", hc.Stderr)
 	sym := fs.Bool("s", false, "")
+	fs.BoolVar(sym, "symbolic", false, "")
 	force := fs.Bool("f", false, "")
+	fs.BoolVar(force, "force", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -203,13 +315,46 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return flag.ErrHelp
 	}
 	dst := resolve(hc.Dir, rest[len(rest)-1])
+	dstFi, dstErr := os.Stat(dst)
+	dstIsDir := dstErr == nil && dstFi.IsDir()
+	if len(rest) > 2 && !dstIsDir {
+		fmt.Fprintf(hc.Stderr, "ln: target '%s' is not a directory\n", rest[len(rest)-1])
+		return exitError{1}
+	}
+	code := 0
 	for _, src := range rest[:len(rest)-1] {
 		target := dst
-		if fi, err := os.Stat(dst); err == nil && fi.IsDir() {
+		if dstIsDir {
 			target = filepath.Join(dst, filepath.Base(src))
 		}
+		if !*sym {
+			srcFull := resolve(hc.Dir, src)
+			sfi, serr := os.Lstat(srcFull)
+			if serr != nil {
+				fmt.Fprintf(hc.Stderr, "ln: failed to access '%s': No such file or directory\n", src)
+				code = 1
+				continue
+			}
+			if tfi, terr := os.Lstat(target); terr == nil && os.SameFile(sfi, tfi) {
+				fmt.Fprintf(hc.Stderr, "ln: '%s' and '%s' are the same file\n", src, target)
+				code = 1
+				continue
+			}
+		} else {
+			if tfi, terr := os.Lstat(target); terr == nil {
+				linkDest := resolve(filepath.Dir(target), src)
+				if sfi, serr := os.Lstat(linkDest); serr == nil && os.SameFile(sfi, tfi) {
+					fmt.Fprintf(hc.Stderr, "ln: '%s' and '%s' are the same file\n", src, target)
+					code = 1
+					continue
+				}
+			}
+		}
 		if *force {
-			os.Remove(target)
+			if runtime.GOOS == "windows" {
+				_ = os.Chmod(target, 0o666)
+			}
+			_ = os.Remove(target)
 		}
 		var err error
 		if *sym {
@@ -228,8 +373,12 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 			} else {
 				fmt.Fprintln(hc.Stderr, "ln:", err)
 			}
-			return exitError{1}
+			code = 1
+			continue
 		}
+	}
+	if code != 0 {
+		return exitError{code}
 	}
 	return nil
 }
@@ -641,19 +790,24 @@ func strftime(t time.Time, format string) string {
 func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("mktemp", hc.Stderr)
 	isDir := fs.Bool("d", false, "")
+	fs.BoolVar(isDir, "directory", false, "")
 	tmpdir := fs.String("p", "", "")
+	fs.StringVar(tmpdir, "tmpdir", "", "")
 	dryRun := fs.Bool("u", false, "")
 	fs.BoolVar(dryRun, "dry-run", false, "")
 	fs.Bool("t", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	// GNU mktemp -t: interpret template as relative to $TMPDIR (compat).
-	// The template still comes from positional args; -t only changes the
-	// directory interpretation, which already defaults to os.TempDir().
+	baseTmp := shellGetenv(hc, "TMPDIR")
+	if baseTmp != "" {
+		baseTmp = resolve(hc.Dir, baseTmp)
+	} else {
+		baseTmp = os.TempDir()
+	}
 	dir := *tmpdir
 	if dir == "" {
-		dir = os.TempDir()
+		dir = baseTmp
 	} else {
 		dir = resolve(hc.Dir, dir)
 	}
@@ -665,34 +819,31 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 		if d := filepath.Dir(pattern); d != "." && d != "" {
 			// A template directory of /tmp (or any absolute POSIX path
 			// that does not exist, e.g. on Windows) falls back to the
-			// OS temp dir, matching GNU's "create in /tmp" intent.
+			// temp dir, matching GNU's "create in /tmp" intent.
 			cand := resolve(hc.Dir, d)
 			if st, err := os.Stat(cand); err != nil || !st.IsDir() {
 				if filepath.IsAbs(d) || strings.HasPrefix(d, "/") {
-					cand = os.TempDir()
+					cand = baseTmp
 				}
 			}
 			dir = cand
 			pattern = filepath.Base(pattern)
 		}
 	}
-	prefix, suffix := splitMktempPattern(pattern)
+	prefix, suffix, xLen := splitMktempPattern(pattern)
 	if *dryRun {
-		name, err := os.MkdirTemp("", "")
-		if err != nil {
+		const alnum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+		raw := make([]byte, xLen)
+		if _, err := rand.Read(raw); err != nil {
 			fmt.Fprintln(hc.Stderr, "mktemp:", err)
 			return exitError{1}
 		}
-		os.Remove(name)
-		// Derive a non-created name with same pattern in target dir.
-		f, err := os.CreateTemp(dir, prefix+"*"+suffix)
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "mktemp:", err)
-			return exitError{1}
+		var rnd strings.Builder
+		rnd.Grow(xLen)
+		for _, b := range raw {
+			rnd.WriteByte(alnum[int(b)%len(alnum)])
 		}
-		nm := f.Name()
-		f.Close()
-		os.Remove(nm)
+		nm := filepath.Join(dir, prefix+rnd.String()+suffix)
 		fmt.Fprintln(hc.Stdout, filepath.ToSlash(nm))
 		return nil
 	}
@@ -710,20 +861,23 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintln(hc.Stderr, "mktemp:", err)
 		return exitError{1}
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		fmt.Fprintln(hc.Stderr, "mktemp:", err)
+		return exitError{1}
+	}
 	fmt.Fprintln(hc.Stdout, filepath.ToSlash(f.Name()))
 	return nil
 }
 
-func splitMktempPattern(pattern string) (prefix, suffix string) {
+func splitMktempPattern(pattern string) (prefix, suffix string, xLen int) {
 	if i := strings.Index(pattern, "XX"); i >= 0 {
 		j := i
 		for j < len(pattern) && pattern[j] == 'X' {
 			j++
 		}
-		return pattern[:i], pattern[j:]
+		return pattern[:i], pattern[j:], j - i
 	}
-	return pattern + ".", ""
+	return pattern + ".", "", 10
 }
 
 type findNode struct {
@@ -733,6 +887,7 @@ type findNode struct {
 	typ     os.FileMode // from d_type when known (0 = unknown)
 	depth   int
 	pruned  bool
+	follow  bool
 }
 
 // stat lazily loads the file info; GNU find only stats entries whose
@@ -741,7 +896,18 @@ type findNode struct {
 // nil-safe.
 func (n *findNode) stat() os.FileInfo {
 	if n.fi == nil {
-		fi, err := os.Lstat(n.full)
+		var (
+			fi  os.FileInfo
+			err error
+		)
+		if n.follow {
+			fi, err = os.Stat(n.full)
+			if err != nil {
+				fi, err = os.Lstat(n.full)
+			}
+		} else {
+			fi, err = os.Lstat(n.full)
+		}
 		if err != nil {
 			fi = zeroFileInfo{}
 		}
@@ -802,10 +968,31 @@ func (n *findNode) typeIs(letter string) bool {
 type findPredicate func(node *findNode, hc interp.HandlerContext) bool
 
 func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	followMode := 0 // 0 = -P (never), 1 = -H (root operands only), 2 = -L (always)
+	idx := 1
+	for idx < len(args) {
+		switch args[idx] {
+		case "-P":
+			followMode = 0
+			idx++
+			continue
+		case "-H":
+			followMode = 1
+			idx++
+			continue
+		case "-L":
+			followMode = 2
+			idx++
+			continue
+		case "--":
+			idx++
+		}
+		break
+	}
 	var paths, expr []string
 	seenExpr := false
-	for _, a := range args[1:] {
-		if !seenExpr && !strings.HasPrefix(a, "-") && a != "!" && a != "(" {
+	for _, a := range args[idx:] {
+		if !seenExpr && !strings.HasPrefix(a, "-") && a != "!" && a != "(" && a != ")" {
 			paths = append(paths, a)
 		} else {
 			seenExpr = true
@@ -818,8 +1005,16 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 
 	maxdepth := -1
 	mindepth := 0
+	depthFirst := false
 	hasAction := false
 	stop := false // set when stdout pipe closes (head -c/N): abort walk
+	code := 0
+
+	type pendingExecBatch struct {
+		template []string
+		paths    []string
+	}
+	var plusBatches []*pendingExecBatch
 
 	pos := 0
 	peek := func() string {
@@ -918,11 +1113,24 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		}
 		tok := next()
 		if tok == "(" {
-			sub := parseOr()
-			if peek() == ")" {
-				next()
+			if peek() == ")" || pos >= len(expr) {
+				fmt.Fprintln(hc.Stderr, "find: invalid expression; empty parentheses are not allowed.")
+				parseErr = fmt.Errorf("empty parens")
+				return func(*findNode, interp.HandlerContext) bool { return false }
 			}
+			sub := parseOr()
+			if peek() != ")" {
+				fmt.Fprintln(hc.Stderr, "find: invalid expression; I was expecting to find a ')' somewhere but did not see one.")
+				parseErr = fmt.Errorf("missing )")
+				return func(*findNode, interp.HandlerContext) bool { return false }
+			}
+			next()
 			return sub
+		}
+		if tok == ")" {
+			fmt.Fprintln(hc.Stderr, "find: invalid expression; you have too many ')'")
+			parseErr = fmt.Errorf("unexpected )")
+			return func(*findNode, interp.HandlerContext) bool { return false }
 		}
 		switch tok {
 		case "-name":
@@ -1104,35 +1312,70 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 				}
 				return true
 			}
+		case "-follow":
+			followMode = 2
+			return func(*findNode, interp.HandlerContext) bool { return true }
+		case "-depth", "-d":
+			depthFirst = true
+			return func(*findNode, interp.HandlerContext) bool { return true }
 		case "-delete":
 			hasAction = true
+			depthFirst = true
 			return func(n *findNode, _ interp.HandlerContext) bool {
-				_ = os.Remove(n.full)
+				if n.depth == 0 && isDotOperand(n.display) {
+					return true
+				}
+				err := os.Remove(n.full)
+				if err != nil && runtime.GOOS == "windows" {
+					_ = os.Chmod(n.full, 0o666)
+					err = os.Remove(n.full)
+				}
+				if err != nil {
+					fmt.Fprintf(hc.Stderr, "find: cannot delete '%s': %v\n", n.display, err)
+					code = 1
+					return false
+				}
 				return true
 			}
 		case "-exec":
 			hasAction = true
 			var execArgs []string
+			term := ""
 			for pos < len(expr) {
 				a := next()
 				if a == ";" || a == "+" {
+					term = a
 					break
 				}
 				execArgs = append(execArgs, a)
 			}
+			if term == "" || len(execArgs) == 0 {
+				fmt.Fprintln(hc.Stderr, "find: missing argument to `-exec'")
+				parseErr = fmt.Errorf("missing -exec terminator")
+				return func(*findNode, interp.HandlerContext) bool { return false }
+			}
+			if term == "+" {
+				pb := &pendingExecBatch{template: execArgs}
+				plusBatches = append(plusBatches, pb)
+				return func(n *findNode, _ interp.HandlerContext) bool {
+					pb.paths = append(pb.paths, filepath.ToSlash(n.display))
+					return true
+				}
+			}
 			return func(n *findNode, hc interp.HandlerContext) bool {
-				var cmdLine []string
-				for _, a := range execArgs {
-					if a == "{}" {
-						cmdLine = append(cmdLine, n.display)
-					} else {
-						cmdLine = append(cmdLine, a)
-					}
+				disp := filepath.ToSlash(n.display)
+				cmdLine := make([]string, len(execArgs))
+				for i, a := range execArgs {
+					cmdLine[i] = strings.ReplaceAll(a, "{}", disp)
 				}
-				if len(cmdLine) > 0 {
-					_ = runSubcommand(ctx, hc, cmdLine)
+				subHC := hc
+				subHC.Stdin = bytes.NewReader(nil)
+				err := runSubcommand(ctx, subHC, cmdLine)
+				if ctx.Err() != nil {
+					stop = true
+					return false
 				}
-				return true
+				return err == nil
 			}
 		case "-perm":
 			modeStr := next()
@@ -1169,6 +1412,14 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	var rootPred findPredicate
 	if len(expr) > 0 {
 		rootPred = parseOr()
+		if parseErr == nil && pos < len(expr) {
+			if expr[pos] == ")" {
+				fmt.Fprintln(hc.Stderr, "find: invalid expression; you have too many ')'")
+			} else {
+				fmt.Fprintf(hc.Stderr, "find: paths must precede expression: `%s'\n", expr[pos])
+			}
+			parseErr = fmt.Errorf("unexpected trailing token")
+		}
 	} else {
 		rootPred = func(*findNode, interp.HandlerContext) bool { return true }
 	}
@@ -1186,10 +1437,64 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		defer bw.Flush()
 	}
 
-	code := 0
+	opts := findWalkOpts{
+		maxdepth:   maxdepth,
+		mindepth:   mindepth,
+		followMode: followMode,
+		depthFirst: depthFirst,
+		hasAction:  hasAction,
+	}
 	for _, p := range paths {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		full := resolve(hc.Dir, p)
-		walkFind(ctx, hc, p, full, 0, maxdepth, mindepth, rootPred, hasAction, &code, &stop, nil)
+		walkFind(ctx, hc, p, full, 0, opts, rootPred, &code, &stop, nil, nil)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	for _, pb := range plusBatches {
+		if len(pb.paths) == 0 {
+			continue
+		}
+		const chunkMax = 1024
+		for i := 0; i < len(pb.paths); i += chunkMax {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			end := i + chunkMax
+			if end > len(pb.paths) {
+				end = len(pb.paths)
+			}
+			chunk := pb.paths[i:end]
+			var cmdLine []string
+			substituted := false
+			for _, a := range pb.template {
+				if a == "{}" {
+					cmdLine = append(cmdLine, chunk...)
+					substituted = true
+				} else if strings.Contains(a, "{}") {
+					for _, cp := range chunk {
+						cmdLine = append(cmdLine, strings.ReplaceAll(a, "{}", cp))
+					}
+					substituted = true
+				} else {
+					cmdLine = append(cmdLine, a)
+				}
+			}
+			if !substituted {
+				cmdLine = append(cmdLine, chunk...)
+			}
+			subHC := hc
+			subHC.Stdin = bytes.NewReader(nil)
+			if err := runSubcommand(ctx, subHC, cmdLine); err != nil {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				code = 1
+			}
+		}
 	}
 	if code != 0 {
 		return exitError{code}
@@ -1197,18 +1502,51 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return nil
 }
 
-func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth, maxdepth, mindepth int, pred findPredicate, hasAction bool, code *int, stop *bool, ent os.DirEntry) {
+type findWalkOpts struct {
+	maxdepth   int
+	mindepth   int
+	followMode int
+	depthFirst bool
+	hasAction  bool
+}
+
+func walkFind(ctx context.Context, hc interp.HandlerContext, display, full string, depth int, opts findWalkOpts, pred findPredicate, code *int, stop *bool, ent os.DirEntry, ancestors []os.FileInfo) {
 	if ctx.Err() != nil || (stop != nil && *stop) {
 		return
 	}
+	followHere := opts.followMode == 2 || (opts.followMode == 1 && depth == 0)
 	node := findNode{
 		display: display,
 		full:    full,
 		depth:   depth,
+		follow:  followHere,
 	}
-	if ent != nil {
-		// readdir already told us the type; stat lazily if a predicate
-		// actually needs the metadata.
+	if followHere {
+		if ent == nil || ent.Type()&os.ModeSymlink != 0 || ent.Type() == os.ModeIrregular {
+			sfi, serr := os.Stat(full)
+			if serr == nil {
+				node.fi = sfi
+				node.typ = sfi.Mode().Type()
+			} else {
+				lfi, lerr := os.Lstat(full)
+				if lerr != nil {
+					fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
+					*code = 1
+					return
+				}
+				if strings.Contains(strings.ToLower(serr.Error()), "too many links") ||
+					strings.Contains(strings.ToLower(serr.Error()), "too many levels") {
+					fmt.Fprintf(hc.Stderr, "find: File system loop detected; '%s' is part of the same file system loop\n", filepath.ToSlash(display))
+					*code = 1
+					return
+				}
+				node.fi = lfi
+				node.typ = lfi.Mode().Type()
+			}
+		} else {
+			node.typ = ent.Type()
+		}
+	} else if ent != nil {
 		node.typ = ent.Type()
 	} else {
 		fi, err := os.Lstat(full)
@@ -1218,42 +1556,89 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full strin
 			return
 		}
 		node.fi = fi
+		node.typ = fi.Mode().Type()
 	}
-	match := pred(&node, hc)
-	if match && !hasAction && depth >= mindepth {
-		if _, err := fmt.Fprintln(hc.Stdout, filepath.ToSlash(display)); err != nil {
-			if isPipeClosed(err) {
-				*stop = true
-				return
+
+	var dirFi os.FileInfo
+	if node.isDir() && opts.followMode != 0 {
+		dirFi = node.fi
+		if dirFi == nil {
+			if sfi, err := os.Stat(full); err == nil {
+				dirFi = sfi
+			}
+		}
+		if dirFi != nil {
+			for _, anc := range ancestors {
+				if os.SameFile(dirFi, anc) {
+					fmt.Fprintf(hc.Stderr, "find: File system loop detected; '%s' is part of the same file system loop\n", filepath.ToSlash(display))
+					*code = 1
+					return
+				}
 			}
 		}
 	}
-	if node.pruned || !node.isDir() {
-		return
-	}
-	if maxdepth >= 0 && depth >= maxdepth {
-		return
-	}
-	entries, err := os.ReadDir(full)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, err)
-		*code = 1
-		return
-	}
-	for _, e := range entries {
-		if stop != nil && *stop {
+
+	evalCurrent := func() {
+		if depth < opts.mindepth {
 			return
 		}
-		subDisplay := display
-		if subDisplay == "." {
-			subDisplay = "./" + e.Name()
-		} else if strings.HasSuffix(subDisplay, "/") {
-			subDisplay = subDisplay + e.Name()
-		} else {
-			subDisplay = subDisplay + "/" + e.Name()
+		match := pred(&node, hc)
+		if match && !opts.hasAction && (stop == nil || !*stop) {
+			if _, err := fmt.Fprintln(hc.Stdout, filepath.ToSlash(display)); err != nil {
+				if isPipeClosed(err) {
+					*stop = true
+				}
+			}
 		}
-		walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, maxdepth, mindepth, pred, hasAction, code, stop, e)
 	}
+
+	descendChildren := func() {
+		if node.pruned || !node.isDir() {
+			return
+		}
+		if opts.maxdepth >= 0 && depth >= opts.maxdepth {
+			return
+		}
+		entries, err := os.ReadDir(full)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, err)
+			*code = 1
+			return
+		}
+		nextAncestors := ancestors
+		if dirFi != nil {
+			nextAncestors = append(ancestors, dirFi)
+		}
+		for _, e := range entries {
+			if ctx.Err() != nil || (stop != nil && *stop) {
+				return
+			}
+			subDisplay := display
+			if subDisplay == "." {
+				subDisplay = "./" + e.Name()
+			} else if strings.HasSuffix(subDisplay, "/") {
+				subDisplay = subDisplay + e.Name()
+			} else {
+				subDisplay = subDisplay + "/" + e.Name()
+			}
+			walkFind(ctx, hc, subDisplay, filepath.Join(full, e.Name()), depth+1, opts, pred, code, stop, e, nextAncestors)
+		}
+	}
+
+	if opts.depthFirst {
+		descendChildren()
+		if ctx.Err() != nil || (stop != nil && *stop) {
+			return
+		}
+		evalCurrent()
+		return
+	}
+
+	evalCurrent()
+	if ctx.Err() != nil || (stop != nil && *stop) {
+		return
+	}
+	descendChildren()
 }
 
 func cmdMd5sum(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -1309,17 +1694,15 @@ func cmdHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, ar
 	status := fs.Bool("status", false, "")
 	fs.BoolVar(status, "s", false, "")
 	strict := fs.Bool("strict", false, "")
+	fs.BoolVar(strict, "z", false, "")
 	fs.Bool("tag", false, "")
 	warn := fs.Bool("w", false, "")
 	fs.BoolVar(warn, "warn", false, "")
-	_ = quiet
-	_ = status
-	_ = strict
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
 	if *check {
-		return runHashCheck(name, newHash, hc, fs.Args(), *quiet, *status)
+		return runHashCheck(name, newHash, hc, fs.Args(), *quiet, *status, *strict, *warn)
 	}
 	return runHash(name, newHash, hc, fs.Args())
 }
@@ -1331,8 +1714,8 @@ func runHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, fi
 	code := 0
 	for _, f := range files {
 		var r io.Reader = hc.Stdin
-		label := "-"
-		if f != "-" {
+		label := f
+		if f != "-" && f != "/dev/stdin" {
 			fh, err := openShellFile(resolve(hc.Dir, f))
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, name+":", err)
@@ -1370,7 +1753,7 @@ var _ = runtime.GOOS
 // runHashCheck implements `md5sum/sha*sum -c FILE`: reads checksum lines
 // ("<hex> [* ]<path>") and verifies each file, printing "path: OK" or
 // "path: FAILED" like GNU. Returns exit 0 iff all checked files match.
-func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string, quiet, status bool) error {
+func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string, quiet, status, strict, warn bool) error {
 	if len(files) == 0 {
 		files = []string{"-"}
 	}
@@ -1391,7 +1774,7 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 			code = 1
 			continue
 		}
-		for _, line := range strings.Split(string(data), "\n") {
+		for lineNo, line := range strings.Split(string(data), "\n") {
 			line = strings.TrimRight(line, "\r")
 			if line == "" || strings.HasPrefix(line, "#") {
 				continue
@@ -1399,6 +1782,9 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 			sum, path, ok := parseHashLine(line)
 			if !ok {
 				badFmt++
+				if warn && !status {
+					fmt.Fprintf(hc.Stderr, "%s: %s: %d: improperly formatted checksum line\n", name, f, lineNo+1)
+				}
 				continue
 			}
 			checked++
@@ -1438,8 +1824,10 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 		}
 		return exitError{1}
 	}
+	if strict && badFmt > 0 {
+		code = 1
+	}
 	_ = failed
-	_ = badFmt
 	if code != 0 {
 		return exitError{code}
 	}
