@@ -33,16 +33,63 @@ package unish
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"mvdan.cc/sh/v3/interp"
 )
+
+func init() {
+	registerExtra("kill", cmdKillNetproc)
+	interp.RegisterFastCallHandler(callOverride, isOverriddenCallNetproc, fastCallOverrideNetproc)
+}
+
+func isOverriddenCallNetproc(name string) bool {
+	if len(name) == 0 {
+		return false
+	}
+	if name == "kill" || name == "jobs" {
+		return true
+	}
+	return isOverriddenCall(name)
+}
+
+func fastCallOverrideNetproc(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	if len(args) == 0 {
+		return args, nil
+	}
+	switch args[0] {
+	case "kill":
+		err := cmdKillNetproc(interp.WithHandlerContext(ctx, hc), hc, splitAttached("kill", args))
+		if err == nil {
+			return nil, interp.CallHandled(0)
+		}
+		if ee, ok := err.(exitError); ok {
+			return nil, interp.CallHandled(uint8(ee.code))
+		}
+		var exitSt *interp.ExitError
+		if errors.As(err, &exitSt) {
+			return nil, err
+		}
+		return nil, interp.CallHandled(1)
+	case "jobs":
+		if err := cmdJobsCtx(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	}
+	return fastCallOverride(ctx, hc, args)
+}
 
 // trackedJob is one external process started by this shell.
 type trackedJob struct {
@@ -57,13 +104,48 @@ type trackedJob struct {
 	started time.Time
 }
 
-// jobTable is the process-wide registry of external children.
+// jobTable is a registry of external children for a shell session or process.
 type jobTable struct {
 	mu   sync.Mutex
 	jobs []*trackedJob // launch order; each live job keeps a stable id
 }
 
-var globalJobs = &jobTable{}
+// JobTable is an isolated per-session registry of external child processes.
+type JobTable = jobTable
+
+type jobTableKey struct{}
+
+var (
+	globalJobs         = &jobTable{}
+	hasCustomJobTables atomic.Bool
+)
+
+// NewJobTable creates a fresh per-session JobTable so concurrent embedded
+// sessions do not share `jobs`, `wait`, or `kill %n` state.
+func NewJobTable() *JobTable {
+	return &jobTable{}
+}
+
+// WithJobTable attaches jt to ctx (pass nil to fall back to globalJobs).
+func WithJobTable(ctx context.Context, jt *JobTable) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if jt != nil {
+		hasCustomJobTables.Store(true)
+	}
+	return context.WithValue(ctx, jobTableKey{}, jt)
+}
+
+func jobsFromContext(ctx context.Context) *jobTable {
+	if !hasCustomJobTables.Load() || ctx == nil {
+		return globalJobs
+	}
+	if jt, _ := ctx.Value(jobTableKey{}).(*jobTable); jt != nil {
+		return jt
+	}
+	return globalJobs
+}
 
 // maxTrackedJobs bounds the registry: finished jobs are reaped, and if
 // more than this many are still RUNNING, the oldest finished slots are
@@ -312,17 +394,76 @@ func (t *jobTable) resolveJobSpec(arg string) *trackedJob {
 	return nil
 }
 
-// trackExec is an exec middleware kept for chain completeness.
-// NOTE: mvdan/sh resolves builtins (jobs, wait, kill, ...) BEFORE the
-// exec-handler chain, so job-control interception lives in callOverride.
-// External commands are tracked in extraHandler.runExternalTracked.
+// trackExec is an exec middleware kept for chain completeness and per-session
+// job/capability isolation when a custom JobTable or CapabilityHook is active.
 func trackExec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		for _, a := range args[1:] {
 			waitProcSubstProducerCtx(ctx, a)
 		}
+		jt := jobsFromContext(ctx)
+		if (jt != globalJobs || CapabilityHookFromContext(ctx) != nil) &&
+			len(args) > 0 && !interp.IsBuiltin(args[0]) && lookupExtra(args[0]) == nil {
+			if err, handled := runExternalTrackedInTable(ctx, jt, args); handled {
+				return err
+			}
+		}
 		return next(ctx, args)
 	}
+}
+
+func runExternalTrackedInTable(ctx context.Context, jt *jobTable, args []string) (error, bool) {
+	hc := interp.HandlerCtx(ctx)
+	if isAbsOrRel(args[0]) {
+		if _, cerr := checkExec(ctx, args[0], args[0], args, hc.Dir); cerr != nil {
+			if hc.InBackground() {
+				hc.ReportBgStart(0)
+			}
+			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
+			return interp.NewExitStatus(126), true
+		}
+	}
+	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
+	if err != nil {
+		return nil, false
+	}
+	checkedBin, cerr := checkExec(ctx, args[0], path, args, hc.Dir)
+	if cerr != nil {
+		if hc.InBackground() {
+			hc.ReportBgStart(0)
+		}
+		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
+		return interp.NewExitStatus(126), true
+	}
+	cmd := exec.CommandContext(ctx, checkedBin, args[1:]...)
+	cmd.Dir = hc.Dir
+	cmd.Stdin = hc.Stdin
+	cmd.Stdout = hc.Stdout
+	cmd.Stderr = hc.Stderr
+	cmd.Env = shellExecEnv(hc)
+	afterStart, afterWait := interp.PrepareExecStdio(cmd)
+	if err := cmd.Start(); err != nil {
+		afterWait()
+		return nil, false
+	}
+	afterStart()
+	defer afterWait()
+	hc.ReportBgStart(cmd.Process.Pid)
+	j := jt.track(cmd, args)
+	<-j.done
+	if j.err != nil {
+		if isPipeClosed(j.err) {
+			return nil, true
+		}
+		if ee, ok := j.err.(*exec.ExitError); ok {
+			if code := signalExitCode(ee); code >= 0 {
+				return interp.NewExitStatus(uint8(code)), true
+			}
+			return interp.NewExitStatus(uint8(ee.ExitCode())), true
+		}
+		return j.err, true
+	}
+	return nil, true
 }
 
 // trackCmd starts an external command with job-table tracking. Used by
@@ -344,19 +485,25 @@ func trackCmd(hc interp.HandlerContext, name string, argv []string) (*trackedJob
 	return globalJobs.track(cmd, argv), nil
 }
 
-// cmdJobs implements `jobs [-l]`: list tracked background processes.
+// cmdJobs implements `jobs [-l]` against globalJobs (kept for signature compatibility).
 func cmdJobs(hc interp.HandlerContext, args []string) error {
-	globalJobs.waitForLaunch()
-	globalJobs.sweep(0)
+	return cmdJobsCtx(context.Background(), hc, args)
+}
+
+// cmdJobsCtx implements `jobs [-l]` against the session's JobTable in ctx.
+func cmdJobsCtx(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	jt := jobsFromContext(ctx)
+	jt.waitForLaunch()
+	jt.sweep(0)
 	long := false
 	for _, a := range args[1:] {
 		if a == "-l" {
 			long = true
 		}
 	}
-	globalJobs.mu.Lock()
-	defer globalJobs.mu.Unlock()
-	for _, j := range globalJobs.jobs {
+	jt.mu.Lock()
+	defer jt.mu.Unlock()
+	for _, j := range jt.jobs {
 		state := "Done"
 		select {
 		case <-j.done:
@@ -378,6 +525,7 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 	if len(args) < 1 || args[0] != "wait" {
 		return 0, false
 	}
+	jt := jobsFromContext(ctx)
 	hc := interp.HandlerCtx(ctx)
 	var operands []string
 	endOpts := false
@@ -394,10 +542,10 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 		operands = append(operands, a)
 	}
 	if len(operands) == 0 {
-		globalJobs.waitForLaunch()
-		globalJobs.mu.Lock()
-		jobs := append([]*trackedJob(nil), globalJobs.jobs...)
-		globalJobs.mu.Unlock()
+		jt.waitForLaunch()
+		jt.mu.Lock()
+		jobs := append([]*trackedJob(nil), jt.jobs...)
+		jt.mu.Unlock()
 		for _, j := range jobs {
 			select {
 			case <-j.done:
@@ -406,7 +554,7 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 				return 1, true
 			}
 		}
-		globalJobs.sweep(0)
+		jt.sweep(0)
 		// Let callOverride pass bare `wait` / `wait --` through to mvdan/sh's
 		// builtin so in-process background goroutines (subshells, procsubst)
 		// are awaited as well.
@@ -419,7 +567,7 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 		if !inRunner {
 			allInRunner = false
 		}
-		j := globalJobs.resolveJobSpec(a)
+		j := jt.resolveJobSpec(a)
 		if j == nil {
 			if inRunner {
 				continue
@@ -436,7 +584,7 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 			return 1, true
 		}
 	}
-	globalJobs.sweep(0)
+	jt.sweep(0)
 	if allInRunner {
 		// Delegate exit-status reporting to mvdan/sh's wait builtin so exact
 		// 0..255 exit statuses (e.g. 42) are preserved instead of collapsing

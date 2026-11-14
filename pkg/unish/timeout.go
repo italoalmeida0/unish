@@ -5,7 +5,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -156,26 +159,26 @@ func timeoutResult(err error, timedOut, preserve bool, sig string) error {
 
 func sigNumber(sig string) int {
 	switch sig {
-		case "HUP":
-			return 1
-		case "INT":
-			return 2
-		case "QUIT":
-			return 3
-		case "KILL":
-			return 9
-		case "USR1":
-			return 10
-		case "USR2":
-			return 12
-		case "TERM":
-			return 15
-		default:
-			if n, err := strconv.Atoi(sig); err == nil {
-				return n
-			}
-			return 15
+	case "HUP":
+		return 1
+	case "INT":
+		return 2
+	case "QUIT":
+		return 3
+	case "KILL":
+		return 9
+	case "USR1":
+		return 10
+	case "USR2":
+		return 12
+	case "TERM":
+		return 15
+	default:
+		if n, err := strconv.Atoi(sig); err == nil {
+			return n
 		}
+		return 15
+	}
 }
 
 func gracePeriod(s string) time.Duration {
@@ -254,30 +257,72 @@ func gateHCOnDone(hc interp.HandlerContext) (interp.HandlerContext, *gateWriter)
 	return ghc, og
 }
 
+func resolveTimeoutPathExec(hc interp.HandlerContext, name string) (string, error) {
+	pathVal := shellGetenv(hc, "PATH")
+	for _, dir := range strings.Split(pathVal, string(os.PathListSeparator)) {
+		if dir == "" {
+			continue
+		}
+		searchDir := dir
+		if !filepath.IsAbs(searchDir) {
+			searchDir = resolveHostPath(hc.Dir, searchDir)
+		}
+		for _, cand := range execCandidates(searchDir, name) {
+			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+				return cand, nil
+			}
+		}
+	}
+	return "", fmt.Errorf("%s not found", name)
+}
+
 func startTimeoutProc(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) (*timeoutProc, error) {
 	for _, a := range cmdArgs[1:] {
 		waitProcSubstProducerCtx(ctx, a)
 	}
-	path := cmdArgs[0]
-	if !isAbsOrRel(path) {
-		lp, err := findExec(hc, path)
+	rawCmd := cmdArgs[0]
+	var execPath string
+	if isAbsOrRel(rawCmd) {
+		if _, cerr := checkExec(ctx, "timeout", rawCmd, cmdArgs, hc.Dir); cerr != nil {
+			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, cerr)
+			return nil, exitError{126}
+		}
+		lp, err := resolveDirectExecPath(hc.Dir, rawCmd)
 		if err != nil {
-			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': No such file or directory\n", path)
+			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, err)
+			if strings.Contains(err.Error(), "Is a directory") {
+				return nil, exitError{126}
+			}
 			return nil, exitError{127}
 		}
-		path = lp
+		execPath = lp
+	} else {
+		lp, err := resolveTimeoutPathExec(hc, rawCmd)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': No such file or directory\n", rawCmd)
+			return nil, exitError{127}
+		}
+		execPath = lp
 	}
-	c := exec.Command(path, cmdArgs[1:]...)
+	checkedBin, err := checkExec(ctx, "timeout", execPath, cmdArgs, hc.Dir)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, err)
+		return nil, exitError{126}
+	}
+	c := exec.Command(checkedBin, cmdArgs[1:]...)
 	c.Stdin = hc.Stdin
 	c.Stdout = hc.Stdout
 	c.Stderr = hc.Stderr
 	c.Dir = hc.Dir
 	c.Env = shellExecEnv(hc)
 	if err := c.Start(); err != nil {
-		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", cmdArgs[0], err)
-		return nil, exitError{127}
+		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, err)
+		if os.IsNotExist(err) {
+			return nil, exitError{127}
+		}
+		return nil, exitError{126}
 	}
-	j := globalJobs.track(c, cmdArgs)
+	j := jobsFromContext(ctx).track(c, cmdArgs)
 	return &timeoutProc{cmd: c, job: j}, nil
 }
 
@@ -309,5 +354,5 @@ func (p *timeoutProc) signal(sig string) error {
 }
 
 func isAbsOrRel(p string) bool {
-	return strings.ContainsAny(p, `/\`) || (len(p) > 1 && p[1] == ':')
+	return strings.ContainsAny(p, `/\`) || (runtime.GOOS == "windows" && len(p) > 1 && p[1] == ':')
 }

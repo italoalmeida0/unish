@@ -21,8 +21,143 @@ func init() {
 	)
 }
 
+func cmdKillNetproc(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	if len(args) > 1 && (args[1] == "-l" || args[1] == "-L" || args[1] == "--list") {
+		fmt.Fprintln(hc.Stdout, "HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM")
+		return nil
+	}
+	sig := "TERM"
+	var pids []string
+	argv2 := args[1:]
+	endOpts := false
+	for i := 0; i < len(argv2); i++ {
+		a := argv2[i]
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			// GNU: -s SIG / -n SIGNUM (separate arg) select the signal.
+			if (a == "-s" || a == "-n") && i+1 < len(argv2) {
+				i++
+				name := strings.ToUpper(argv2[i])
+				if strings.HasPrefix(name, "SIG") {
+					name = name[3:]
+				}
+				if a == "-n" {
+					if !validSignalNumber(name) {
+						fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", argv2[i])
+						return exitError{1}
+					}
+				}
+				sig = name
+				continue
+			}
+			if strings.HasPrefix(a, "-") && len(a) > 1 {
+				name := strings.ToUpper(strings.TrimPrefix(a, "-"))
+				if strings.HasPrefix(name, "SIG") {
+					name = name[3:]
+				}
+				if isDigits(name) {
+					if validSignalNumber(name) {
+						sig = name
+						continue
+					}
+					fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", strings.TrimPrefix(a, "-"))
+					return exitError{1}
+				}
+				if a[1] < '0' || a[1] > '9' {
+					sig = name
+					continue
+				}
+			}
+		}
+		pids = append(pids, a)
+	}
+	if !isValidKillSignal(sig) {
+		fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", sig)
+		return exitError{1}
+	}
+	if len(pids) == 0 {
+		fmt.Fprintln(hc.Stderr, "kill: missing operand")
+		return flag.ErrHelp
+	}
+	jt := jobsFromContext(ctx)
+	embeddedOrJailed := !standaloneCLIMode.Load() || CapabilityHookFromContext(ctx) != nil
+	code := 0
+	for _, p := range pids {
+		if selfPID(p) {
+			if !queueSelfSignalForHC(hc, sig) {
+				if embeddedOrJailed {
+					// Never call OS Kill or os.Exit on the host Go process when
+					// embedded as a library or running inside a capability jail.
+					if ec := portableSelfSignalExitCode(sig); ec > 0 {
+						return interp.Exit(ec)
+					}
+					continue
+				}
+				if p2, err := os.FindProcess(os.Getpid()); err == nil {
+					if err := killProc(p2, sig); err != nil {
+						code = 1
+						continue
+					}
+				}
+				if ec := defaultSelfExitCode(sig); ec > 0 {
+					os.Exit(ec)
+				}
+			}
+			continue
+		}
+		// Session job table first: fake $! ids ("g1"), tracked child pids,
+		// and jobspecs (%1, %%/\%+, \%-, \%name, \%?substr).
+		if j := jt.resolveJobSpec(p); j != nil && j.proc != nil {
+			if err := killProc(j.proc, sig); err != nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", j.pid, killErrText(err))
+				code = 1
+			}
+			continue
+		}
+		if strings.HasPrefix(p, "%") {
+			fmt.Fprintf(hc.Stderr, "kill: %s: no such job\n", p)
+			code = 1
+			continue
+		}
+		pid, err := strconv.Atoi(p)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "kill:", err)
+			code = 1
+			continue
+		}
+		if err := checkProc(ctx, "kill", pid, sig); err != nil {
+			fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", pid, err)
+			code = 1
+			continue
+		}
+		if pid <= 0 && embeddedOrJailed {
+			// Prevent process-group or broadcast signals (0, -1, -pgid) from
+			// killing the host Go process in embedded/jailed mode.
+			fmt.Fprintf(hc.Stderr, "kill: (%d) - Operation not permitted\n", pid)
+			code = 1
+			continue
+		}
+		proc, err := os.FindProcess(pid)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "kill: (%d) - No such process\n", pid)
+			code = 1
+			continue
+		}
+		if err := killProc(proc, sig); err != nil {
+			fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", pid, killErrText(err))
+			code = 1
+		}
+	}
+	if code != 0 {
+		return exitError{code}
+	}
+	return nil
+}
+
 func cmdPgrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	_ = ctx
 	args = splitAttached("pgrep", args)
 	fs := newFlagSet("pgrep", hc.Stderr)
 	full := fs.Bool("f", false, "")
@@ -41,6 +176,10 @@ func cmdPgrep(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	if len(rest) > 1 {
 		fmt.Fprintln(hc.Stderr, "pgrep: only one pattern can be provided")
 		return exitError{2}
+	}
+	if err := checkProc(ctx, "pgrep", 0, "list"); err != nil {
+		fmt.Fprintf(hc.Stderr, "pgrep: %v\n", err)
+		return exitError{1}
 	}
 	pattern := rest[0]
 	matched, err := matchProcs(pattern, *full, *ignoreCase, *exact)
@@ -125,7 +264,6 @@ func recoverPkillSplitArgs(args []string) []string {
 }
 
 func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	_ = ctx
 	args = recoverPkillSplitArgs(args)
 	sig := "TERM"
 	var cleanArgs []string
@@ -198,9 +336,10 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		fmt.Fprintln(hc.Stderr, "pkill: only one pattern can be provided")
 		return exitError{2}
 	}
+	jt := jobsFromContext(ctx)
 	var matched []procInfo
 	if *pgroup != "" {
-		j := globalJobs.resolveJobSpec("%" + *pgroup)
+		j := jt.resolveJobSpec("%" + *pgroup)
 		if len(rest) == 0 && j != nil && j.proc != nil {
 			if sig == "0" {
 				return nil
@@ -214,6 +353,10 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
 			return exitError{2}
+		}
+		if err := checkProc(ctx, "pkill", 0, "list"); err != nil {
+			fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
+			return exitError{1}
 		}
 		procs, err := listProcs()
 		if err != nil {
@@ -239,6 +382,10 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			fmt.Fprintln(hc.Stderr, "pkill: no matching criteria specified")
 			return flag.ErrHelp
 		}
+		if err := checkProc(ctx, "pkill", 0, "list"); err != nil {
+			fmt.Fprintf(hc.Stderr, "pkill: %v\n", err)
+			return exitError{1}
+		}
 		var err error
 		matched, err = matchProcs(rest[0], *full, *ignoreCase, *exact)
 		if err != nil {
@@ -258,8 +405,18 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	if len(matched) == 0 {
 		return exitError{1}
 	}
+	myPid := os.Getpid()
 	killed := 0
 	for _, p := range matched {
+		if p.pid == myPid {
+			continue
+		}
+		if jt.byPID(p.pid) == nil {
+			if err := checkProc(ctx, "pkill", p.pid, sig); err != nil {
+				fmt.Fprintf(hc.Stderr, "pkill: (%d) - %v\n", p.pid, err)
+				continue
+			}
+		}
 		if sig == "0" {
 			if runtime.GOOS == "windows" {
 				killed++
@@ -307,10 +464,10 @@ func allCharsIn(s, set string) bool {
 func isSignalName(s string) bool {
 	clean := strings.TrimPrefix(s, "SIG")
 	switch clean {
-	case "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "BUS", "FPE",
+	case "HUP", "INT", "QUIT", "ILL", "TRAP", "ABRT", "IOT", "BUS", "FPE",
 		"KILL", "USR1", "SEGV", "USR2", "PIPE", "ALRM", "TERM",
-		"STOP", "CONT", "CHLD", "TSTP", "TTIN", "TTOU", "URG",
-		"XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO", "SYS":
+		"STOP", "CONT", "CHLD", "CLD", "TSTP", "TTIN", "TTOU", "URG",
+		"XCPU", "XFSZ", "VTALRM", "PROF", "WINCH", "IO", "POLL", "SYS":
 		return true
 	}
 	return false
@@ -321,8 +478,7 @@ func isValidKillSignal(sig string) bool {
 		return true
 	}
 	if allASCIIUint(sig) {
-		n, err := strconv.Atoi(sig)
-		return err == nil && n >= 0 && n <= 64
+		return validSignalNumber(sig)
 	}
 	return false
 }

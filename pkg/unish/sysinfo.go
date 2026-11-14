@@ -3,6 +3,7 @@ package unish
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -42,7 +43,7 @@ func init() {
 	)
 }
 
-func cmdDf(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdDf(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("df", hc.Stderr)
 	human := fs.Bool("h", false, "")
 	fs.BoolVar(human, "human-readable", false, "")
@@ -64,9 +65,22 @@ func cmdDf(_ context.Context, hc interp.HandlerContext, args []string) error {
 	var rows []row
 	exitStatus := 0
 	for _, p := range paths {
-		full := resolve(hc.Dir, p)
+		full, err := checkFS(ctx, hc.Dir, "df", p, OpStat)
+		if err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "df: %s: Permission denied\n", p)
+			} else {
+				fmt.Fprintf(hc.Stderr, "df: %s: %v\n", p, err)
+			}
+			exitStatus = 1
+			continue
+		}
 		if _, err := os.Stat(full); err != nil {
-			fmt.Fprintf(hc.Stderr, "df: %s: No such file or directory\n", p)
+			if errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "df: %s: Permission denied\n", p)
+			} else {
+				fmt.Fprintf(hc.Stderr, "df: %s: No such file or directory\n", p)
+			}
 			exitStatus = 1
 			continue
 		}
@@ -136,7 +150,7 @@ type procInfo struct {
 	cmd             string
 }
 
-func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdPs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	bsd := false
 	full := false
 	var oformat string
@@ -189,6 +203,11 @@ func cmdPs(_ context.Context, hc interp.HandlerContext, args []string) error {
 				}
 			}
 		}
+	}
+
+	if err := checkProc(ctx, "ps", 0, "list"); err != nil {
+		fmt.Fprintln(hc.Stderr, "ps:", err)
+		return exitError{1}
 	}
 
 	procs, err := listProcs()
@@ -601,7 +620,7 @@ func cmdEnv(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		pairs:   childEnv,
 		cleared: cleared,
 	}
-	return runSysSubcommand(ctx, hc, childEnv, cleared, 0, false, cmd)
+	return runSysSubcommand(ctx, hc, "env", childEnv, cleared, 0, false, cmd)
 }
 
 func envKeyMatchCase(entry, name string, foldCase bool) bool {
@@ -670,9 +689,11 @@ func isEnvName(s string) bool {
 	return true
 }
 
-func cmdStat(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdStat(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("stat", hc.Stderr)
 	format := fs.String("c", "", "")
+	deref := fs.Bool("L", false, "")
+	fs.BoolVar(deref, "dereference", false, "")
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
@@ -682,10 +703,31 @@ func cmdStat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	code := 0
 	for _, p := range fs.Args() {
-		full := resolve(hc.Dir, p)
-		fi, err := os.Lstat(full)
+		var (
+			fi   os.FileInfo
+			err  error
+			full string
+		)
+		if *deref {
+			fi, err = fsStat(ctx, hc.Dir, "stat", p)
+			if err == nil {
+				full = resolveHostPath(hc.Dir, p)
+				if eval, eerr := filepath.EvalSymlinks(full); eerr == nil {
+					full = eval
+				}
+			}
+		} else {
+			fi, err = fsLstat(ctx, hc.Dir, "stat", p)
+			if err == nil {
+				full = resolveHostPath(hc.Dir, p)
+			}
+		}
 		if err != nil {
-			fmt.Fprintf(hc.Stderr, "stat: cannot statx '%s': No such file or directory\n", p)
+			if errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "stat: cannot statx '%s': Permission denied\n", p)
+			} else {
+				fmt.Fprintf(hc.Stderr, "stat: cannot statx '%s': No such file or directory\n", p)
+			}
 			code = 1
 			continue
 		}
@@ -871,7 +913,7 @@ func parseProcIPv6HexEndian(s string, littleEndian bool) (string, error) {
 	return net.IP(b[:]).String(), nil
 }
 
-func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdSs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("ss", hc.Stderr)
 	tcp := fs.Bool("t", false, "")
 	udp := fs.Bool("u", false, "")
@@ -905,6 +947,10 @@ func cmdSs(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	if *udp || (!*tcp && !*udp) {
 		protos = append(protos, "udp")
+	}
+	if err := checkProc(ctx, "ss", 0, "list"); err != nil {
+		fmt.Fprintln(hc.Stderr, "ss:", err)
+		return exitError{1}
 	}
 	socks, err := listSockets(protos)
 	if err != nil {
@@ -1060,6 +1106,19 @@ func cmdSync(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
+func isWriterTTY(w io.Writer) bool {
+	if w == nil {
+		return false
+	}
+	if f, ok := w.(*os.File); ok {
+		return term.IsTerminal(int(f.Fd()))
+	}
+	if tw, ok := w.(interface{ IsTTY() bool }); ok {
+		return tw.IsTTY()
+	}
+	return false
+}
+
 func cmdNohup(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	rest := args[1:]
 	if len(rest) > 0 && (rest[0] == "--" || strings.HasPrefix(rest[0], "--")) {
@@ -1069,8 +1128,32 @@ func cmdNohup(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		fmt.Fprintln(hc.Stderr, "nohup: missing operand")
 		return exitError{125}
 	}
+	if isWriterTTY(hc.Stdout) {
+		outName := "nohup.out"
+		outFile, err := fsOpenFile(ctx, hc.Dir, "nohup", outName, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600)
+		if err != nil {
+			if home := shellGetenv(hc, "HOME"); home != "" {
+				homeOut := filepath.Join(home, "nohup.out")
+				if f2, err2 := fsOpenFile(ctx, hc.Dir, "nohup", homeOut, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o600); err2 == nil {
+					outFile = f2
+					outName = homeOut
+					err = nil
+				}
+			}
+		}
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "nohup: failed to open '%s': %v\n", outName, err)
+			return exitError{125}
+		}
+		defer outFile.Close()
+		fmt.Fprintf(hc.Stderr, "nohup: appending output to '%s'\n", outName)
+		if isWriterTTY(hc.Stderr) {
+			hc.Stderr = outFile
+		}
+		hc.Stdout = outFile
+	}
 	childEnv, cleared := currentEnvPairs(hc)
-	return runSysSubcommand(ctx, hc, childEnv, cleared, 0, false, rest)
+	return runSysSubcommand(ctx, hc, "nohup", childEnv, cleared, 0, false, rest)
 }
 
 func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error {
@@ -1110,13 +1193,41 @@ func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error
 		return nil
 	}
 	childEnv, cleared := currentEnvPairs(hc)
-	return runSysSubcommand(ctx, hc, childEnv, cleared, adjust, true, cmd)
+	return runSysSubcommand(ctx, hc, "nice", childEnv, cleared, adjust, true, cmd)
+}
+
+func resolveDirectExecPath(dir, name string) (string, error) {
+	p := resolveHostPath(dir, name)
+	fi, err := os.Stat(p)
+	if err == nil {
+		if fi.IsDir() {
+			return "", fmt.Errorf("%s: Is a directory", name)
+		}
+		if abs, aerr := filepath.Abs(p); aerr == nil {
+			return abs, nil
+		}
+		return p, nil
+	}
+	if runtime.GOOS == "windows" {
+		for _, e := range strings.Split(os.Getenv("PATHEXT"), ";") {
+			if e = strings.TrimSpace(e); e != "" {
+				cand := p + e
+				if cfi, cerr := os.Stat(cand); cerr == nil && !cfi.IsDir() {
+					if abs, aerr := filepath.Abs(cand); aerr == nil {
+						return abs, nil
+					}
+					return cand, nil
+				}
+			}
+		}
+	}
+	return "", err
 }
 
 func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared bool, name string) (string, error) {
 	_ = cleared
-	if strings.ContainsAny(name, `/\`) || (runtime.GOOS == "windows" && len(name) > 1 && name[1] == ':') {
-		return findExec(hc, name)
+	if isAbsOrRel(name) {
+		return resolveDirectExecPath(hc.Dir, name)
 	}
 	var pathVal string
 	hasPath := false
@@ -1137,7 +1248,7 @@ func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared boo
 		}
 		searchDir := dir
 		if !filepath.IsAbs(searchDir) {
-			searchDir = resolve(hc.Dir, searchDir)
+			searchDir = resolveHostPath(hc.Dir, searchDir)
 		}
 		for _, cand := range execCandidates(searchDir, name) {
 			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
@@ -1148,22 +1259,36 @@ func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared boo
 	return "", fmt.Errorf("%s: No such file or directory", name)
 }
 
-func runSysSubcommand(ctx context.Context, hc interp.HandlerContext, childEnv []string, cleared bool, niceAdjust int, hasNice bool, cmdArgs []string) error {
+func runSysSubcommand(ctx context.Context, hc interp.HandlerContext, wrapperName string, childEnv []string, cleared bool, niceAdjust int, hasNice bool, cmdArgs []string) error {
 	if extra := lookupExtra(cmdArgs[0]); extra != nil {
 		return invokeExtra(ctx, hc, extra, cmdArgs)
 	}
 	if cmdArgs[0] == "printf" {
 		return cmdPrintf(ctx, hc, cmdArgs)
 	}
+	if isAbsOrRel(cmdArgs[0]) {
+		if _, cerr := checkExec(ctx, wrapperName, cmdArgs[0], cmdArgs, hc.Dir); cerr != nil {
+			fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", wrapperName, cmdArgs[0], cerr)
+			return exitError{126}
+		}
+	}
 	path, err := findSubcommandExec(hc, childEnv, cleared, cmdArgs[0])
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "%v\n", err)
+		if strings.Contains(err.Error(), "Is a directory") {
+			return exitError{126}
+		}
 		return exitError{127}
+	}
+	checkedBin, err := checkExec(ctx, wrapperName, path, cmdArgs, hc.Dir)
+	if err != nil {
+		fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", wrapperName, cmdArgs[0], err)
+		return exitError{126}
 	}
 	if childEnv == nil {
 		childEnv = []string{}
 	}
-	c := exec.CommandContext(ctx, path, cmdArgs[1:]...)
+	c := exec.CommandContext(ctx, checkedBin, cmdArgs[1:]...)
 	c.Dir = hc.Dir
 	c.Stdin = hc.Stdin
 	c.Stdout = hc.Stdout
@@ -1180,7 +1305,7 @@ func runSysSubcommand(ctx context.Context, hc interp.HandlerContext, childEnv []
 		setProcNice(c.Process.Pid, currentNice()+niceAdjust)
 	}
 	hc.ReportBgStart(c.Process.Pid)
-	j := globalJobs.track(c, cmdArgs)
+	j := jobsFromContext(ctx).track(c, cmdArgs)
 	<-j.done
 	if j.err != nil {
 		if ctx.Err() != nil {

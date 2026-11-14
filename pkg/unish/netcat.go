@@ -2,10 +2,12 @@ package unish
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 
@@ -67,13 +69,12 @@ func cmdNc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		if *udp {
 			return ncListenUDP(ctx, hc, network, addr, timeout, waitExplicit, *verbose)
 		}
-		var lc net.ListenConfig
-		ln, err := lc.Listen(ctx, network, addr)
+		ln, err := netListen(ctx, "nc", network, addr)
 		if err != nil {
-			if ctx.Err() != nil {
+			if ctx.Err() != nil && !errors.Is(err, os.ErrPermission) {
 				return ctx.Err()
 			}
-			if *verbose {
+			if *verbose || errors.Is(err, os.ErrPermission) {
 				fmt.Fprintf(hc.Stderr, "nc: listen on %s failed: %v\n", addr, err)
 			}
 			return exitError{1}
@@ -83,12 +84,18 @@ func cmdNc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		if *verbose {
 			fmt.Fprintf(hc.Stderr, "Listening on %s...\n", addr)
 		}
+		var stopWait *time.Timer
 		if waitExplicit {
-			if tl, ok := ln.(*net.TCPListener); ok {
-				_ = tl.SetDeadline(time.Now().Add(timeout))
+			if dl, ok := ln.(interface{ SetDeadline(time.Time) error }); ok {
+				_ = dl.SetDeadline(time.Now().Add(timeout))
+			} else {
+				stopWait = time.AfterFunc(timeout, func() { _ = ln.Close() })
 			}
 		}
 		conn, err := ln.Accept()
+		if stopWait != nil {
+			stopWait.Stop()
+		}
 		stopAccept()
 		if err != nil {
 			if ctx.Err() != nil {
@@ -112,13 +119,12 @@ func cmdNc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	host, port := rest[0], rest[1]
 	target := net.JoinHostPort(host, port)
 
-	dialer := net.Dialer{Timeout: timeout}
-	conn, err := dialer.DialContext(ctx, network, target)
+	conn, err := netDial(ctx, "nc", network, target, timeout)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !errors.Is(err, os.ErrPermission) {
 			return ctx.Err()
 		}
-		if *verbose {
+		if *verbose || errors.Is(err, os.ErrPermission) {
 			fmt.Fprintf(hc.Stderr, "nc: connect to %s port %s (%s) failed: %v\n", host, port, network, err)
 		}
 		return exitError{1}
@@ -144,13 +150,12 @@ func cmdNc(ctx context.Context, hc interp.HandlerContext, args []string) error {
 }
 
 func ncListenUDP(ctx context.Context, hc interp.HandlerContext, network, addr string, timeout time.Duration, waitExplicit, verbose bool) error {
-	var lc net.ListenConfig
-	pc, err := lc.ListenPacket(ctx, network, addr)
+	pc, err := netListenPacket(ctx, "nc", network, addr)
 	if err != nil {
-		if ctx.Err() != nil {
+		if ctx.Err() != nil && !errors.Is(err, os.ErrPermission) {
 			return ctx.Err()
 		}
-		if verbose {
+		if verbose || errors.Is(err, os.ErrPermission) {
 			fmt.Fprintf(hc.Stderr, "nc: listen on %s failed: %v\n", addr, err)
 		}
 		return exitError{1}
