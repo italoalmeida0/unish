@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -417,7 +418,7 @@ func TestBugRawModeLifecycleExitZeroAndExitTrap(t *testing.T) {
 		interp.StdIO(nil, &outBuf, io.Discard),
 		interp.CallHandler(func(ctx context.Context, args []string) ([]string, error) {
 			if len(args) > 0 && args[0] == "echo" {
-				if rawMock.active || rp.rawOn {
+				if rawMock.active || rp.isRawOn() {
 					sawRawActiveDuringCmd = true
 				}
 			}
@@ -452,7 +453,7 @@ func TestBugRawModeLifecycleExitZeroAndExitTrap(t *testing.T) {
 	if rp.exitCode != 1 {
 		t.Fatalf("PROMPT_COMMAND clobbered exitCode to %d, want 1", rp.exitCode)
 	}
-	if !rawMock.active || !rp.rawOn {
+	if !rawMock.active || !rp.isRawOn() {
 		t.Fatal("expected raw mode to be resumed after non-exiting execLine")
 	}
 
@@ -468,7 +469,7 @@ func TestBugRawModeLifecycleExitZeroAndExitTrap(t *testing.T) {
 	if sawRawActiveDuringCmd {
 		t.Fatal("raw mode remained active while executing foreground command!")
 	}
-	if rawMock.active || rp.rawOn {
+	if rawMock.active || rp.isRawOn() {
 		t.Fatal("raw mode was re-enabled after `exit 0`!")
 	}
 	got := outBuf.String()
@@ -709,4 +710,244 @@ func TestBugHistoryControlPersistenceAndBangAndVerify(t *testing.T) {
 	_ = errors.New
 	_ = context.Background
 	_ = syntax.NewParser
+}
+
+// TestBugExitTrapPreservesLastExitStatus verifies `runExitTrap()` preserves `$?`
+// (such as 1 after `false` or 130 after `Ctrl-C`) inside `trap ... EXIT` on EOF/Ctrl-D.
+func TestBugExitTrapPreservesLastExitStatus(t *testing.T) {
+	runCase := func(name, input string, wantCode int, wantOut string) {
+		t.Helper()
+		var outBuf bytes.Buffer
+		rp := &repl{
+			hist:   newHistStore(),
+			kbd:    &keyReader{},
+			out:    io.Discard,
+			errOut: io.Discard,
+			width:  80,
+		}
+		r, err := interp.New(
+			interp.Interactive(true),
+			interp.StdIO(nil, &outBuf, io.Discard),
+			interp.CallHandler(rp.callHandler),
+			interp.OpenHandler(shellOpenHandler()),
+			interp.ExecHandlers(trackExec, extraHandler),
+			interp.ProcSubstHandler(procSubstHandler),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rp.r = r
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer pr.Close()
+		rp.inFile = pr
+		go func() {
+			_, _ = pw.Write([]byte(input))
+			_ = pw.Close()
+		}()
+		code := rp.ttyLoop()
+		if code != wantCode {
+			t.Fatalf("%s: ttyLoop exit code = %d, want %d (out=%q)", name, code, wantCode, outBuf.String())
+		}
+		if outBuf.String() != wantOut {
+			t.Fatalf("%s: EXIT trap output = %q, want %q", name, outBuf.String(), wantOut)
+		}
+	}
+
+	runCase("false+EOF", "trap 'echo rc=$?' EXIT\rfalse\r\x04", 1, "rc=1\n")
+	runCase("ctrlC+CtrlD", "trap 'echo rc=$?' EXIT\r\x03\x04", 130, "rc=130\n")
+}
+
+type fakeFatalSignal struct{}
+
+func (fakeFatalSignal) String() string { return "fake-fatal" }
+func (fakeFatalSignal) Signal()        {}
+
+// TestBugPromptSignalSyncAndStaleDrain verifies:
+//  1. Signals buffered in promptSigCh while raw mode is suspended (`execLine`) are
+//     drained before `resumeRaw()` sets `rawOn = true`, preventing stale fatal exits.
+//  2. Concurrent `suspendRaw`/`resumeRaw`/`recordHist`/`cmdHistory`/`handlePromptSignal`
+//     calls synchronize cleanly via `rp.mu`.
+func TestBugPromptSignalSyncAndStaleDrain(t *testing.T) {
+	histPath := filepath.Join(t.TempDir(), "sig_hist")
+	rawMock := &mockRawCtl{active: true}
+	sigCh := make(chan os.Signal, 4)
+	rp := &repl{
+		r:           mustRunner(t),
+		hist:        newHistStore(),
+		kbd:         &keyReader{},
+		raw:         rawMock,
+		rawOn:       true,
+		promptSigCh: sigCh,
+		out:         io.Discard,
+		errOut:      io.Discard,
+		width:       80,
+	}
+	rp.hist.load(histPath, 500)
+	replHist = rp
+	defer func() { replHist = nil }()
+
+	// Simulate entering execLine (`suspendRaw`) and a signal arriving on promptSigCh
+	// right as/while raw mode is suspended; `resumeRaw` must drain it before `rawOn = true`.
+	rp.suspendRaw()
+	sigCh <- fakeFatalSignal{}
+	rp.resumeRaw()
+	select {
+	case s := <-sigCh:
+		t.Fatalf("stale signal %v was not drained by resumeRaw()!", s)
+	default:
+	}
+
+	// Concurrent stress across raw state transitions, history mutations, and prompt signals.
+	var wg sync.WaitGroup
+	wg.Add(3)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			rp.suspendRaw()
+			rp.resumeRaw()
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			rp.recordHist("echo item")
+			_ = cmdHistory(context.Background(), interp.HandlerContext{Stdout: io.Discard, Stderr: io.Discard}, []string{"history", "-a"})
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			_ = rp.handlePromptSignal(os.Interrupt)
+		}
+	}()
+	wg.Wait()
+
+	// Finally, an unhandled fatal signal while idle at prompt (`rawOn == true`) must
+	// close raw mode, persist histNew, and report true.
+	rp.resumeRaw()
+	rp.recordHist("echo saved_on_term")
+	if !rp.handlePromptSignal(fakeFatalSignal{}) {
+		t.Fatal("expected handlePromptSignal on fatal signal while rawOn=true to return true")
+	}
+	if rawMock.active || rp.isRawOn() {
+		t.Fatal("expected handlePromptSignal to close raw mode")
+	}
+	data, err := os.ReadFile(histPath)
+	if err != nil || !strings.Contains(string(data), "echo saved_on_term\n") {
+		t.Fatalf("expected handlePromptSignal to persist histNew, got %q (err=%v)", string(data), err)
+	}
+}
+
+// TestBugTTYHangupDoesNotExecuteUnsubmittedLine verifies EOF / PTY hangup on an
+// unsubmitted line (both primary prompt and PS2 continuation) never executes it.
+func TestBugTTYHangupDoesNotExecuteUnsubmittedLine(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"primary_unsubmitted", "echo SHOULD_NOT_EXECUTE"},
+		{"ps2_quote_unsubmitted", "echo \"hello\rSHOULD_NOT_EXECUTE\""},
+		{"ps2_backslash_eof", "echo SHOULD_NOT_EXECUTE \\\r"},
+	} {
+		var outBuf bytes.Buffer
+		rp := &repl{
+			hist:   newHistStore(),
+			kbd:    &keyReader{},
+			out:    io.Discard,
+			errOut: io.Discard,
+			width:  80,
+		}
+		r, err := interp.New(
+			interp.Interactive(true),
+			interp.StdIO(nil, &outBuf, io.Discard),
+			interp.CallHandler(rp.callHandler),
+			interp.OpenHandler(shellOpenHandler()),
+			interp.ExecHandlers(trackExec, extraHandler),
+			interp.ProcSubstHandler(procSubstHandler),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		rp.r = r
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			t.Fatal(err)
+		}
+		rp.inFile = pr
+		go func() {
+			_, _ = pw.Write([]byte(tc.input))
+			_ = pw.Close()
+		}()
+		_ = rp.ttyLoop()
+		_ = pr.Close()
+		if strings.Contains(outBuf.String(), "SHOULD_NOT_EXECUTE") {
+			t.Fatalf("%s: executed unsubmitted/incomplete command on hangup! out=%q", tc.name, outBuf.String())
+		}
+	}
+}
+
+// TestBugEscapedBangNoEchoAndHistverifySafe verifies `\!` suppresses history
+// expansion without echoing the command to rp.out or trapping `shopt -s histverify`
+// in a stripped-backslash re-edit failure, while `history -p` still outputs `!`.
+func TestBugEscapedBangNoEchoAndHistverifySafe(t *testing.T) {
+	var cmdOut, ttyOut, errOut bytes.Buffer
+	rp := &repl{
+		hist:       newHistStore(),
+		kbd:        &keyReader{},
+		out:        &ttyOut,
+		errOut:     &errOut,
+		histExpand: true,
+		width:      80,
+	}
+	r, err := interp.New(
+		interp.Interactive(true),
+		interp.StdIO(nil, &cmdOut, &errOut),
+		interp.CallHandler(rp.callHandler),
+		interp.OpenHandler(shellOpenHandler()),
+		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ProcSubstHandler(procSubstHandler),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rp.r = r
+	mustRun(t, r, "PS1='$ '")
+	mustRun(t, r, "shopt -s histverify")
+	replHist = rp
+	defer func() { replHist = nil }()
+
+	// 1. Direct expandBang check: displayEcho must be "" when only `\!` was unescaped.
+	exp, disp, err := expandBang(`echo \!hello`, []string{"echo prev"})
+	if err != nil || exp != "echo !hello" || disp != "" {
+		t.Fatalf(`expandBang(echo \!hello) = (%q, %q, %v), want ("echo !hello", "", nil)`, exp, disp, err)
+	}
+
+	// 2. In ttyLoop with `shopt -s histverify`, `echo \!hello` must execute immediately
+	// without echoing "echo !hello" as an expanded line or failing with event not found.
+	pr, pw, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pr.Close()
+	rp.inFile = pr
+	go func() {
+		_, _ = pw.Write([]byte("echo \\!hello\rhistory -p 'echo \\!world'\r"))
+		_ = pw.Close()
+	}()
+	code := rp.ttyLoop()
+	if code != 0 {
+		t.Fatalf("ttyLoop exited %d (errOut=%q)", code, errOut.String())
+	}
+	if cmdOut.String() != "!hello\necho !world\n" {
+		t.Fatalf("cmdOut = %q, want %q", cmdOut.String(), "!hello\necho !world\n")
+	}
+	if errOut.String() != "" {
+		t.Fatalf("unexpected stderr: %q", errOut.String())
+	}
+	if strings.Contains(ttyOut.String(), "echo !hello") {
+		t.Fatalf("escaped bang falsely echoed expanded line to ttyOut: %q", ttyOut.String())
+	}
 }

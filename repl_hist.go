@@ -225,6 +225,7 @@ func expandBang(line string, items []string) (string, string, error) {
 	var sb strings.Builder
 	inS, inD := false, false
 	atWordBoundary := true
+	didExpand := false
 	i := 0
 	for i < len(line) {
 		c := line[i]
@@ -296,10 +297,12 @@ func expandBang(line string, items []string) (string, string, error) {
 				return "", "", errNoHist("!!")
 			}
 			sb.WriteString(items[len(items)-1])
+			didExpand = true
 			i += 2
 		case n == '#':
 			// !# = line so far.
 			sb.WriteString(sb.String())
+			didExpand = true
 			i += 2
 		case n == ' ' || n == '\t' || n == '\n' || n == '=' || n == '(':
 			sb.WriteByte(c)
@@ -340,6 +343,7 @@ func expandBang(line string, items []string) (string, string, error) {
 					return "", "", errNoHist(line[i:k])
 				}
 				sb.WriteString(items[found])
+				didExpand = true
 				i = k
 				continue
 			}
@@ -354,6 +358,7 @@ func expandBang(line string, items []string) (string, string, error) {
 				return "", "", errNoHist(line[i:k])
 			}
 			sb.WriteString(items[idx])
+			didExpand = true
 			i = k
 		default:
 			// !prefix or !?substr[?]
@@ -397,10 +402,16 @@ func expandBang(line string, items []string) (string, string, error) {
 				return "", "", errNoHist(line[i:end])
 			}
 			sb.WriteString(items[found])
+			didExpand = true
 			i = end
 		}
 	}
-	return sb.String(), sb.String(), nil
+	out := sb.String()
+	displayEcho := ""
+	if didExpand {
+		displayEcho = out
+	}
+	return out, displayEcho, nil
 }
 
 func isBangDelim(c byte) bool {

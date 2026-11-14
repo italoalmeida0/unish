@@ -50,6 +50,7 @@ type repl struct {
 	inFile         *os.File
 	raw            rawModeCtl
 	rawOn          bool
+	promptSigCh    chan os.Signal
 	inTTY          bool
 	width          int
 	exitCode       int
@@ -70,7 +71,32 @@ type repl struct {
 	mu             sync.Mutex
 }
 
+func drainSignals(ch chan os.Signal) {
+	if ch == nil {
+		return
+	}
+	for {
+		select {
+		case <-ch:
+		default:
+			return
+		}
+	}
+}
+
+func (rp *repl) isRawOn() bool {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	return rp.rawOn
+}
+
 func (rp *repl) suspendRaw() {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	if rp.promptSigCh != nil {
+		signal.Stop(rp.promptSigCh)
+		drainSignals(rp.promptSigCh)
+	}
 	if rp.raw != nil {
 		rp.raw.suspend()
 	}
@@ -78,6 +104,12 @@ func (rp *repl) suspendRaw() {
 }
 
 func (rp *repl) resumeRaw() {
+	rp.mu.Lock()
+	defer rp.mu.Unlock()
+	if rp.promptSigCh != nil {
+		drainSignals(rp.promptSigCh)
+		signal.Notify(rp.promptSigCh, trapSignals()...)
+	}
 	if rp.raw != nil {
 		rp.raw.resume()
 	}
@@ -390,7 +422,7 @@ func promptEscape(s string) string {
 // execLine parses + runs one accepted (possibly multiline) line,
 // returning the exit code. History-expand already applied by caller.
 func (rp *repl) execLine(line string) int {
-	wasRaw := rp.rawOn || rp.raw != nil
+	wasRaw := rp.isRawOn() || rp.raw != nil
 	if wasRaw {
 		rp.suspendRaw()
 		defer func() {
@@ -463,18 +495,23 @@ func (rp *repl) execLine(line string) int {
 }
 
 // runExitTrap triggers any registered EXIT trap once when the REPL terminates
-// via EOF/Ctrl-D (when exit/errexit has not already fired it).
+// via EOF/Ctrl-D (when exit/errexit has not already fired it), preserving $?
+// inside the trap via `builtin exit <exitCode>`.
 func (rp *repl) runExitTrap() {
 	if rp.r == nil || rp.shouldExit {
 		return
 	}
-	wasRaw := rp.rawOn || rp.raw != nil
+	wasRaw := rp.isRawOn() || rp.raw != nil
 	if wasRaw {
 		rp.suspendRaw()
 	}
+	prog, err := syntax.NewParser().Parse(strings.NewReader(fmt.Sprintf("builtin exit %d", rp.exitCode&0xff)), "")
+	if err != nil || len(prog.Stmts) == 0 {
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	if err := rp.r.Run(ctx, &syntax.File{}); err != nil {
+	if err := rp.r.Run(ctx, prog.Stmts[0]); err != nil {
 		var es interp.ExitStatus
 		if errors.As(err, &es) {
 			rp.exitCode = int(es)

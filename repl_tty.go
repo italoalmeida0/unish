@@ -106,17 +106,23 @@ func runInteractive() int {
 	if f := rawSess.inFile(); f != nil {
 		rp.inFile = f
 	}
+	sigCh := make(chan os.Signal, 1)
+	rp.mu.Lock()
 	rp.raw = rawSess
 	rp.rawOn = true
+	rp.promptSigCh = sigCh
+	signal.Notify(sigCh, trapSignals()...)
+	rp.mu.Unlock()
 
 	// Ensure fatal signals (SIGTERM/SIGHUP) while idle at the prompt restore
 	// terminal cooked mode and save history instead of leaving the TTY raw.
 	var exitingSig atomic.Bool
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, trapSignals()...)
 	sigDone := make(chan struct{})
 	defer func() {
+		rp.mu.Lock()
 		signal.Stop(sigCh)
+		rp.promptSigCh = nil
+		rp.mu.Unlock()
 		close(sigDone)
 	}()
 	go func() {
@@ -125,19 +131,7 @@ func runInteractive() int {
 			case <-sigDone:
 				return
 			case sig := <-sigCh:
-				// When rawOn is false we are inside execLine, which manages its own signals.
-				if !rp.rawOn {
-					continue
-				}
-				if sig == os.Interrupt {
-					continue
-				}
-				if rp.r != nil && rp.r.QueueSignal(sig) {
-					continue
-				}
-				if exitingSig.CompareAndSwap(false, true) {
-					rawSess.close()
-					rp.hist.save(rp.histNew)
+				if rp.handlePromptSignal(sig) && exitingSig.CompareAndSwap(false, true) {
 					os.Exit(1)
 				}
 			}
@@ -146,8 +140,37 @@ func runInteractive() int {
 
 	code := rp.ttyLoop()
 	// Persist new history (append, like bash).
-	rp.hist.save(rp.histNew)
+	rp.saveHist()
 	return code
+}
+
+// handlePromptSignal processes a signal received while idle at the prompt.
+// Returns true when the signal is fatal and the process should exit after
+// restoring terminal state and persisting history.
+func (rp *repl) handlePromptSignal(sig os.Signal) bool {
+	if !rp.isRawOn() {
+		return false
+	}
+	if sig == os.Interrupt {
+		return false
+	}
+	if rp.r != nil && rp.r.QueueSignal(sig) {
+		return false
+	}
+	rp.mu.Lock()
+	if !rp.rawOn {
+		rp.mu.Unlock()
+		return false
+	}
+	rp.rawOn = false
+	raw := rp.raw
+	snap := append([]string(nil), rp.histNew...)
+	rp.hist.save(snap)
+	rp.mu.Unlock()
+	if raw != nil {
+		raw.close()
+	}
+	return true
 }
 
 func histInt(s string, def int) int {
@@ -247,7 +270,7 @@ func (rp *repl) handleShopt(ctx context.Context, args []string) (bool, []string,
 }
 
 func (rp *repl) rawNewline() {
-	if rp.rawOn {
+	if rp.isRawOn() {
 		fmt.Fprint(rp.out, "\r\n")
 	} else {
 		fmt.Fprintln(rp.out)
@@ -348,16 +371,19 @@ func (rp *repl) plainLoop() int {
 		}
 	}
 	rp.runExitTrap()
-	rp.hist.save(rp.histNew)
+	rp.saveHist()
 	return rp.exitCode
 }
 
 // acceptLine runs bang expansion, history save, and execution.
 func (rp *repl) acceptLine(line string) int {
 	if rp.histExpand && strings.Contains(line, "!") {
-		exp, _, err := expandBang(line, rp.hist.items)
+		rp.mu.Lock()
+		itemsSnap := append([]string(nil), rp.hist.items...)
+		rp.mu.Unlock()
+		exp, displayEcho, err := expandBang(line, itemsSnap)
 		if err != nil {
-			if rp.rawOn {
+			if rp.isRawOn() {
 				fmt.Fprint(rp.errOut, err.Error()+"\r\n")
 			} else {
 				fmt.Fprintln(rp.errOut, err.Error())
@@ -365,24 +391,27 @@ func (rp *repl) acceptLine(line string) int {
 			rp.exitCode = 1
 			return 1
 		}
-		if exp != line {
-			fmt.Fprint(rp.out, exp)
+		if displayEcho != "" {
+			fmt.Fprint(rp.out, displayEcho)
 			rp.rawNewline()
-			if rp.histVerify && (rp.inTTY || rp.rawOn || rp.raw != nil) {
+			if rp.histVerify && (rp.inTTY || rp.isRawOn() || rp.raw != nil) {
 				// Re-edit expanded line instead of executing.
 				rp.lastLine = exp
 				return -1
 			}
-			line = exp
 		}
+		line = exp
 	}
 	rp.recordHist(line)
+	rp.mu.Lock()
 	rp.syncHistBounds()
+	rp.mu.Unlock()
 	rp.liveSaved = ""
 	replHist = rp
 	code := rp.execLine(line)
 	if v := rp.getenv("HISTSIZE"); v != "" {
 		histsz := histInt(v, 0)
+		rp.mu.Lock()
 		rp.hist.maxIn = histsz
 		if histsz == 0 {
 			rp.hist.items = nil
@@ -390,6 +419,7 @@ func (rp *repl) acceptLine(line string) int {
 			rp.hist.items = rp.hist.items[len(rp.hist.items)-histsz:]
 		}
 		rp.syncHistBounds()
+		rp.mu.Unlock()
 	}
 	if strings.Contains(line, "shopt") {
 		rp.histVerify = shoptEnabled(rp.r, "histverify")
@@ -424,7 +454,9 @@ func (rp *repl) ttyLoop() int {
 		rn.prompt = promptDisp
 		rn.invalidate() // new prompt (PROMPT_COMMAND may change it)
 		lb.clear()
+		rp.mu.Lock()
 		rp.syncHistBounds()
+		rp.mu.Unlock()
 		rp.liveSaved = ""
 		rp.tabCount = 0
 		// histverify re-edit?
@@ -435,7 +467,7 @@ func (rp *repl) ttyLoop() int {
 		}
 		redraw()
 		line, ctrl := rp.readEditedLine(&lb, rn, redraw)
-		if ctrl == readCtrlD && lb.String() == "" {
+		if ctrl == readCtrlD {
 			rp.rawNewline()
 			break
 		}
@@ -444,6 +476,7 @@ func (rp *repl) ttyLoop() int {
 			continue
 		}
 		full := line
+		eofAbort := false
 		// Multiline continuation.
 		for incomplete(full) {
 			p2d, _ := rp.prompt(false)
@@ -463,14 +496,17 @@ func (rp *repl) ttyLoop() int {
 				break
 			}
 			if c2 == readCtrlD {
-				if cont != "" {
-					full += "\n" + cont
-				}
+				eofAbort = true
 				break
 			}
 			full += "\n" + cont
 		}
 		rp.rawNewline()
+		if eofAbort && hasTrailingBackslashContinuation(full) {
+			fmt.Fprintln(rp.errOut, "bash: syntax error: unexpected end of file")
+			rp.exitCode = 2
+			continue
+		}
 		if full == "" {
 			continue
 		}
