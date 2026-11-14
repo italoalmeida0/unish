@@ -2,14 +2,15 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"mvdan.cc/sh/v3/interp"
 )
@@ -46,9 +47,9 @@ type sedCmd struct {
 	name    byte
 	arg     string
 	sub     *sedSub
-	blk     []*sedCmd
 	label   string
 	rangeID int
+	endPC   int // for '{': PC immediately after matching '}'
 }
 
 type sedSub struct {
@@ -66,25 +67,94 @@ type sedSub struct {
 	write   string
 }
 
-var sedRangeSeq int
+func extractSedFlags(args []string) (cleanArgs []string, inplaceOn bool, inplaceSuffix string) {
+	var flagArgs, posArgs []string
+	skipNext := false
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if skipNext {
+			skipNext = false
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if a == "--" {
+			posArgs = append(posArgs, args[i+1:]...)
+			break
+		}
+		if a == "-i" || a == "--in-place" {
+			inplaceOn = true
+			inplaceSuffix = ""
+			continue
+		}
+		if strings.HasPrefix(a, "--in-place=") {
+			inplaceOn = true
+			inplaceSuffix = strings.TrimPrefix(a, "--in-place=")
+			continue
+		}
+		if a == "-e" || a == "--expression" || a == "-f" || a == "--file" {
+			skipNext = true
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if strings.HasPrefix(a, "--expression=") || strings.HasPrefix(a, "--file=") {
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if len(a) >= 2 && a[0] == '-' && a[1] != '-' {
+			var boolCluster []string
+			handled := false
+			for j := 1; j < len(a); j++ {
+				ch := a[j]
+				switch ch {
+				case 'n', 'E', 'r':
+					boolCluster = append(boolCluster, "-"+string(ch))
+				case 'e', 'f':
+					flagArgs = append(flagArgs, boolCluster...)
+					flagArgs = append(flagArgs, "-"+string(ch))
+					if j+1 < len(a) {
+						flagArgs = append(flagArgs, a[j+1:])
+					} else {
+						skipNext = true
+					}
+					handled = true
+				case 'i':
+					flagArgs = append(flagArgs, boolCluster...)
+					inplaceOn = true
+					inplaceSuffix = a[j+1:]
+					handled = true
+				default:
+					j = len(a)
+				}
+				if handled {
+					break
+				}
+			}
+			if handled {
+				continue
+			}
+			if len(boolCluster) == len(a)-1 {
+				flagArgs = append(flagArgs, boolCluster...)
+				continue
+			}
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		if strings.HasPrefix(a, "--") && len(a) > 2 {
+			flagArgs = append(flagArgs, a)
+			continue
+		}
+		posArgs = append(posArgs, a)
+	}
+	cleanArgs = append(cleanArgs, flagArgs...)
+	if len(posArgs) > 0 {
+		cleanArgs = append(cleanArgs, "--")
+		cleanArgs = append(cleanArgs, posArgs...)
+	}
+	return cleanArgs, inplaceOn, inplaceSuffix
+}
 
 func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error {
-	_ = ctx
-	inplace := ""
-	inplaceOn := false
-	var cleanArgs []string
-	for _, a := range args[1:] {
-		if len(a) > 2 && a[0] == '-' && a[1] == 'i' && a[2] != '=' {
-			inplaceOn = true
-			inplace = a[2:]
-			continue
-		}
-		if a == "-i" {
-			inplaceOn = true
-			continue
-		}
-		cleanArgs = append(cleanArgs, a)
-	}
+	cleanArgs, inplaceOn, inplace := extractSedFlags(args[1:])
 	fs := newFlagSet("sed", hc.Stderr)
 	quiet := fs.Bool("n", false, "")
 	fs.BoolVar(quiet, "quiet", false, "")
@@ -130,40 +200,28 @@ func cmdSed(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		fmt.Fprintf(hc.Stderr, "sed: -e expression #1, char 1: %v\n", dropSedPrefix(err))
 		return exitError{1}
 	}
-	inplaceFlag := inplaceOn || hasIFlag(args)
-	if inplaceFlag {
-		return sedInplace(hc, prog, *quiet, *extended, inputs, inplace)
+	if inplaceOn {
+		return sedInplace(ctx, hc, prog, *quiet, *extended, inputs, inplace)
 	}
-	r := &sedRunner{hc: hc, quiet: *quiet, extended: *extended,
-		labels: map[string]int{}, wfiles: map[string]*os.File{},
-		ranges: map[int]bool{}, rangeSeen: map[int]bool{}, rangeStart: map[int]int{}}
-	for i, c := range prog {
-		if c.name == ':' {
-			r.labels[c.label] = i
-		}
-	}
-	if len(inputs) == 0 {
-		r.runStream(prog, hc.Stdin)
-	} else {
-		for _, in := range inputs {
-			if in == "-" || in == "/dev/stdin" {
-				r.runStream(prog, hc.Stdin)
-				continue
-			}
-			f, err := os.Open(resolvePath(hc, in))
-			if err != nil {
-				fmt.Fprintln(hc.Stderr, "sed:", err)
-				return exitError{1}
-			}
-			r.runStream(prog, f)
-			f.Close()
-			if r.quit {
-				break
-			}
-		}
-	}
+	r := newSedRunner(ctx, hc, prog, *quiet, *extended, hc.Stdout)
+	stream := &sedStream{ctx: ctx, hc: hc, inputs: inputs}
+	r.runStream(prog, stream)
+	stream.closeCur()
 	for _, f := range r.wfiles {
 		f.Close()
+	}
+	if r.writeErr != nil {
+		if isPipeClosed(r.writeErr) {
+			return r.writeErr
+		}
+		fmt.Fprintln(hc.Stderr, "sed:", r.writeErr)
+		return exitError{1}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if stream.openErr && r.err == nil && r.exitCode == 0 {
+		return exitError{1}
 	}
 	return sedFinish(hc, r)
 }
@@ -193,282 +251,212 @@ func sedFinish(hc interp.HandlerContext, r *sedRunner) error {
 	return nil
 }
 
-func hasIFlag(args []string) bool {
-	for _, a := range args[1:] {
-		if len(a) >= 2 && a[0] == '-' && a[1] == 'i' {
-			return true
-		}
-	}
-	return false
-}
-
-func splitSedArgs(args []string) []string {
-	var out []string
-	for _, a := range args {
-		if len(a) > 2 && a[0] == '-' && a[1] != '-' {
-			switch a[1] {
-			case 'i':
-				out = append(out, "-i", a[2:])
-				continue
-			case 'e', 'f':
-				out = append(out, "-"+string(a[1]), a[2:])
-				continue
-			}
-		}
-		out = append(out, a)
-	}
-	return out
-}
-
-func isSedProgram(a, full string) bool {
-	if _, err := os.Stat(full); err != nil {
-		return true
-	}
-	for _, c := range a {
-		if strings.ContainsRune("spdqyngGNPHhlawrbt:{}=!#", c) {
-			return true
-		}
-	}
-	return false
-}
-
 func parseSed(src string, extended bool) ([]*sedCmd, error) {
-	var lines []string
-	var cur strings.Builder
-	for _, raw := range strings.Split(src, "\n") {
-		line := strings.TrimRight(raw, "\r")
-		if cur.Len() > 0 {
-			cur.WriteString("\n")
+	// Normalize CRLF to LF for script parsing while keeping raw command bytes intact.
+	s := strings.ReplaceAll(src, "\r\n", "\n")
+	var prog []*sedCmd
+	var blockStack []int
+	rangeSeq := 0
+
+	for len(s) > 0 {
+		// Skip command separators and whitespace.
+		for len(s) > 0 && (s[0] == ' ' || s[0] == '\t' || s[0] == '\r' || s[0] == '\n' || s[0] == ';') {
+			s = s[1:]
 		}
-		cur.WriteString(line)
-		if strings.HasSuffix(line, "\\") && !strings.HasSuffix(line, "\\\\") {
-			cur.WriteString("\n")
+		if len(s) == 0 {
+			break
+		}
+		if s[0] == '#' {
+			if nl := strings.IndexByte(s, '\n'); nl >= 0 {
+				s = s[nl+1:]
+			} else {
+				s = ""
+			}
 			continue
 		}
-		lines = append(lines, cur.String())
-		cur.Reset()
-	}
-	if cur.Len() > 0 {
-		lines = append(lines, cur.String())
-	}
-	var prog []*sedCmd
-	for _, line := range lines {
-		for _, chunk := range splitCommands(line) {
-			cmds, err := parseSedLine(chunk, extended)
+		if s[0] == '}' {
+			if len(blockStack) == 0 {
+				return nil, fmt.Errorf("unexpected `}'")
+			}
+			openIdx := blockStack[len(blockStack)-1]
+			blockStack = blockStack[:len(blockStack)-1]
+			prog = append(prog, &sedCmd{name: '}'})
+			prog[openIdx].endPC = len(prog)
+			s = s[1:]
+			continue
+		}
+
+		var a1, a2 *sedAddr
+		var err error
+		s, a1, err = parseAddr(s, extended)
+		if err != nil {
+			return nil, err
+		}
+		s = strings.TrimLeft(s, " \t")
+		if a1 != nil && strings.HasPrefix(s, ",") {
+			s = strings.TrimLeft(s[1:], " \t")
+			if len(s) > 1 && (s[0] == '+' || s[0] == '~') && s[1] >= '0' && s[1] <= '9' {
+				i := 1
+				for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+					i++
+				}
+				n, _ := strconv.Atoi(s[1:i])
+				if s[0] == '+' {
+					a2 = &sedAddr{kind: 6, plus: n}
+				} else {
+					a2 = &sedAddr{kind: 7, tilde: n}
+				}
+				s = s[i:]
+			} else {
+				s, a2, err = parseAddr(s, extended)
+				if err != nil {
+					return nil, err
+				}
+			}
+		}
+		s = strings.TrimLeft(s, " \t")
+		bang := false
+		if strings.HasPrefix(s, "!") {
+			bang = true
+			s = strings.TrimLeft(s[1:], " \t")
+		}
+		if len(s) == 0 || s[0] == '\n' || s[0] == ';' || s[0] == '}' {
+			return nil, fmt.Errorf("missing command")
+		}
+
+		name := s[0]
+		s = s[1:]
+		rangeSeq++
+		c := &sedCmd{a1: a1, a2: a2, bang: bang, name: name, rangeID: rangeSeq}
+
+		switch name {
+		case '{':
+			blockStack = append(blockStack, len(prog))
+			prog = append(prog, c)
+		case 's':
+			var sub *sedSub
+			sub, s, err = parseSubStream(s, extended)
 			if err != nil {
 				return nil, err
 			}
-			prog = append(prog, cmds...)
+			c.sub = sub
+			prog = append(prog, c)
+		case 'y':
+			if len(s) == 0 {
+				return nil, fmt.Errorf("y: missing delimiter")
+			}
+			d := s[0]
+			fromSet, rest2, ok := takeUntil(s[1:], d)
+			if !ok {
+				return nil, fmt.Errorf("y: need 2 sets")
+			}
+			toSet, rest3, ok := takeUntil(rest2, d)
+			if !ok {
+				return nil, fmt.Errorf("y: need 2 sets")
+			}
+			c.arg = fromSet + "\x00" + toSet
+			s = rest3
+			prog = append(prog, c)
+		case 'a', 'i', 'c':
+			s = strings.TrimLeft(s, " \t")
+			if strings.HasPrefix(s, "\\\n") {
+				s = s[2:]
+				var textBuf strings.Builder
+				for {
+					nl := strings.IndexByte(s, '\n')
+					var linePart string
+					if nl >= 0 {
+						linePart = s[:nl]
+						s = s[nl+1:]
+					} else {
+						linePart = s
+						s = ""
+					}
+					if hasTrailingSingleBackslash(linePart) {
+						textBuf.WriteString(unescapeSedText(linePart[:len(linePart)-1]))
+						textBuf.WriteByte('\n')
+						if len(s) == 0 {
+							break
+						}
+						continue
+					}
+					textBuf.WriteString(unescapeSedText(linePart))
+					break
+				}
+				c.arg = textBuf.String()
+			} else {
+				if strings.HasPrefix(s, "\\") {
+					s = s[1:]
+				}
+				end := len(s)
+				for k := 0; k < len(s); k++ {
+					if s[k] == '\\' && k+1 < len(s) {
+						k++
+						continue
+					}
+					if s[k] == '\n' || (len(blockStack) > 0 && s[k] == '}') {
+						end = k
+						break
+					}
+				}
+				c.arg = unescapeSedText(s[:end])
+				s = s[end:]
+				if len(s) > 0 && s[0] == '\n' {
+					s = s[1:]
+				}
+			}
+			prog = append(prog, c)
+		case 'r', 'w':
+			s = strings.TrimLeft(s, " \t")
+			end := len(s)
+			for k := 0; k < len(s); k++ {
+				if s[k] == '\n' || s[k] == ';' || s[k] == '}' {
+					end = k
+					break
+				}
+			}
+			c.arg = strings.TrimSpace(s[:end])
+			s = s[end:]
+			prog = append(prog, c)
+		case ':', 'b', 't', 'T':
+			s = strings.TrimLeft(s, " \t")
+			end := len(s)
+			for k := 0; k < len(s); k++ {
+				if s[k] == '\n' || s[k] == ';' || s[k] == '}' || s[k] == '#' || s[k] == ' ' || s[k] == '\t' {
+					end = k
+					break
+				}
+			}
+			c.label = s[:end]
+			s = strings.TrimLeft(s[end:], " \t")
+			prog = append(prog, c)
+		case 'q', 'Q':
+			s = strings.TrimLeft(s, " \t")
+			end := 0
+			for end < len(s) && s[end] >= '0' && s[end] <= '9' {
+				end++
+			}
+			c.arg = s[:end]
+			s = s[end:]
+			prog = append(prog, c)
+		case 'd', 'D', 'p', 'P', 'n', 'N', 'h', 'H', 'g', 'G', 'x', 'l', '=':
+			prog = append(prog, c)
+		default:
+			return nil, fmt.Errorf("unknown command: `%c'", name)
 		}
+	}
+	if len(blockStack) > 0 {
+		return nil, fmt.Errorf("unmatched `{'")
 	}
 	return prog, nil
 }
 
-func splitCommands(line string) []string {
-	var parts []string
-	start := 0
-	i := 0
-	for i < len(line) {
-		ch := line[i]
-		if ch == 'a' || ch == 'i' || ch == 'c' {
-			j := i + 1
-			for j < len(line) && (line[j] == ' ' || line[j] == '\t') {
-				j++
-			}
-			if j < len(line) && line[j] == '\\' {
-				break
-			}
-		}
-		if ch == 's' || ch == 'y' {
-			if i+1 < len(line) {
-				d := line[i+1]
-				j := i + 2
-				count := 0
-				need := 2
-				for j < len(line) && count < need {
-					if line[j] == '\\' {
-						j += 2
-						continue
-					}
-					if line[j] == d {
-						count++
-					}
-					j++
-				}
-				i = j
-				continue
-			}
-		}
-		if ch == '{' {
-			depth := 1
-			j := i + 1
-			for j < len(line) && depth > 0 {
-				if line[j] == '{' {
-					depth++
-				} else if line[j] == '}' {
-					depth--
-				}
-				j++
-			}
-			i = j
-			continue
-		}
-		if ch == ';' {
-			parts = append(parts, line[start:i])
-			start = i + 1
-		}
-		i++
+func hasTrailingSingleBackslash(s string) bool {
+	n := 0
+	for i := len(s) - 1; i >= 0 && s[i] == '\\'; i-- {
+		n++
 	}
-	parts = append(parts, line[start:])
-	var out []string
-	for _, p := range parts {
-		if strings.TrimSpace(p) != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-func parseSedLine(line string, extended bool) ([]*sedCmd, error) {
-	s := strings.TrimLeft(line, " \t")
-	if s == "" || strings.HasPrefix(s, "#") {
-		return nil, nil
-	}
-	var a1, a2 *sedAddr
-	var err error
-	s, a1, err = parseAddr(s, extended)
-	if err != nil {
-		return nil, err
-	}
-	if a1 != nil && strings.HasPrefix(s, ",") {
-		s = s[1:]
-		if len(s) > 1 && (s[0] == '+' || s[0] == '~') && s[1] >= '0' && s[1] <= '9' {
-			i := 1
-			for i < len(s) && s[i] >= '0' && s[i] <= '9' {
-				i++
-			}
-			n, _ := strconv.Atoi(s[1:i])
-			if s[0] == '+' {
-				a2 = &sedAddr{kind: 6, plus: n}
-			} else {
-				a2 = &sedAddr{kind: 7, tilde: n}
-			}
-			s = s[i:]
-		} else {
-			s, a2, err = parseAddr(s, extended)
-			if err != nil {
-				return nil, err
-			}
-		}
-	}
-	s = strings.TrimLeft(s, " \t")
-	bang := false
-	if strings.HasPrefix(s, "!") {
-		bang = true
-		s = strings.TrimLeft(s[1:], " \t")
-	}
-	if s == "" {
-		return nil, fmt.Errorf("missing command")
-	}
-	if s[0] == '{' {
-		inner := strings.TrimSpace(s[1:])
-		var blk []*sedCmd
-		if strings.HasSuffix(inner, "}") {
-			inner = strings.TrimSpace(inner[:len(inner)-1])
-			for _, part := range splitSedBlock(inner) {
-				sub, err := parseSedLine(part, extended)
-				if err != nil {
-					return nil, err
-				}
-				blk = append(blk, sub...)
-			}
-		}
-		sedRangeSeq++
-		return []*sedCmd{{a1: a1, a2: a2, bang: bang, name: '{', blk: blk, rangeID: sedRangeSeq}}, nil
-	}
-	name := s[0]
-	rest := ""
-	if len(s) > 1 {
-		rest = s[1:]
-	}
-	sedRangeSeq++
-	c := &sedCmd{a1: a1, a2: a2, bang: bang, name: name, rangeID: sedRangeSeq}
-	switch name {
-	case 's':
-		sub, err := parseSub(rest, extended)
-		if err != nil {
-			return nil, err
-		}
-		c.sub = sub
-	case 'y':
-		if len(rest) < 3 {
-			return nil, fmt.Errorf("y: missing delimiter")
-		}
-		d := rest[0]
-		parts := splitDelim(rest[1:], d, 2)
-		if len(parts) != 2 {
-			return nil, fmt.Errorf("y: need 2 sets")
-		}
-		c.arg = parts[0] + "\x00" + parts[1]
-	case 'a', 'i', 'c':
-		t := strings.TrimLeft(rest, " \t")
-		t = strings.TrimPrefix(t, "\\")
-		c.arg = unescapeSedText(t)
-	case 'r', 'w':
-		c.arg = strings.TrimSpace(rest)
-	case ':', 'b', 't', 'T':
-		c.label = strings.TrimSpace(rest)
-		if (name == 'b' || name == 't' || name == 'T') && c.label != "" {
-			c.label = strings.Fields(c.label)[0]
-		}
-	case 'q', 'Q':
-		c.arg = strings.TrimSpace(rest)
-	case 'd', 'D', 'p', 'P', 'n', 'N', 'h', 'H', 'g', 'G', 'x', 'l', '=', '}':
-	default:
-		return nil, fmt.Errorf("unknown command: `%c'", name)
-	}
-	return []*sedCmd{c}, nil
-}
-
-func splitSedBlock(s string) []string {
-	var parts []string
-	depth := 0
-	start := 0
-	var delim byte
-	inCmd := byte(0)
-	seenDelim := false
-	for i := 0; i < len(s); i++ {
-		ch := s[i]
-		if delim != 0 {
-			if ch == delim {
-				delim = 0
-			} else if ch == '\\' {
-				i++
-			}
-			continue
-		}
-		if inCmd != 0 && !seenDelim {
-			delim = ch
-			seenDelim = true
-			inCmd = 0
-			continue
-		}
-		if ch == ';' && depth == 0 && delim == 0 {
-			parts = append(parts, strings.TrimSpace(s[start:i]))
-			start = i + 1
-		} else if ch == '{' {
-			depth++
-		} else if ch == '}' {
-			depth--
-		} else if (ch == 's' || ch == 'y') && delim == 0 {
-			inCmd = ch
-			seenDelim = false
-		}
-	}
-	if t := strings.TrimSpace(s[start:]); t != "" {
-		parts = append(parts, t)
-	}
-	return parts
+	return n%2 == 1
 }
 
 func parseAddr(s string, extended bool) (string, *sedAddr, error) {
@@ -542,63 +530,84 @@ func parseStep(s string, a *sedAddr) (string, *sedAddr) {
 	return s, a
 }
 
-func parseSub(s string, extended bool) (*sedSub, error) {
-	if s == "" {
-		return nil, fmt.Errorf("unterminated `s' command")
+func parseSubStream(s string, extended bool) (*sedSub, string, error) {
+	if s == "" || s[0] == '\n' {
+		return nil, s, fmt.Errorf("unterminated `s' command")
 	}
 	d := s[0]
 	rest := s[1:]
 	pat, rest2, ok := takeUntil(rest, d)
 	if !ok {
-		return nil, fmt.Errorf("unterminated `s' command")
+		return nil, s, fmt.Errorf("unterminated `s' command")
 	}
 	repl, rest3, ok := takeUntil(rest2, d)
 	if !ok {
-		return nil, fmt.Errorf("unterminated `s' command")
+		return nil, s, fmt.Errorf("unterminated `s' command")
 	}
 	sub := &sedSub{rePat: pat, reExt: extended}
 	if pat != "" {
 		re, err := compileSedRe(pat, false, extended)
 		if err != nil {
-			return nil, err
+			return nil, s, err
 		}
 		sub.re = re
 		sub.ngroups = re.NumSubexp()
 	}
 	sub.repl = repl
 	sub.plain = isPlainRepl(repl)
-	flags := strings.TrimSpace(rest3)
-	for i := 0; i < len(flags); i++ {
-		f := flags[i]
+	i := 0
+	for i < len(rest3) {
+		f := rest3[i]
+		if f == '\n' || f == ';' || f == '}' || f == '#' {
+			break
+		}
 		switch f {
+		case ' ', '\t':
+			i++
 		case 'g':
 			sub.global = true
+			i++
 		case 'p':
 			sub.print = true
+			i++
 		case 'i', 'I':
 			sub.nocase = true
 			if pat != "" {
 				re2, err := compileSedRe(pat, true, extended)
 				if err != nil {
-					return nil, err
+					return nil, s, err
 				}
 				sub.re = re2
 			}
+			i++
+		case 'm', 'M', 'e':
+			i++
 		case 'w':
-			sub.write = strings.TrimSpace(flags[i+1:])
-			i = len(flags)
+			i++
+			for i < len(rest3) && (rest3[i] == ' ' || rest3[i] == '\t') {
+				i++
+			}
+			end := i
+			for end < len(rest3) && rest3[end] != '\n' && rest3[end] != ';' && rest3[end] != '}' {
+				end++
+			}
+			sub.write = strings.TrimSpace(rest3[i:end])
+			i = end
 		default:
 			if f >= '0' && f <= '9' {
 				sub.nth = sub.nth*10 + int(f-'0')
+				i++
+			} else {
+				return nil, s, fmt.Errorf("unknown option to `s'")
 			}
 		}
 	}
 	if pat != "" {
 		if err := checkSubRefs(repl, sub.ngroups); err != nil {
-			return nil, err
+			return nil, s, err
 		}
 	}
-	return sub, nil
+	return sub, rest3[i:], nil
 }
 
 func takeUntil(s string, d byte) (string, string, bool) {
@@ -649,13 +658,148 @@ func compileSedRe(pat string, nocase, extended bool) (*regexp.Regexp, error) {
 }
 
 func unescapeSedText(s string) string {
-	s = strings.ReplaceAll(s, "\n", "\n")
-	s = strings.ReplaceAll(s, "\\t", "\t")
-	s = strings.ReplaceAll(s, "\\\\", "\\")
-	return s
+	var sb strings.Builder
+	sb.Grow(len(s))
+	for i := 0; i < len(s); i++ {
+		if s[i] == '\\' && i+1 < len(s) {
+			i++
+			switch s[i] {
+			case 'n':
+				sb.WriteByte('\n')
+			case 't':
+				sb.WriteByte('\t')
+			case '\\':
+				sb.WriteByte('\\')
+			default:
+				sb.WriteByte(s[i])
+			}
+			continue
+		}
+		sb.WriteByte(s[i])
+	}
+	return sb.String()
+}
+
+type sedStream struct {
+	ctx       context.Context
+	hc        interp.HandlerContext
+	inputs    []string // empty means read singleR / hc.Stdin
+	singleR   io.Reader
+	usedR     bool
+	inIdx     int
+	curFile   io.Closer
+	lr        *lineReader
+	openErr   bool
+	hasPeek   bool
+	peekLine  string
+	peekHasNL bool
+	eof       bool
+}
+
+func (s *sedStream) closeCur() {
+	if s.curFile != nil {
+		s.curFile.Close()
+		s.curFile = nil
+	}
+	s.lr = nil
+}
+
+func (s *sedStream) buffered() int {
+	if s.hasPeek {
+		return 1
+	}
+	if s.lr != nil && s.lr.br != nil {
+		return s.lr.br.Buffered()
+	}
+	return 0
+}
+
+func (s *sedStream) nextRaw() (string, bool, bool) {
+	if s.eof {
+		return "", false, false
+	}
+	for {
+		if s.ctx != nil && s.ctx.Err() != nil {
+			s.eof = true
+			return "", false, false
+		}
+		if s.lr != nil {
+			if s.lr.Scan() {
+				return s.lr.Text(), s.lr.EndedWithNewline(), true
+			}
+			s.closeCur()
+		}
+		if len(s.inputs) == 0 {
+			if s.usedR {
+				s.eof = true
+				return "", false, false
+			}
+			s.usedR = true
+			rd := s.singleR
+			if rd == nil {
+				rd = s.hc.Stdin
+			}
+			if rd == nil {
+				s.eof = true
+				return "", false, false
+			}
+			s.lr = newLineReader(rd)
+			continue
+		}
+		if s.inIdx >= len(s.inputs) {
+			s.eof = true
+			return "", false, false
+		}
+		in := s.inputs[s.inIdx]
+		s.inIdx++
+		if in == "-" || in == "/dev/stdin" {
+			rd := s.hc.Stdin
+			if rd == nil {
+				continue
+			}
+			s.lr = newLineReader(rd)
+			continue
+		}
+		f, err := openShellFile(resolvePath(s.hc, in))
+		if err != nil {
+			fmt.Fprintln(s.hc.Stderr, "sed:", err)
+			s.openErr = true
+			continue
+		}
+		s.curFile = f
+		s.lr = newLineReader(f)
+	}
+}
+
+func (s *sedStream) readLine() (string, bool, bool) {
+	if s.hasPeek {
+		line, nl := s.peekLine, s.peekHasNL
+		s.hasPeek = false
+		s.peekLine = ""
+		return line, nl, true
+	}
+	return s.nextRaw()
+}
+
+func (s *sedStream) isEOF() bool {
+	if s.hasPeek {
+		return false
+	}
+	if s.eof {
+		return true
+	}
+	line, nl, ok := s.nextRaw()
+	if !ok {
+		return true
+	}
+	s.hasPeek = true
+	s.peekLine = line
+	s.peekHasNL = nl
+	return false
 }
 
 type sedRunner struct {
+	ctx        context.Context
 	hc         interp.HandlerContext
 	quiet      bool
 	extended   bool
@@ -663,7 +807,7 @@ type sedRunner struct {
 	hold       string
 	quit       bool
 	lineNo     int
-	lastLine   bool
+	curHasNL   bool
 	labels     map[string]int
 	wfiles     map[string]*os.File
 	ranges     map[int]bool
@@ -671,8 +815,10 @@ type sedRunner struct {
 	rangeStart map[int]int
 	subbed     bool
 	out        io.Writer
+	bw         *bufio.Writer
+	writeErr   error
 	pending    []pendingOut
-	trailNL    bool
+	stream     *sedStream
 
 	// GNU parity state
 	err        error // runtime script error (e.g. no previous regexp)
@@ -682,6 +828,27 @@ type sedRunner struct {
 	lastReRe   *regexp.Regexp
 	lastReCase bool
 	lastReExt  bool
+}
+
+func newSedRunner(ctx context.Context, hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, out io.Writer) *sedRunner {
+	r := &sedRunner{
+		ctx:        ctx,
+		hc:         hc,
+		quiet:      quiet,
+		extended:   extended,
+		labels:     map[string]int{},
+		wfiles:     map[string]*os.File{},
+		ranges:     map[int]bool{},
+		rangeSeen:  map[int]bool{},
+		rangeStart: map[int]int{},
+		out:        out,
+	}
+	for i, c := range prog {
+		if c.name == ':' {
+			r.labels[c.label] = i
+		}
+	}
+	return r
 }
 
 // sedReFor resolves a command's regular expression, implementing GNU's
@@ -724,50 +891,66 @@ func checkSubRefs(repl string, ngroups int) error {
 	return nil
 }
 
-func (r *sedRunner) runStream(prog []*sedCmd, rd io.Reader) {
-	data, _ := io.ReadAll(rd)
-	trailingNL := len(data) > 0 && data[len(data)-1] == '\n'
-	var lines []string
-	if len(data) > 0 {
-		text := string(data)
-		if trailingNL {
-			text = text[:len(text)-1]
-		}
-		lines = strings.Split(text, "\n")
+func (r *sedRunner) needTrailingNL() bool {
+	if r.curHasNL {
+		return true
 	}
+	return r.stream != nil && !r.stream.isEOF()
+}
+
+func (r *sedRunner) maybeFlush() {
+	if r.bw == nil || r.writeErr != nil {
+		return
+	}
+	if r.bw.Buffered() >= 4096 || (r.stream != nil && r.stream.buffered() == 0 && r.bw.Buffered() > 0) {
+		if err := r.bw.Flush(); err != nil {
+			r.writeErr = err
+			r.quit = true
+		}
+	}
+}
+
+func (r *sedRunner) runStream(prog []*sedCmd, stream *sedStream) {
+	r.stream = stream
 	if r.out == nil {
 		r.out = r.hc.Stdout
 	}
 	ownBuf := false
-	if _, ok := r.out.(*bufio.Writer); !ok {
-		r.out = bufio.NewWriterSize(r.out, 64*1024)
+	if bw, ok := r.out.(*bufio.Writer); ok {
+		r.bw = bw
+	} else if _, isBuilder := r.out.(*strings.Builder); !isBuilder {
+		r.bw = bufio.NewWriterSize(r.out, 64*1024)
+		r.out = r.bw
 		ownBuf = true
 	}
-	r.trailNL = trailingNL
 	if r.ranges == nil {
 		r.ranges = map[int]bool{}
 	}
-	i := 0
-	for i < len(lines) {
-		if r.quit {
+	restart := false
+	for !r.quit && r.writeErr == nil {
+		if r.ctx != nil && r.ctx.Err() != nil {
 			break
 		}
-		r.lineNo++
-		r.lastLine = i == len(lines)-1
-		r.pat = lines[i]
+		if !restart {
+			line, hasNL, ok := stream.readLine()
+			if !ok {
+				break
+			}
+			r.lineNo++
+			r.pat = line
+			r.curHasNL = hasNL
+		}
+		restart = false
 		r.subbed = false
-		next := r.runCycle(prog, 0, &i, lines)
-		if next == cycleNext {
-			i++
-		} else if next == cycleRestart {
-			lines[i] = r.pat
-		} else if next == cycleReadNext {
-			i++
+		next := r.runCycle(prog)
+		r.maybeFlush()
+		if next == cycleRestart {
+			restart = true
 		}
 	}
-	if ownBuf {
-		if bw, ok := r.out.(*bufio.Writer); ok {
-			bw.Flush()
+	if ownBuf && r.bw != nil {
+		if err := r.bw.Flush(); err != nil && r.writeErr == nil {
+			r.writeErr = err
 		}
 	}
 }
@@ -775,27 +958,40 @@ func (r *sedRunner) runStream(prog []*sedCmd, rd io.Reader) {
 const (
 	cycleNext = iota
 	cycleRestart
-	cycleReadNext
 )
 
-func (r *sedRunner) runCycle(prog []*sedCmd, pc int, idx *int, lines []string) int {
-	for pc < len(prog) {
-		if r.quit {
+func (r *sedRunner) runCycle(prog []*sedCmd) int {
+	steps := 0
+	for pc := 0; pc < len(prog); {
+		if r.quit || r.writeErr != nil {
+			return cycleNext
+		}
+		steps++
+		if steps&0xff == 0 && r.ctx != nil && r.ctx.Err() != nil {
+			r.quit = true
 			return cycleNext
 		}
 		c := prog[pc]
 		pc++
-		if !r.addrMatch(c) {
+		if c.name == '}' {
 			continue
 		}
-		res := r.exec(c, prog, pc, idx, lines)
+		if !r.addrMatch(c) {
+			if c.name == '{' {
+				pc = c.endPC
+			}
+			continue
+		}
+		if c.name == '{' {
+			continue
+		}
+		res := r.exec(c)
 		switch res {
 		case jumpToEnd:
+			r.flushPending()
 			return cycleNext
 		case jumpRestart:
 			return cycleRestart
-		case jumpReadNext:
-			return cycleReadNext
 		case jumpQuit:
 			return cycleNext
 		}
@@ -804,43 +1000,16 @@ func (r *sedRunner) runCycle(prog []*sedCmd, pc int, idx *int, lines []string) i
 		}
 	}
 	if !r.quiet {
-		r.writeLine(r.pat, !(r.lastLine && !r.trailNL))
+		r.writeLine(r.pat, r.needTrailingNL())
 	}
 	r.flushPending()
 	return cycleNext
 }
 
-// runBlock runs a {…} block as part of the enclosing cycle. Unlike
-// runCycle it never auto-prints; a cycle-ending command (d, D, q, Q, b
-// without label, …) ends the whole cycle and is propagated to the
-// caller so the pattern space is not printed by mistake.
-func (r *sedRunner) runBlock(prog []*sedCmd, idx *int, lines []string) int {
-	for pc := 0; pc < len(prog); {
-		if r.quit {
-			return jumpQuit
-		}
-		c := prog[pc]
-		pc++
-		if !r.addrMatch(c) {
-			continue
-		}
-		res := r.exec(c, prog, pc, idx, lines)
-		switch res {
-		case jumpToEnd, jumpRestart, jumpQuit, jumpReadNext:
-			return res
-		}
-		if res >= 0 {
-			pc = res
-		}
-	}
-	return -1
-}
-
 const (
-	jumpToEnd    = -2
-	jumpRestart  = -3
-	jumpReadNext = -4
-	jumpQuit     = -5
+	jumpToEnd   = -2
+	jumpRestart = -3
+	jumpQuit    = -5
 )
 
 func (r *sedRunner) addrMatch(c *sedCmd) bool {
@@ -917,7 +1086,7 @@ func matchAddr(r *sedRunner, a *sedAddr) bool {
 		}
 		return r.lineNo == a.line
 	case 2:
-		return r.lastLine
+		return r.stream != nil && r.stream.isEOF()
 	case 3:
 		re, ok := sedReFor(r, a.re, a.pat, a.reNocase, a.reExt)
 		if !ok {
@@ -928,10 +1097,8 @@ func matchAddr(r *sedRunner, a *sedAddr) bool {
 	return true
 }
 
-func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []string) int {
+func (r *sedRunner) exec(c *sedCmd) int {
 	switch c.name {
-	case '{':
-		return r.runBlock(c.blk, idx, lines)
 	case ':':
 		return -1
 	case 'b':
@@ -973,50 +1140,60 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 		return jumpToEnd
 	case 'p':
 		r.writeLine(r.pat, true)
+		r.maybeFlush()
 	case 'P':
 		if i := strings.IndexByte(r.pat, '\n'); i >= 0 {
 			r.writeLine(r.pat[:i], true)
 		} else {
 			r.writeLine(r.pat, true)
 		}
+		r.maybeFlush()
 	case 'n':
 		if !r.quiet {
-			r.writeLine(r.pat, true)
+			r.writeLine(r.pat, r.needTrailingNL())
 		}
-		if *idx+1 < len(lines) {
-			*idx++
+		r.flushPending()
+		r.maybeFlush()
+		if r.writeErr != nil {
+			return jumpQuit
+		}
+		line, hasNL, ok := r.stream.readLine()
+		if ok {
 			r.lineNo++
-			r.lastLine = *idx == len(lines)-1
-			r.pat = lines[*idx]
+			r.pat = line
+			r.curHasNL = hasNL
 			r.subbed = false
 			return -1
 		}
 		r.pat = ""
-		return jumpToEnd
+		r.quit = true
+		return jumpQuit
 	case 'N':
-		if *idx+1 < len(lines) {
-			r.pat += "\n" + lines[*idx+1]
-			*idx++
+		line, hasNL, ok := r.stream.readLine()
+		if ok {
+			r.pat += "\n" + line
+			r.curHasNL = hasNL
 			r.lineNo++
-			r.lastLine = *idx == len(lines)-1
 			break
 		}
 		// GNU: with no next input, N stops processing; the pattern
 		// space is printed (unless -n) and sed exits.
 		if !r.quiet {
-			r.writeLine(r.pat, !(r.lastLine && !r.trailNL))
+			r.writeLine(r.pat, r.needTrailingNL())
 		}
 		r.flushPending()
 		r.quit = true
 		return jumpQuit
 	case 'q':
 		if !r.quiet {
-			r.writeLine(r.pat, true)
+			r.writeLine(r.pat, r.needTrailingNL())
 		}
+		r.flushPending()
 		r.exitCode = sedExitCode(c.arg)
 		r.quit = true
 		return jumpQuit
 	case 'Q':
+		r.flushPending()
 		r.exitCode = sedExitCode(c.arg)
 		r.quit = true
 		return jumpQuit
@@ -1033,14 +1210,16 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 	case 'a':
 		r.pending = append(r.pending, pendingOut{text: c.arg, after: true})
 	case 'i':
-		fmt.Fprintln(r.out, c.arg)
+		r.writeLine(c.arg, true)
+		r.maybeFlush()
 	case 'c':
 		// GNU emits the text once, when the range ends; inside an open
 		// range the pattern space is just deleted.
 		if c.a2 != nil && !r.rangeEnd {
 			return jumpToEnd
 		}
-		fmt.Fprintln(r.out, c.arg)
+		r.writeLine(c.arg, true)
+		r.maybeFlush()
 		return jumpToEnd
 	case 'r':
 		if data, err := os.ReadFile(resolvePath(r.hc, c.arg)); err == nil {
@@ -1051,12 +1230,14 @@ func (r *sedRunner) exec(c *sedCmd, prog []*sedCmd, pc int, idx *int, lines []st
 			fmt.Fprintln(f, r.pat)
 		}
 	case 'l':
-		fmt.Fprintln(r.out, sedList(r.pat)+"$")
+		r.writeLine(sedList(r.pat)+"$", true)
+		r.maybeFlush()
 		if r.quiet {
 			return jumpToEnd
 		}
 	case '=':
-		fmt.Fprintln(r.out, r.lineNo)
+		r.writeLine(strconv.Itoa(r.lineNo), true)
+		r.maybeFlush()
 	}
 	return -1
 }
@@ -1082,13 +1263,10 @@ func (r *sedRunner) wfile(name string) *os.File {
 }
 
 func resolvePath(hc interp.HandlerContext, p string) string {
-	if p == "" || filepath.IsAbs(p) {
+	if p == "" {
 		return p
 	}
-	if hc.Dir == "" {
-		return p
-	}
-	return filepath.Join(hc.Dir, p)
+	return resolve(hc.Dir, p)
 }
 
 func (r *sedRunner) doSub(sub *sedSub) {
@@ -1145,9 +1323,6 @@ func (r *sedRunner) doSub(sub *sedSub) {
 			sb.Grow(len(r.pat) + 16)
 			last := 0
 			for _, m := range matches[sub.nth-1:] {
-				if m[0] == m[1] {
-					continue
-				}
 				sb.WriteString(r.pat[last:m[0]])
 				sb.WriteString(expandSubMatch(r.pat, sub, m))
 				last = m[1]
@@ -1167,9 +1342,6 @@ func (r *sedRunner) doSub(sub *sedSub) {
 		sb.Grow(len(r.pat) + 16)
 		last := 0
 		for _, m := range matches {
-			if m[0] == m[1] {
-				continue
-			}
 			sb.WriteString(r.pat[last:m[0]])
 			sb.WriteString(expandSubMatch(r.pat, sub, m))
 			last = m[1]
@@ -1227,20 +1399,25 @@ func expandSubMatch(orig string, sub *sedSub, m []int) string {
 	var sb strings.Builder
 	upper, lower := false, false
 	repl := sub.repl
-	for i := 0; i < len(repl); i++ {
-		c := repl[i]
-		if c == '\\' && i+1 < len(repl) {
+	for i := 0; i < len(repl); {
+		if repl[i] == '\\' && i+1 < len(repl) {
 			i++
-			n := repl[i]
-			switch n {
+			r, sz := utf8.DecodeRuneInString(repl[i:])
+			if r == utf8.RuneError && sz == 1 {
+				sb.WriteByte(repl[i])
+				i++
+				continue
+			}
+			i += sz
+			switch r {
 			case 'n':
-				sb.WriteString("\n")
+				sb.WriteByte('\n')
 			case 't':
-				sb.WriteString("\\t")
+				sb.WriteByte('\t')
 			case '\\':
 				sb.WriteByte('\\')
 			case '&':
-				sb.WriteString("&")
+				sb.WriteByte('&')
 			case 'U':
 				upper, lower = true, false
 			case 'L':
@@ -1248,8 +1425,8 @@ func expandSubMatch(orig string, sub *sedSub, m []int) string {
 			case 'E':
 				upper, lower = false, false
 			default:
-				if n >= '0' && n <= '9' {
-					s := group(int(n - '0'))
+				if r >= '0' && r <= '9' {
+					s := group(int(r - '0'))
 					if upper {
 						s = strings.ToUpper(s)
 					} else if lower {
@@ -1257,12 +1434,19 @@ func expandSubMatch(orig string, sub *sedSub, m []int) string {
 					}
 					sb.WriteString(s)
 				} else {
-					sb.WriteByte(n)
+					s := string(r)
+					if upper {
+						s = strings.ToUpper(s)
+					} else if lower {
+						s = strings.ToLower(s)
+					}
+					sb.WriteString(s)
 				}
 			}
 			continue
 		}
-		if c == '&' {
+		if repl[i] == '&' {
+			i++
 			s := match
 			if upper {
 				s = strings.ToUpper(s)
@@ -1272,7 +1456,14 @@ func expandSubMatch(orig string, sub *sedSub, m []int) string {
 			sb.WriteString(s)
 			continue
 		}
-		s := string(c)
+		r, sz := utf8.DecodeRuneInString(repl[i:])
+		if r == utf8.RuneError && sz == 1 {
+			sb.WriteByte(repl[i])
+			i++
+			continue
+		}
+		i += sz
+		s := string(r)
 		if upper {
 			s = strings.ToUpper(s)
 		} else if lower {
@@ -1293,19 +1484,39 @@ func trString(s, from, to string) string {
 	for i := range table {
 		table[i] = rune(i)
 	}
+	var hiMap map[rune]rune
 	for i, r := range fr {
 		c := toR[len(toR)-1]
 		if i < len(toR) {
 			c = toR[i]
 		}
-		if r < 256 {
+		if r >= 0 && r < 256 {
 			table[r] = c
+		} else {
+			if hiMap == nil {
+				hiMap = make(map[rune]rune)
+			}
+			hiMap[r] = c
 		}
 	}
 	var sb strings.Builder
-	for _, r := range s {
-		if r < 256 {
+	sb.Grow(len(s))
+	for i := 0; i < len(s); {
+		r, sz := utf8.DecodeRuneInString(s[i:])
+		if r == utf8.RuneError && sz == 1 {
+			sb.WriteByte(s[i])
+			i++
+			continue
+		}
+		i += sz
+		if r >= 0 && r < 256 {
 			sb.WriteRune(table[r])
+		} else if hiMap != nil {
+			if mapped, ok := hiMap[r]; ok {
+				sb.WriteRune(mapped)
+			} else {
+				sb.WriteRune(r)
+			}
 		} else {
 			sb.WriteRune(r)
 		}
@@ -1355,34 +1566,51 @@ func sedList(s string) string {
 // writeLine writes a line to the output without fmt overhead (the hot
 // path of every sed script).
 func (r *sedRunner) writeLine(s string, nl bool) {
-	io.WriteString(r.out, s)
+	if r.writeErr != nil {
+		return
+	}
+	if _, err := io.WriteString(r.out, s); err != nil {
+		r.writeErr = err
+		r.quit = true
+		return
+	}
 	if nl {
-		io.WriteString(r.out, "\n")
+		if _, err := io.WriteString(r.out, "\n"); err != nil {
+			r.writeErr = err
+			r.quit = true
+		}
 	}
 }
 
 func (r *sedRunner) flushPending() {
 	for _, p := range r.pending {
+		if r.writeErr != nil {
+			break
+		}
 		if p.data != "" {
-			fmt.Fprint(r.out, p.data)
-			if !strings.HasSuffix(p.data, "\n") {
-				fmt.Fprintln(r.out)
-			}
+			r.writeLine(p.data, !strings.HasSuffix(p.data, "\n"))
 		} else {
-			fmt.Fprintln(r.out, p.text)
+			r.writeLine(p.text, true)
 		}
 	}
 	r.pending = nil
 }
 
-func sedInplace(hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, inputs []string, suffix string) error {
+func sedInplace(ctx context.Context, hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, inputs []string, suffix string) error {
 	if len(inputs) == 0 {
 		fmt.Fprintln(hc.Stderr, "sed: no input files")
 		return exitError{1}
 	}
 	code := 0
 	for _, in := range inputs {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		full := resolvePath(hc, in)
+		perm := os.FileMode(0o644)
+		if fi, err := os.Stat(full); err == nil {
+			perm = fi.Mode().Perm()
+		}
 		data, err := os.ReadFile(full)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "sed:", err)
@@ -1390,52 +1618,33 @@ func sedInplace(hc interp.HandlerContext, prog []*sedCmd, quiet, extended bool, 
 			continue
 		}
 		var out strings.Builder
-		r := &sedRunner{hc: hc, quiet: quiet, extended: extended,
-			labels: map[string]int{}, wfiles: map[string]*os.File{},
-			ranges: map[int]bool{}, rangeSeen: map[int]bool{}, rangeStart: map[int]int{}, out: &out}
-		for i, c := range prog {
-			if c.name == ':' {
-				r.labels[c.label] = i
-			}
-		}
-		lines := strings.Split(string(data), "\n")
-		hasNL := false
-		if len(lines) > 0 && lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-			hasNL = true
-		}
-		i := 0
-		for i < len(lines) {
-			if r.quit {
-				break
-			}
-			r.lineNo++
-			r.lastLine = i == len(lines)-1
-			r.pat = lines[i]
-			r.subbed = false
-			next := r.runCycle(prog, 0, &i, lines)
-			if next == cycleNext || next == cycleReadNext {
-				i++
-			} else if next == cycleRestart {
-				lines[i] = r.pat
-			}
-		}
+		r := newSedRunner(ctx, hc, prog, quiet, extended, &out)
+		stream := &sedStream{ctx: ctx, hc: hc, singleR: bytes.NewReader(data)}
+		r.runStream(prog, stream)
+		stream.closeCur()
 		for _, f := range r.wfiles {
 			f.Close()
 		}
-		if err := sedFinish(hc, r); err != nil {
-			if ee, ok := err.(exitError); ok && code == 0 {
-				code = ee.code
-			}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		// Never overwrite or truncate the target file on runtime script error!
+		if r.err != nil {
+			_ = sedFinish(hc, r)
+			code = 1
+			continue
+		}
+		if r.exitCode != 0 && code == 0 {
+			code = r.exitCode
 		}
 		if suffix != "" {
-			os.WriteFile(full+suffix, data, 0o644)
+			if err := os.WriteFile(full+suffix, data, perm); err != nil {
+				fmt.Fprintln(hc.Stderr, "sed:", err)
+				code = 1
+				continue
+			}
 		}
-		content := out.String()
-		if hasNL && !strings.HasSuffix(content, "\n") {
-			content += "\n"
-		}
-		if err := os.WriteFile(full, []byte(content), 0o644); err != nil {
+		if err := os.WriteFile(full, []byte(out.String()), perm); err != nil {
 			fmt.Fprintln(hc.Stderr, "sed:", err)
 			code = 1
 		}

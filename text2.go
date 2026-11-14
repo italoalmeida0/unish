@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode/utf8"
@@ -29,7 +30,12 @@ func init() {
 
 func preparseOdArgs(args []string) []string {
 	out := []string{args[0]}
-	for _, a := range args[1:] {
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			out = append(out, args[i:]...)
+			break
+		}
 		if a == "-An" {
 			out = append(out, "-An")
 			continue
@@ -57,7 +63,7 @@ func preparseOdArgs(args []string) []string {
 	return out
 }
 
-func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdOd(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	args = preparseOdArgs(args)
 	fs := newFlagSet("od", hc.Stderr)
 	noAddr := fs.Bool("An", false, "")
@@ -175,104 +181,105 @@ func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	defer closeAll()
-	var data []byte
-	for _, r := range readers {
-		b, err := io.ReadAll(r)
-		if err != nil {
-			return err
+	combined := io.MultiReader(readers...)
+	if skip > 0 {
+		if _, derr := discardStreamBytes(ctx, combined, skip); derr != nil && derr != io.EOF {
+			return derr
 		}
-		data = append(data, b...)
 	}
-	if skip >= uint64(len(data)) {
-		data = nil
-	} else {
-		data = data[skip:]
-	}
-	if limit > 0 && uint64(len(data)) > limit {
-		data = data[:limit]
+	if limit > 0 {
+		combined = io.LimitReader(combined, int64(limit))
 	}
 	off := skip
 	const perLine = 16
 	var sb strings.Builder
-	sb.Grow(len(data)*4 + 64)
 	prevSame := false
 	var prev []byte
-	for i := 0; i < len(data); {
-		end := i + perLine
-		if end > len(data) {
-			end = len(data)
-		}
-		chunk := data[i:end]
-		if !*verbose && len(prev) == len(chunk) && string(prev) == string(chunk) && len(chunk) == perLine {
-			if !prevSame {
-				sb.WriteString("*\n")
-				prevSame = true
-			}
-			off += uint64(len(chunk))
-			i = end
-			continue
-		}
-		prevSame = false
-		prev = append(prev[:0], chunk...)
-		if addrMode != "n" {
-			switch addrMode {
-			case "x":
-				fmt.Fprintf(&sb, "%06x", off)
-			case "d":
-				fmt.Fprintf(&sb, "%07d", off)
-			default:
-				fmt.Fprintf(&sb, "%07o", off)
-			}
-		}
-		for _, u := range units {
-			bare := addrMode != "n" && (u.kind == "d" || u.kind == "u") && u.size == 2
-			for j := 0; j < len(chunk); {
-				rem := len(chunk) - j
-				sz := u.size
-				var val []byte
-				if rem < sz {
-					val = make([]byte, sz)
-					copy(val, chunk[j:])
-					j = len(chunk)
-				} else {
-					val = chunk[j : j+sz]
-					j += sz
+	var chunkBuf [perLine]byte
+	for {
+		n, rerr := readStreamChunk(ctx, combined, chunkBuf[:])
+		if n > 0 {
+			chunk := chunkBuf[:n]
+			sb.Reset()
+			if !*verbose && len(prev) == len(chunk) && string(prev) == string(chunk) && len(chunk) == perLine {
+				if !prevSame {
+					if _, werr := io.WriteString(hc.Stdout, "*\n"); werr != nil {
+						return werr
+					}
+					prevSame = true
 				}
-				if !bare {
-					sb.WriteByte(' ')
-				}
-				if bare && u.kind == "u" {
-					writeOdU2Bare(&sb, val)
-				} else {
-					writeOdVal(&sb, u.kind, val)
-				}
-			}
-		}
-		if showGutter {
-			// Align gutter as GNU does: pad missing bytes (3 cols each
-			// for x1) plus 2 spaces, then ">printable<".
-			missing := perLine - len(chunk)
-			if missing > 0 {
-				sb.WriteString(strings.Repeat("   ", missing))
-				sb.WriteString("  ")
+				off += uint64(len(chunk))
 			} else {
-				sb.WriteString("  ")
-			}
-			sb.WriteString(">")
-			for _, b := range chunk {
-				if b >= 32 && b < 127 {
-					sb.WriteByte(b)
-				} else {
-					sb.WriteByte('.')
+				prevSame = false
+				prev = append(prev[:0], chunk...)
+				if addrMode != "n" {
+					switch addrMode {
+					case "x":
+						fmt.Fprintf(&sb, "%06x", off)
+					case "d":
+						fmt.Fprintf(&sb, "%07d", off)
+					default:
+						fmt.Fprintf(&sb, "%07o", off)
+					}
 				}
+				for _, u := range units {
+					bare := addrMode != "n" && (u.kind == "d" || u.kind == "u") && u.size == 2
+					for j := 0; j < len(chunk); {
+						rem := len(chunk) - j
+						sz := u.size
+						var val []byte
+						if rem < sz {
+							val = make([]byte, sz)
+							copy(val, chunk[j:])
+							j = len(chunk)
+						} else {
+							val = chunk[j : j+sz]
+							j += sz
+						}
+						if !bare {
+							sb.WriteByte(' ')
+						}
+						if bare && u.kind == "u" {
+							writeOdU2Bare(&sb, val)
+						} else {
+							writeOdVal(&sb, u.kind, val)
+						}
+					}
+				}
+				if showGutter {
+					missing := perLine - len(chunk)
+					if missing > 0 {
+						sb.WriteString(strings.Repeat("   ", missing))
+						sb.WriteString("  ")
+					} else {
+						sb.WriteString("  ")
+					}
+					sb.WriteString(">")
+					for _, b := range chunk {
+						if b >= 32 && b < 127 {
+							sb.WriteByte(b)
+						} else {
+							sb.WriteByte('.')
+						}
+					}
+					sb.WriteByte('<')
+				}
+				sb.WriteByte('\n')
+				if _, werr := io.WriteString(hc.Stdout, sb.String()); werr != nil {
+					return werr
+				}
+				off += uint64(len(chunk))
 			}
-			sb.WriteByte('<')
 		}
-		sb.WriteByte('\n')
-		off += uint64(len(chunk))
-		i = end
+		if rerr == io.EOF {
+			break
+		}
+		if rerr != nil {
+			return rerr
+		}
 	}
 	if addrMode != "n" {
+		sb.Reset()
 		switch addrMode {
 		case "x":
 			fmt.Fprintf(&sb, "%06x\n", off)
@@ -281,10 +288,11 @@ func cmdOd(_ context.Context, hc interp.HandlerContext, args []string) error {
 		default:
 			fmt.Fprintf(&sb, "%07o\n", off)
 		}
-	} else if len(data) > 0 {
+		if _, werr := io.WriteString(hc.Stdout, sb.String()); werr != nil {
+			return werr
+		}
 	}
-	_, err = io.WriteString(hc.Stdout, sb.String())
-	return err
+	return nil
 }
 
 func fieldWidth(kind string, size int) int {
@@ -475,7 +483,7 @@ func (s stringListFlagT) Set(v string) error {
 	return nil
 }
 
-func cmdNl(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdNl(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("nl", hc.Stderr)
 	body := fs.String("b", "t", "")
 	fs.StringVar(body, "body-numbering", "t", "")
@@ -511,14 +519,21 @@ func cmdNl(_ context.Context, hc interp.HandlerContext, args []string) error {
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			line := sc.Text()
 			if number(line == "") {
-				fmt.Fprintf(hc.Stdout, "%*d%s%s\n", w, n, *sep, line)
+				if _, werr := fmt.Fprintf(hc.Stdout, "%*d%s%s\n", w, n, *sep, line); werr != nil {
+					return werr
+				}
 				n += int64(*incr)
 			} else {
 				// GNU nl prints unnumbered lines (blank under -b t,
 				// all lines under -b n) as width+1 spaces + content.
-				fmt.Fprintf(hc.Stdout, "%*s%s\n", w+1, "", line)
+				if _, werr := fmt.Fprintf(hc.Stdout, "%*s%s\n", w+1, "", line); werr != nil {
+					return werr
+				}
 			}
 		}
 		if err := sc.Err(); err != nil {
@@ -529,7 +544,7 @@ func cmdNl(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func cmdTac(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdTac(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("tac", hc.Stderr)
 	before := fs.Bool("b", false, "")
 	regex := fs.Bool("r", false, "")
@@ -537,7 +552,19 @@ func cmdTac(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	_ = regex
+	s := *sep
+	if s == "" {
+		s = "\n"
+	}
+	var re *regexp.Regexp
+	if *regex {
+		var rerr error
+		re, rerr = regexp.Compile(s)
+		if rerr != nil {
+			fmt.Fprintln(hc.Stderr, "tac:", rerr)
+			return exitError{1}
+		}
+	}
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tac:", err)
@@ -545,57 +572,78 @@ func cmdTac(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	defer closeAll()
 	var data []byte
+	buf := make([]byte, 64*1024)
 	for _, r := range readers {
-		b, err := io.ReadAll(r)
-		if err != nil {
-			return err
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			nr, rerr := r.Read(buf)
+			if nr > 0 {
+				data = append(data, buf[:nr]...)
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return rerr
+			}
 		}
-		data = append(data, b...)
-	}
-	s := *sep
-	if s == "" {
-		s = "\n"
 	}
 	text := string(data)
-	var parts []string
-	var seps int
-	t := text
-	for len(t) > 0 {
-		idx := strings.Index(t, s)
-		if idx < 0 {
-			parts = append(parts, t)
-			break
-		}
-		parts = append(parts, t[:idx])
-		seps++
-		t = t[idx+len(s):]
-	}
-	var sb strings.Builder
-	sb.Grow(len(data) + 16)
-	if *before {
-		trailing := seps == len(parts)
-		if trailing {
-			sb.WriteString(s)
-		}
-		for k := len(parts) - 1; k >= 0; k-- {
-			if k > 0 {
-				sb.WriteString(s)
+	var spans [][2]int
+	if *regex {
+		for _, m := range re.FindAllStringIndex(text, -1) {
+			if m[1] > m[0] {
+				spans = append(spans, [2]int{m[0], m[1]})
 			}
-			sb.WriteString(parts[k])
 		}
 	} else {
-		for k := len(parts) - 1; k >= 0; k-- {
-			sb.WriteString(parts[k])
-			if k < seps {
-				sb.WriteString(s)
+		pos := 0
+		for pos < len(text) {
+			idx := strings.Index(text[pos:], s)
+			if idx < 0 {
+				break
 			}
+			spans = append(spans, [2]int{pos + idx, pos + idx + len(s)})
+			pos += idx + len(s)
 		}
 	}
-	_, err = io.WriteString(hc.Stdout, sb.String())
-	return err
+	var recs []string
+	if len(spans) == 0 {
+		if len(text) > 0 {
+			recs = []string{text}
+		}
+	} else if *before {
+		if spans[0][0] > 0 {
+			recs = append(recs, text[:spans[0][0]])
+		}
+		for k := 0; k < len(spans)-1; k++ {
+			recs = append(recs, text[spans[k][0]:spans[k+1][0]])
+		}
+		recs = append(recs, text[spans[len(spans)-1][0]:])
+	} else {
+		prevEnd := 0
+		for _, sp := range spans {
+			recs = append(recs, text[prevEnd:sp[1]])
+			prevEnd = sp[1]
+		}
+		if prevEnd < len(text) {
+			recs = append(recs, text[prevEnd:])
+		}
+	}
+	for k := len(recs) - 1; k >= 0; k-- {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if _, werr := io.WriteString(hc.Stdout, recs[k]); werr != nil {
+			return werr
+		}
+	}
+	return nil
 }
 
-func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdRev(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("rev", hc.Stderr)
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
@@ -609,6 +657,9 @@ func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			rs := []rune(sc.Text())
 			for i, j := 0, len(rs)-1; i < j; i, j = i+1, j-1 {
 				rs[i], rs[j] = rs[j], rs[i]
@@ -617,7 +668,9 @@ func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
 			if !sc.EndedWithNewline() {
 				nl = ""
 			}
-			fmt.Fprint(hc.Stdout, string(rs)+nl)
+			if _, werr := fmt.Fprint(hc.Stdout, string(rs)+nl); werr != nil {
+				return werr
+			}
 		}
 		if err := sc.Err(); err != nil {
 			fmt.Fprintln(hc.Stderr, "rev:", err)
@@ -631,8 +684,12 @@ func cmdRev(_ context.Context, hc interp.HandlerContext, args []string) error {
 // -sb6) into -w N so Go's flag parser can handle them.
 func foldOldStyle(args []string) []string {
 	out := make([]string, 0, len(args))
-	for _, a := range args {
-		if len(a) > 1 && a[0] == '-' && a[1] != '-' {
+	for idx, a := range args {
+		if idx > 0 && a == "--" {
+			out = append(out, args[idx:]...)
+			break
+		}
+		if idx > 0 && len(a) > 1 && a[0] == '-' && a[1] != '-' {
 			i := len(a) - 1
 			for i >= 1 && a[i] >= '0' && a[i] <= '9' {
 				i--
@@ -656,7 +713,7 @@ func foldOldStyle(args []string) []string {
 	return out
 }
 
-func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdFold(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	// GNU fold accepts old-style widths: -3, -b3, -sb6 …
 	args = foldOldStyle(args)
 	fs := newFlagSet("fold", hc.Stderr)
@@ -680,40 +737,35 @@ func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	defer closeAll()
+	type cell struct {
+		s string
+		w int
+	}
 	for _, r := range readers {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "fold:", err)
-			return exitError{1}
-		}
-		trailingNL := len(data) > 0 && data[len(data)-1] == '\n'
-		text := string(data)
-		if trailingNL {
-			text = text[:len(text)-1]
-		}
-		lines := []string{}
-		if len(data) > 0 {
-			lines = strings.Split(text, "\n")
-		}
-		emit := func(s string, last bool) {
+		sc := newLineReader(r)
+		emit := func(s string, hasNL bool) error {
 			// GNU fold preserves a missing trailing newline.
-			if last && !trailingNL {
-				fmt.Fprint(hc.Stdout, s)
-			} else {
-				fmt.Fprintln(hc.Stdout, s)
+			if !hasNL {
+				_, werr := fmt.Fprint(hc.Stdout, s)
+				return werr
 			}
+			_, werr := fmt.Fprintln(hc.Stdout, s)
+			return werr
 		}
-		for li, line := range lines {
-			lastLine := li == len(lines)-1
+		var cells []cell
+		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			line := sc.Text()
+			hasNL := sc.EndedWithNewline()
 			if line == "" {
-				emit("", lastLine)
+				if werr := emit("", hasNL); werr != nil {
+					return werr
+				}
 				continue
 			}
-			type cell struct {
-				s string
-				w int
-			}
-			var cells []cell
+			cells = cells[:0]
 			for i := 0; i < len(line); {
 				c, sz := utf8.DecodeRuneInString(line[i:])
 				wc := 1
@@ -749,7 +801,9 @@ func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
 					for _, c := range cells[start:end] {
 						sb.WriteString(c.s)
 					}
-					fmt.Fprintln(hc.Stdout, sb.String())
+					if _, werr := fmt.Fprintln(hc.Stdout, sb.String()); werr != nil {
+						return werr
+					}
 					start = end
 					cur = 0
 					for _, c := range cells[start:idx] {
@@ -762,7 +816,13 @@ func cmdFold(_ context.Context, hc interp.HandlerContext, args []string) error {
 			for _, c := range cells[start:] {
 				sb.WriteString(c.s)
 			}
-			emit(sb.String(), lastLine)
+			if werr := emit(sb.String(), hasNL); werr != nil {
+				return werr
+			}
+		}
+		if err := sc.Err(); err != nil {
+			fmt.Fprintln(hc.Stderr, "fold:", err)
+			return exitError{1}
 		}
 	}
 	return nil
@@ -812,7 +872,7 @@ func nextTab(col int, stops []int) int {
 	return n
 }
 
-func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdExpand(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("expand", hc.Stderr)
 	tabs := fs.String("t", "8", "")
 	fs.StringVar(tabs, "tabs", "8", "")
@@ -835,6 +895,9 @@ func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			line := sc.Text()
 			var sb strings.Builder
 			sb.Grow(len(line) + 8)
@@ -863,7 +926,9 @@ func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error
 					}
 				}
 			}
-			fmt.Fprintln(hc.Stdout, sb.String())
+			if _, werr := fmt.Fprintln(hc.Stdout, sb.String()); werr != nil {
+				return werr
+			}
 		}
 		if err := sc.Err(); err != nil {
 			fmt.Fprintln(hc.Stderr, "expand:", err)
@@ -873,7 +938,7 @@ func cmdExpand(_ context.Context, hc interp.HandlerContext, args []string) error
 	return nil
 }
 
-func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdUnexpand(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("unexpand", hc.Stderr)
 	tabs := fs.String("t", "8", "")
 	fs.StringVar(tabs, "tabs", "8", "")
@@ -899,6 +964,9 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			line := sc.Text()
 			var sb strings.Builder
 			sb.Grow(len(line))
@@ -909,11 +977,19 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 					if line[i] == '\t' {
 						sb.WriteByte('\t')
 						col = nextTab(col, stops)
+						i++
 					} else {
-						sb.WriteByte(line[i])
-						col++
+						ru, sz := utf8.DecodeRuneInString(line[i:])
+						sb.WriteString(line[i : i+sz])
+						if ru == '\b' {
+							if col > 0 {
+								col--
+							}
+						} else {
+							col++
+						}
+						i += sz
 					}
-					i++
 					continue
 				}
 				j := i
@@ -945,7 +1021,9 @@ func cmdUnexpand(_ context.Context, hc interp.HandlerContext, args []string) err
 				}
 				i = j
 			}
-			fmt.Fprintln(hc.Stdout, sb.String())
+			if _, werr := fmt.Fprintln(hc.Stdout, sb.String()); werr != nil {
+				return werr
+			}
 		}
 		if err := sc.Err(); err != nil {
 			fmt.Fprintln(hc.Stderr, "unexpand:", err)
@@ -1151,7 +1229,11 @@ func cmdJoin(_ context.Context, hc interp.HandlerContext, args []string) error {
 			fmt.Fprintln(hc.Stdout, strings.Join(parts, joiner))
 			return
 		}
-		emit(map[int]string{1: mustKey(row, k1), 2: mustKey(row, k2)}[which], row, nil)
+		if which == 1 {
+			emit(mustKey(row, k1), row, nil)
+		} else {
+			emit(mustKey(row, k2), nil, row)
+		}
 	}
 	// GNU join requires sorted input: warn and exit 1 on disorder,
 	// while still printing matches found so far.

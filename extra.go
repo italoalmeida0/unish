@@ -98,9 +98,6 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 		if len(args) == 0 {
 			return next(ctx, args)
 		}
-		if args[0] == "ls" {
-			args = filterLsArgs(args)
-		}
 		// Job-control builtins with real-pid semantics live here so
 		// they bypass mvdan/sh's fake-id-only implementations.
 		// (trackExec also routes them; this covers direct chains.)
@@ -125,15 +122,26 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			}
 			return next(ctx, args)
 		}
-		for _, a := range args[1:] {
-			if a == "--version" {
-				hc := interp.HandlerCtx(ctx)
-				fmt.Fprintf(hc.Stdout, "%s (unish coreutils) 1.0\n", args[0])
-				return nil
-			}
+		if hasVersionFlag(args) {
+			hc := interp.HandlerCtx(ctx)
+			fmt.Fprintf(hc.Stdout, "%s (unish coreutils) 1.0\n", args[0])
+			return nil
 		}
 		hc := interp.HandlerCtx(ctx)
-		err := cmd.main(ctx, hc, splitAttached(args[0], args))
+		if hc.Stdin == nil {
+			hc.Stdin = strings.NewReader("")
+		}
+		var err error
+		if args[0] == "ls" {
+			lsColorMu.Lock()
+			lsColorMode = "never"
+			filtered := filterLsArgs(args)
+			err = cmd.main(ctx, hc, splitAttached(args[0], filtered))
+			lsColorMode = "never"
+			lsColorMu.Unlock()
+		} else {
+			err = cmd.main(ctx, hc, splitAttached(args[0], args))
+		}
 		if isPipeClosed(err) || isPipeClosed(ctx.Err()) {
 			// SIGPIPE semantics: downstream closed the pipe early
 			// (e.g. `seq 1 5 | head -n 0`). GNU tools exit 0 silently;
@@ -259,7 +267,77 @@ func shellExecEnv(hc interp.HandlerContext) []string {
 	return list
 }
 
-var lsColorMode = "never" // --color[=WHEN]: never/always/auto
+var (
+	lsColorMu   sync.Mutex
+	lsColorMode = "never" // --color[=WHEN]: never/always/auto
+)
+
+// hasVersionFlag reports whether args passes --version as an actual option to
+// args[0], stopping at "--", skipping values of value-taking flags, ignoring
+// builtins like echo/true/false, and stopping before subcommands of wrappers.
+func hasVersionFlag(args []string) bool {
+	if len(args) < 2 {
+		return false
+	}
+	cmd := args[0]
+	switch cmd {
+	case "echo", "true", "false":
+		return false
+	}
+	spec, hasSpec := flagSpecs[cmd]
+	isWrapper := cmd == "env" || cmd == "timeout" || cmd == "nice" || cmd == "nohup" || cmd == "watch" || cmd == "xargs"
+	positionals := 0
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			return false
+		}
+		if a == "--version" {
+			return true
+		}
+		if cmd == "env" && !strings.HasPrefix(a, "-") && strings.IndexByte(a, '=') >= 0 {
+			continue
+		}
+		if strings.HasPrefix(a, "--") && len(a) > 2 {
+			if strings.IndexByte(a, '=') < 0 && hasSpec {
+				if short, known := spec.long[a[2:]]; known {
+					if (len(short) == 1 && strings.ContainsRune(spec.values, rune(short[0]))) ||
+						(len(short) > 1 && !spec.longBools[short]) {
+						i++
+					}
+				}
+			}
+			continue
+		}
+		if len(a) >= 2 && a[0] == '-' && a[1] != '-' {
+			if hasSpec {
+				if len(a) == 2 && strings.ContainsRune(spec.values, rune(a[1])) {
+					i++
+				} else if len(a) > 2 {
+					for j := 1; j < len(a); j++ {
+						c := rune(a[j])
+						if strings.ContainsRune(spec.bools, c) {
+							continue
+						}
+						if strings.ContainsRune(spec.values, c) && j == len(a)-1 {
+							i++
+						}
+						break
+					}
+				}
+			}
+			continue
+		}
+		positionals++
+		if isWrapper {
+			if cmd == "timeout" && positionals == 1 {
+				continue // duration operand before subcommand
+			}
+			return false
+		}
+	}
+	return false
+}
 
 func filterLsArgs(args []string) []string {
 	out := args[:1:1]
@@ -651,9 +729,10 @@ func shellOpenHandler() interp.OpenHandlerFunc {
 }
 
 type flagSpec struct {
-	bools  string
-	values string
-	long   map[string]string
+	bools     string
+	values    string
+	long      map[string]string
+	longBools map[string]bool
 }
 
 var flagSpecs = map[string]flagSpec{
@@ -707,7 +786,7 @@ var flagSpecs = map[string]flagSpec{
 		"delimiter": "d", "fields": "f", "characters": "c", "bytes": "b",
 		"only-delimited": "s", "complement": "complement",
 		"output-delimiter": "output-delimiter",
-	}},
+	}, longBools: map[string]bool{"complement": true}},
 	"paste": {bools: "s", values: "d", long: map[string]string{
 		"delimiters": "d", "serial": "s",
 	}},
@@ -720,7 +799,7 @@ var flagSpecs = map[string]flagSpec{
 		"recursive": "R", "classify": "F", "quoted": "Q",
 		"size": "S", "reverse": "r", "time": "t",
 		"full-time": "full-time", "time-style": "time-style",
-	}},
+	}, longBools: map[string]bool{"full-time": true}},
 	"comm": {bools: "123", values: ""},
 	"split": {bools: "dv", values: "labn", long: map[string]string{
 		"lines": "l", "suffix-length": "a", "bytes": "b", "number": "n",
@@ -827,9 +906,9 @@ var flagSpecs = map[string]flagSpec{
 	"strings": {bools: "ao", values: "nt", long: map[string]string{
 		"radix": "t", "bytes": "n",
 	}},
-	"md5sum":    {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}},
-	"sha1sum":   {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}},
-	"sha256sum": {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}},
+	"md5sum":    {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}, longBools: map[string]bool{"tag": true}},
+	"sha1sum":   {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}, longBools: map[string]bool{"tag": true}},
+	"sha256sum": {bools: "btcqsz", values: "", long: map[string]string{"check": "c", "quiet": "q", "status": "s", "strict": "z", "tag": "tag", "warn": "w"}, longBools: map[string]bool{"tag": true}},
 	"readlink":  {bools: "fm", values: ""},
 	"realpath":  {bools: "em", values: ""},
 	"basename":  {bools: "a", values: "s"},
@@ -853,7 +932,7 @@ var flagSpecs = map[string]flagSpec{
 	"expand": {bools: "", values: "t", long: map[string]string{"tabs": "t"}},
 	"unexpand": {bools: "a", values: "t", long: map[string]string{
 		"tabs": "t", "all": "a", "first-only": "first-only",
-	}},
+	}, longBools: map[string]bool{"first-only": true}},
 	"join": {bools: "i", values: "12jateov", long: map[string]string{
 		"ignore-case": "i",
 	}},
@@ -896,6 +975,14 @@ func splitAttached(cmd string, args []string) []string {
 				continue
 			}
 			if len(short) > 1 {
+				if spec.longBools[short] {
+					if hasVal {
+						movable = append(movable, "--"+short+"="+val)
+					} else {
+						movable = append(movable, "--"+short)
+					}
+					continue
+				}
 				if hasVal {
 					movable = append(movable, "--"+short, val)
 				} else if i+1 < len(argv) {
@@ -1002,13 +1089,18 @@ func parseN(args []string, def uint64) (uint64, []string) {
 	n := def
 	rest := args[:0:0]
 	skipNext := false
-	for _, a := range args {
+	for i := 0; i < len(args); i++ {
+		a := args[i]
 		// Don't treat the VALUE of -n/-c (e.g. "-1" in "-n -1") as an
 		// attached count; it belongs to the flag.
 		if skipNext {
 			skipNext = false
 			rest = append(rest, a)
 			continue
+		}
+		if a == "--" {
+			rest = append(rest, args[i:]...)
+			break
 		}
 		if a == "-n" || a == "-c" {
 			skipNext = true
@@ -1038,6 +1130,9 @@ func parseUint(s string) (uint64, error) {
 }
 
 func openInputs(dir string, args []string, stdin io.Reader) (readers []io.Reader, names []string, closeAll func(), err error) {
+	if stdin == nil {
+		stdin = strings.NewReader("")
+	}
 	if len(args) == 0 {
 		return []io.Reader{stdin}, []string{""}, func() {}, nil
 	}
@@ -1081,7 +1176,7 @@ type stringList []string
 func (s *stringList) String() string     { return strings.Join(*s, ",") }
 func (s *stringList) Set(v string) error { *s = append(*s, v); return nil }
 
-func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdCat(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("cat", hc.Stderr)
 	numAll := fs.Bool("n", false, "")
 	numNonBlank := fs.Bool("b", false, "")
@@ -1109,10 +1204,32 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	}
 	defer closeAll()
 	if !*numAll && !*numNonBlank && !*squeeze && !*showEnds && !*showTabs && !*showNonprint {
+		buf := make([]byte, 32*1024)
 		for _, r := range readers {
-			if _, err := io.Copy(hc.Stdout, r); err != nil {
-				fmt.Fprintln(hc.Stderr, "cat:", err)
-				return exitError{1}
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				n, rerr := r.Read(buf)
+				if n > 0 {
+					if _, werr := hc.Stdout.Write(buf[:n]); werr != nil {
+						if isPipeClosed(werr) {
+							return werr
+						}
+						fmt.Fprintln(hc.Stderr, "cat:", werr)
+						return exitError{1}
+					}
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					if isPipeClosed(rerr) {
+						return rerr
+					}
+					fmt.Fprintln(hc.Stderr, "cat:", rerr)
+					return exitError{1}
+				}
 			}
 		}
 		return nil
@@ -1122,6 +1239,9 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			line := sc.Text()
 			blank := line == ""
 			if *squeeze && blank && prevBlank {
@@ -1143,14 +1263,25 @@ func cmdCat(_ context.Context, hc interp.HandlerContext, args []string) error {
 				nl = ""
 			}
 			number := *numAll || (*numNonBlank && !blank)
+			var werr error
 			if number {
 				ln++
-				fmt.Fprintf(hc.Stdout, "%6d\t%s%s", ln, out, nl)
+				_, werr = fmt.Fprintf(hc.Stdout, "%6d\t%s%s", ln, out, nl)
 			} else {
-				fmt.Fprint(hc.Stdout, out+nl)
+				_, werr = fmt.Fprint(hc.Stdout, out+nl)
+			}
+			if werr != nil {
+				if isPipeClosed(werr) {
+					return werr
+				}
+				fmt.Fprintln(hc.Stderr, "cat:", werr)
+				return exitError{1}
 			}
 		}
 		if err := sc.Err(); err != nil {
+			if isPipeClosed(err) {
+				return err
+			}
 			fmt.Fprintln(hc.Stderr, "cat:", err)
 			return exitError{1}
 		}
@@ -1233,9 +1364,10 @@ func runTest(hc interp.HandlerContext, args []string) error {
 }
 
 type testParser struct {
-	hc   interp.HandlerContext
-	toks []string
-	pos  int
+	hc    interp.HandlerContext
+	toks  []string
+	pos   int
+	depth int
 }
 
 func (t *testParser) peek() string {
@@ -1243,6 +1375,17 @@ func (t *testParser) peek() string {
 		return t.toks[t.pos]
 	}
 	return ""
+}
+
+func (t *testParser) remTokens() int {
+	if t.depth == 0 {
+		return len(t.toks) - t.pos
+	}
+	avail := 0
+	for t.pos+avail < len(t.toks) && t.toks[t.pos+avail] != ")" {
+		avail++
+	}
+	return avail
 }
 
 func (t *testParser) orExpr() (bool, error) {
@@ -1279,6 +1422,17 @@ func (t *testParser) andExpr() (bool, error) {
 
 func (t *testParser) notExpr() (bool, error) {
 	if t.peek() == "!" {
+		rem := t.remTokens()
+		if rem == 1 {
+			return t.primary()
+		}
+		if rem >= 2 && (t.toks[t.pos+1] == "-a" || t.toks[t.pos+1] == "-o") {
+			return t.primary()
+		}
+		if rem >= 3 && isTestBinaryOp(t.toks[t.pos+1]) &&
+			(rem == 3 || t.toks[t.pos+3] == "-a" || t.toks[t.pos+3] == "-o") {
+			return t.primary()
+		}
 		t.pos++
 		v, err := t.notExpr()
 		return !v, err
@@ -1287,45 +1441,66 @@ func (t *testParser) notExpr() (bool, error) {
 }
 
 func (t *testParser) primary() (bool, error) {
+	rem := t.remTokens()
+	if rem == 0 {
+		if t.peek() == ")" {
+			return false, errors.New("unexpected `)'")
+		}
+		return false, errors.New("argument expected")
+	}
 	if t.peek() == "(" {
-		t.pos++
-		v, err := t.orExpr()
-		if err != nil {
-			return false, err
+		isLiteral := rem == 1 ||
+			(rem >= 2 && (t.toks[t.pos+1] == "-a" || t.toks[t.pos+1] == "-o")) ||
+			(rem >= 3 && isTestBinaryOp(t.toks[t.pos+1]) &&
+				(rem == 3 || t.toks[t.pos+3] == "-a" || t.toks[t.pos+3] == "-o"))
+		if !isLiteral {
+			t.pos++
+			t.depth++
+			v, err := t.orExpr()
+			t.depth--
+			if err != nil {
+				return false, err
+			}
+			if t.peek() != ")" {
+				return false, errors.New("expected `)'")
+			}
+			t.pos++
+			return v, nil
 		}
-		if t.peek() != ")" {
-			return false, errors.New("expected `)'")
-		}
-		t.pos++
-		return v, nil
 	}
 	if t.peek() == ")" {
 		return false, errors.New("unexpected `)'")
 	}
-	// Operands available before a closing paren (GNU test quirk: [ '(' x ')' ]).
-	avail := 0
-	for t.pos+avail < len(t.toks) && t.toks[t.pos+avail] != ")" {
-		avail++
-	}
-	switch avail {
+	switch rem {
 	case 1:
+		tok := t.toks[t.pos]
 		t.pos++
-		return t.toks[t.pos-1] != "", nil
+		return tok != "", nil
 	case 2:
 		op, arg := t.toks[t.pos], t.toks[t.pos+1]
+		if arg == "-a" || arg == "-o" {
+			t.pos++
+			return op != "", nil
+		}
 		t.pos += 2
 		return testUnary(t.hc, op, arg)
 	default:
 		a, op, b := t.toks[t.pos], t.toks[t.pos+1], t.toks[t.pos+2]
-		if isTestBinaryOp(op) {
+		if isTestBinaryOp(op) && (rem == 3 || t.toks[t.pos+3] == "-a" || t.toks[t.pos+3] == "-o") {
 			t.pos += 3
 			return testBinary(t.hc, a, op, b)
 		}
-		// GNU: with 3 tokens and no operator this is "missing argument".
-		if a == "!" || isTestUnaryOp(a) {
+		if isTestUnaryOp(a) && (b == "-a" || b == "-o") {
 			t.pos += 2
-			v, err := testUnary(t.hc, a, b)
-			return v, err
+			return testUnary(t.hc, a, op)
+		}
+		if op == "-a" || op == "-o" {
+			t.pos++
+			return a != "", nil
+		}
+		if isTestBinaryOp(op) {
+			t.pos += 3
+			return testBinary(t.hc, a, op, b)
 		}
 		return false, errors.New("binary operator expected")
 	}
@@ -1851,11 +2026,15 @@ func isPipeClosed(err error) bool {
 	if err == nil {
 		return false
 	}
+	if errors.Is(err, io.ErrClosedPipe) {
+		return true
+	}
 	msg := err.Error()
 	for _, s := range []string{
 		"The pipe is being closed",
 		"The pipe has been ended", // Go on Windows, head -c path
 		"broken pipe",
+		"closed pipe",
 		"pipe is closed",
 		"EPIPE",
 	} {

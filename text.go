@@ -8,6 +8,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -20,7 +21,7 @@ import (
 	"mvdan.cc/sh/v3/interp"
 )
 
-func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdGrep(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	var (
 		count, filesOnly, fixed, ignoreCase, invert, lineNum,
 		noName, quiet, recursive, extended, onlyMatch bool
@@ -269,6 +270,8 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 						quiet = true
 					case 'r', 'R':
 						recursive = true
+					case 'a':
+						textMode = true
 					case 'E':
 						extended = true
 					case 'o':
@@ -423,6 +426,7 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 	// direct file search: no filename prefix).
 	descendedDir := false
 	grepStop := false
+	var pipeStopErr error
 	if recursive {
 		for _, f := range rest {
 			if f == "" || f == "-" {
@@ -447,58 +451,70 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 			disp = label
 			showName = true
 		}
-		// Fast path: literal pattern over plain line output.
-		if litOK {
-			if !quiet && !count && !filesOnly && !textMode {
-				// Binary detection wants the whole stream up front.
-				if data, err := io.ReadAll(r); err == nil {
-					if bytes.IndexByte(data, 0) >= 0 {
-						if reMatchAny(re, invert, data) {
-							fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", disp)
-							matchedAny = true
-						}
-						return
-					}
-					m, gerr := grepFastBuf(hc, disp, showName, lit, invert, lineNum, count, quiet, bytes.NewReader(data))
-					matchedAny = matchedAny || m
-					if gerr != nil && isPipeClosed(gerr) {
-						grepStop = true
-					}
-					return
-				}
+		// Probe the first chunk for NUL bytes instead of slurping the whole
+		// stream with io.ReadAll (which hangs/OOMs on infinite pipes like `yes | grep`).
+		recordErr := func(gerr error) {
+			if gerr == nil {
+				return
 			}
-			// -c/-q and text mode stream with constant memory.
-			m, gerr := grepFastBuf(hc, disp, showName, lit, invert, lineNum, count, quiet, r)
-			matchedAny = matchedAny || m
-			if gerr != nil && isPipeClosed(gerr) {
+			if isPipeClosed(gerr) || errors.Is(gerr, epipeErr{}) {
+				pipeStopErr = io.ErrClosedPipe
+				grepStop = true
+			} else if ctx.Err() != nil {
 				grepStop = true
 			}
-			return
 		}
-		// GNU: a matching BINARY file prints "binary file matches" instead
-		// of raw bytes (unless -a/--text is given).
 		if !quiet && !count && !filesOnly && !textMode {
-			if data, err := io.ReadAll(r); err == nil {
-				if bytes.IndexByte(data, 0) >= 0 {
-					if reMatchAny(re, invert, data) {
-						fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", disp)
-						matchedAny = true
+			probe := make([]byte, 32*1024)
+			n, rerr := r.Read(probe)
+			if n == 0 && rerr == io.EOF {
+				return
+			}
+			var fullR io.Reader
+			if rerr == io.EOF {
+				fullR = bytes.NewReader(probe[:n])
+			} else if n > 0 {
+				fullR = io.MultiReader(bytes.NewReader(probe[:n]), r)
+			} else {
+				fullR = r
+			}
+			if bytes.IndexByte(probe[:n], 0) >= 0 {
+				binMatched := false
+				_ = streamLinesCtx(ctx, fullR, func(line []byte, _ bool) bool {
+					ok := re.Match(line)
+					if invert {
+						ok = !ok
 					}
-					return
-				}
-				m, gerr := grepReaderWord(hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, int(maxCount), int(after), int(before), bytes.NewReader(data))
-				matchedAny = matchedAny || m
-				if gerr != nil && isPipeClosed(gerr) {
-					grepStop = true
+					if ok {
+						binMatched = true
+						return false
+					}
+					return true
+				})
+				if binMatched {
+					fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", disp)
+					matchedAny = true
 				}
 				return
 			}
+			r = fullR
 		}
-		m, gerr := grepReaderWord(hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, int(maxCount), int(after), int(before), r)
+		// Fast path: literal pattern over plain line output.
+		if litOK {
+			m, gerr := grepFastBuf(ctx, hc, disp, showName, lit, invert, lineNum, count, quiet, !textMode && !quiet && !count && !filesOnly, r)
+			matchedAny = matchedAny || m
+			if quiet && matchedAny {
+				grepStop = true
+			}
+			recordErr(gerr)
+			return
+		}
+		m, gerr := grepReaderWord(ctx, hc, disp, showName, re, wordRegexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, !textMode && !quiet && !count && !filesOnly, int(maxCount), int(after), int(before), r)
 		matchedAny = matchedAny || m
-		if gerr != nil && isPipeClosed(gerr) {
+		if quiet && matchedAny {
 			grepStop = true
 		}
+		recordErr(gerr)
 	}
 	if len(files) == 0 {
 		if !recursive && len(rest) == 0 {
@@ -526,6 +542,12 @@ func cmdGrep(_ context.Context, hc interp.HandlerContext, args []string) error {
 				emit(f, fh)
 			}()
 		}
+	}
+	if pipeStopErr != nil {
+		return pipeStopErr
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	if hadError {
 		return exitError{2}
@@ -593,9 +615,20 @@ func grepLiteralPattern(pat string) (string, bool) {
 // does not produce an extra empty line. Returning false from fn stops
 // the scan.
 func streamLines(r io.Reader, fn func(line []byte, terminated bool) bool) error {
+	return streamLinesChunked(context.Background(), r, fn, nil)
+}
+
+func streamLinesCtx(ctx context.Context, r io.Reader, fn func(line []byte, terminated bool) bool) error {
+	return streamLinesChunked(ctx, r, fn, nil)
+}
+
+func streamLinesChunked(ctx context.Context, r io.Reader, fn func(line []byte, terminated bool) bool, afterChunk func() error) error {
 	buf := make([]byte, 256*1024)
 	var pending []byte
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n, err := r.Read(buf)
 		var data []byte
 		if len(pending) > 0 {
@@ -625,12 +658,23 @@ func streamLines(r io.Reader, fn func(line []byte, terminated bool) bool) error 
 		for start < len(data) {
 			end := bytes.IndexByte(data[start:], '\n')
 			if end < 0 {
+				pending = append([]byte(nil), data[start:]...)
 				break
 			}
 			if !fn(data[start:start+end], true) {
+				if afterChunk != nil {
+					if cerr := afterChunk(); cerr != nil {
+						return cerr
+					}
+				}
 				return nil
 			}
 			start += end + 1
+		}
+		if afterChunk != nil {
+			if cerr := afterChunk(); cerr != nil {
+				return cerr
+			}
 		}
 		if err == io.EOF {
 			break
@@ -642,6 +686,11 @@ func streamLines(r io.Reader, fn func(line []byte, terminated bool) bool) error 
 	// Last line without a trailing newline.
 	if len(pending) > 0 {
 		fn(pending, false)
+		if afterChunk != nil {
+			if cerr := afterChunk(); cerr != nil {
+				return cerr
+			}
+		}
 	}
 	return nil
 }
@@ -649,8 +698,8 @@ func streamLines(r io.Reader, fn func(line []byte, terminated bool) bool) error 
 // grepFastBuf scans a literal pattern with the byte primitives,
 // streaming in chunks (constant memory, like GNU grep). It covers the
 // everyday grep shape: plain output plus -c/-n/-v/-q/-H.
-func grepFastBuf(hc interp.HandlerContext, name string, showName bool, lit string,
-	invert, lineNum, count, quiet bool, r io.Reader) (bool, error) {
+func grepFastBuf(ctx context.Context, hc interp.HandlerContext, name string, showName bool, lit string,
+	invert, lineNum, count, quiet, checkBin bool, r io.Reader) (bool, error) {
 	prefix := ""
 	if showName && name != "" {
 		prefix = name + ":"
@@ -660,8 +709,12 @@ func grepFastBuf(hc interp.HandlerContext, name string, showName bool, lit strin
 	litB := []byte(lit)
 	matched, matchedAny := 0, false
 	ln := 0
+	var writeErr error
 
 	handle := func(line []byte, terminated bool) bool {
+		if ctx.Err() != nil {
+			return false
+		}
 		ln++
 		ok := bytes.Contains(line, litB)
 		if invert {
@@ -670,6 +723,16 @@ func grepFastBuf(hc interp.HandlerContext, name string, showName bool, lit strin
 		if ok {
 			matchedAny = true
 			if quiet {
+				return false
+			}
+			if checkBin && bytes.IndexByte(line, 0) >= 0 {
+				if bw.Buffered() > 0 {
+					if err := bw.Flush(); err != nil {
+						writeErr = err
+						return false
+					}
+				}
+				fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", name)
 				return false
 			}
 			if count {
@@ -684,22 +747,43 @@ func grepFastBuf(hc interp.HandlerContext, name string, showName bool, lit strin
 				if terminated {
 					bw.WriteByte('\n')
 				}
+				if bw.Buffered() >= 4096 {
+					if err := bw.Flush(); err != nil {
+						writeErr = err
+						return false
+					}
+				}
 			}
 		}
 		return true
 	}
-	if err := streamLines(r, handle); err != nil {
+	err := streamLinesChunked(ctx, r, handle, func() error {
+		if bw.Buffered() > 0 {
+			return bw.Flush()
+		}
+		return nil
+	})
+	if writeErr != nil {
+		return matchedAny, writeErr
+	}
+	if err != nil {
+		return matchedAny, err
+	}
+	if err := ctx.Err(); err != nil {
 		return matchedAny, err
 	}
 	if count && !quiet {
 		bw.WriteString(prefix)
 		bw.WriteString(strconv.Itoa(matched))
 		bw.WriteByte('\n')
+		if err := bw.Flush(); err != nil {
+			return matchedAny, err
+		}
 	}
 	return matchedAny, nil
 }
 
-func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, invert, lineNum, count, filesOnly, quiet, onlyMatch bool, maxCount, after, before int, r io.Reader) (bool, error) {
+func grepReader(ctx context.Context, hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, invert, lineNum, count, filesOnly, quiet, onlyMatch, checkBin bool, maxCount, after, before int, r io.Reader) (bool, error) {
 	sc := newLineReader(r)
 	prefix := ""
 	if showName && name != "" {
@@ -766,6 +850,9 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 	ln := 0
 	lastOut := 0
 	for sc.Scan() {
+		if err := ctx.Err(); err != nil {
+			return matchedAny, err
+		}
 		ln++
 		line := sc.Text()
 		ok := re.MatchString(line)
@@ -778,12 +865,20 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 				return true, nil
 			}
 			if filesOnly {
-				fmt.Fprintln(hc.Stdout, name)
+				if _, err := fmt.Fprintln(hc.Stdout, name); err != nil && isPipeClosed(err) {
+					return true, epipeErr{}
+				}
+				return true, nil
+			}
+			if checkBin && strings.IndexByte(line, 0) >= 0 {
+				fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", name)
 				return true, nil
 			}
 			// GNU "--" separator between disjoint context groups.
 			if (after > 0 || before > 0) && lastOut > 0 && ln-lastOut > 1 {
-				fmt.Fprintln(hc.Stdout, "--")
+				if _, err := fmt.Fprintln(hc.Stdout, "--"); err != nil && isPipeClosed(err) {
+					return matchedAny, epipeErr{}
+				}
 			}
 			for _, pl := range pending {
 				if !printLine(pl.ln, pl.text, false) {
@@ -824,16 +919,18 @@ func grepReader(hc interp.HandlerContext, name string, showName bool, re *regexp
 		}
 	}
 	if count && !quiet && !filesOnly {
-		fmt.Fprintf(hc.Stdout, "%s%d\n", prefix, matched)
+		if _, err := fmt.Fprintf(hc.Stdout, "%s%d\n", prefix, matched); err != nil && isPipeClosed(err) {
+			return matchedAny, epipeErr{}
+		}
 	}
 	return matchedAny, sc.Err()
 }
 
 // grepReaderWord wraps grepReader, fixing `-o -w` to print only the word
 // (group 1) instead of the boundary characters consumed by the match.
-func grepReaderWord(hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, wordMode, invert bool, lineNum, count, filesOnly, quiet, onlyMatch bool, maxCount, after, before int, r io.Reader) (bool, error) {
+func grepReaderWord(ctx context.Context, hc interp.HandlerContext, name string, showName bool, re *regexp.Regexp, wordMode, invert bool, lineNum, count, filesOnly, quiet, onlyMatch, checkBin bool, maxCount, after, before int, r io.Reader) (bool, error) {
 	if !wordMode || !onlyMatch {
-		return grepReader(hc, name, showName, re, invert, lineNum, count, filesOnly, quiet, onlyMatch, maxCount, after, before, r)
+		return grepReader(ctx, hc, name, showName, re, invert, lineNum, count, filesOnly, quiet, onlyMatch, checkBin, maxCount, after, before, r)
 	}
 	sc := newLineReader(r)
 	prefix := ""
@@ -843,12 +940,22 @@ func grepReaderWord(hc interp.HandlerContext, name string, showName bool, re *re
 	matchedAny := false
 	ln := 0
 	for sc.Scan() {
+		if err := ctx.Err(); err != nil {
+			return matchedAny, err
+		}
 		ln++
 		line := sc.Text()
 		subs := re.FindAllStringSubmatch(line, -1)
 		if invert {
 			if len(subs) == 0 {
 				matchedAny = true
+				if quiet {
+					return true, nil
+				}
+				if checkBin && strings.IndexByte(line, 0) >= 0 {
+					fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", name)
+					return true, nil
+				}
 				if lineNum {
 					if _, err := fmt.Fprintf(hc.Stdout, "%s%d:%s\n", prefix, ln, line); err != nil && isPipeClosed(err) {
 						return matchedAny, epipeErr{}
@@ -867,6 +974,10 @@ func grepReaderWord(hc interp.HandlerContext, name string, showName bool, re *re
 			}
 			matchedAny = true
 			if quiet {
+				return true, nil
+			}
+			if checkBin && strings.IndexByte(line, 0) >= 0 {
+				fmt.Fprintf(hc.Stderr, "grep: %s: binary file matches\n", name)
 				return true, nil
 			}
 			if lineNum {
@@ -888,7 +999,7 @@ type ctxLine struct {
 	text string
 }
 
-func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdHead(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	n, rest := parseN(args[1:], 10)
 	fs := newFlagSet("head", hc.Stderr)
 	fsN := fs.String("n", strconv.FormatUint(n, 10), "")
@@ -930,6 +1041,9 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		var total uint64
 		for _, r := range readers {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			left := cn - total
 			if left == 0 {
 				break
@@ -937,6 +1051,9 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 			w, err := io.CopyN(hc.Stdout, r, int64(left))
 			total += uint64(w)
 			if err != nil {
+				if isPipeClosed(err) {
+					return err
+				}
 				break
 			}
 		}
@@ -948,16 +1065,25 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 		for i, r := range readers {
 			if (multi && !*quiet) || *verbose {
 				if i > 0 {
-					fmt.Fprintln(hc.Stdout)
+					if _, err := fmt.Fprintln(hc.Stdout); err != nil {
+						return err
+					}
 				}
-				fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i])
+				if _, err := fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i]); err != nil {
+					return err
+				}
 			}
 			var buf []string
 			sc := newLineReader(r)
 			for sc.Scan() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				buf = append(buf, sc.Text())
 				if int64(len(buf)) > negLines {
-					fmt.Fprintln(hc.Stdout, buf[0])
+					if _, err := fmt.Fprintln(hc.Stdout, buf[0]); err != nil {
+						return err
+					}
 					buf = buf[1:]
 				}
 			}
@@ -978,18 +1104,27 @@ func cmdHead(_ context.Context, hc interp.HandlerContext, args []string) error {
 	for i, r := range readers {
 		if (multi && !*quiet) || *verbose {
 			if i > 0 {
-				fmt.Fprintln(hc.Stdout)
+				if _, err := fmt.Fprintln(hc.Stdout); err != nil {
+					return err
+				}
 			}
-			fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i])
+			if _, err := fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i]); err != nil {
+				return err
+			}
 		}
 		sc := newLineReader(r)
 		var c uint64
 		for c < n && sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			nl := "\n"
 			if !sc.EndedWithNewline() {
 				nl = ""
 			}
-			fmt.Fprint(hc.Stdout, sc.Text()+nl)
+			if _, err := fmt.Fprint(hc.Stdout, sc.Text()+nl); err != nil {
+				return err
+			}
 			c++
 		}
 		if err := sc.Err(); err != nil {
@@ -1031,12 +1166,16 @@ func parseCount(s string) (uint64, error) {
 	return n * mult, nil
 }
 
-func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdTail(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fromLine := uint64(0)
 	filtered := args[:1:1]
 	argv := args[1:]
 	for i := 0; i < len(argv); i++ {
 		a := argv[i]
+		if a == "--" {
+			filtered = append(filtered, argv[i:]...)
+			break
+		}
 		if (a == "-n" || a == "--lines") && i+1 < len(argv) &&
 			len(argv[i+1]) > 1 && argv[i+1][0] == '+' {
 			if v, err := parseUint(argv[i+1][1:]); err == nil && v >= 1 {
@@ -1100,16 +1239,34 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return exitError{1}
 		}
 		var data []byte
+		buf := make([]byte, 64*1024)
 		for _, r := range readers {
-			chunk, err := io.ReadAll(r)
-			if err != nil {
-				fmt.Fprintln(hc.Stderr, "tail:", err)
-				return exitError{1}
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				nr, rerr := r.Read(buf)
+				if nr > 0 && cn > 0 {
+					if uint64(nr) >= cn {
+						data = append(data[:0], buf[nr-int(cn):nr]...)
+					} else {
+						data = append(data, buf[:nr]...)
+						if uint64(len(data)) > cn {
+							data = append([]byte(nil), data[len(data)-int(cn):]...)
+						}
+					}
+				}
+				if rerr == io.EOF {
+					break
+				}
+				if rerr != nil {
+					fmt.Fprintln(hc.Stderr, "tail:", rerr)
+					return exitError{1}
+				}
 			}
-			data = append(data, chunk...)
 		}
-		if uint64(len(data)) > cn {
-			data = data[len(data)-int(cn):]
+		if len(data) == 0 {
+			return nil
 		}
 		_, err = hc.Stdout.Write(data)
 		return err
@@ -1119,21 +1276,30 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 	for i, r := range readers {
 		if (multi && !*quiet) || *verbose {
 			if i > 0 {
-				fmt.Fprintln(hc.Stdout)
+				if _, err := fmt.Fprintln(hc.Stdout); err != nil {
+					return err
+				}
 			}
-			fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i])
+			if _, err := fmt.Fprintf(hc.Stdout, "==> %s <==\n", names[i]); err != nil {
+				return err
+			}
 		}
 		if fromLine > 0 {
 			sc := newLineReader(r)
 			var ln uint64
 			for sc.Scan() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				ln++
 				if ln >= fromLine {
 					nl := "\n"
 					if !sc.EndedWithNewline() {
 						nl = ""
 					}
-					fmt.Fprint(hc.Stdout, sc.Text()+nl)
+					if _, err := fmt.Fprint(hc.Stdout, sc.Text()+nl); err != nil {
+						return err
+					}
 				}
 			}
 			if err := sc.Err(); err != nil {
@@ -1143,7 +1309,16 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			continue
 		}
 		if n == 0 {
-			_, _ = io.Copy(io.Discard, r)
+			buf := make([]byte, 64*1024)
+			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				_, rerr := r.Read(buf)
+				if rerr != nil {
+					break
+				}
+			}
 			continue
 		}
 		ring := make([]string, n)
@@ -1151,6 +1326,9 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 		var count, pos uint64
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			ring[pos] = sc.Text()
 			ringNL[pos] = sc.EndedWithNewline()
 			pos = (pos + 1) % n
@@ -1169,12 +1347,14 @@ func cmdTail(_ context.Context, hc interp.HandlerContext, args []string) error {
 			shown = n
 		}
 		for k := uint64(0); k < shown; k++ {
-			i := (start + k) % n
+			idx := (start + k) % n
 			nl := "\n"
-			if k == shown-1 && !ringNL[i] {
+			if k == shown-1 && !ringNL[idx] {
 				nl = ""
 			}
-			fmt.Fprint(hc.Stdout, ring[i]+nl)
+			if _, err := fmt.Fprint(hc.Stdout, ring[idx]+nl); err != nil {
+				return err
+			}
 		}
 	}
 	return nil
@@ -2372,12 +2552,26 @@ func sortParseHuman(s string) float64 {
 		i++
 	}
 	j := i
-	for j < len(s) && (s[j] == '+' || s[j] == '-' || s[j] == '.' ||
-		(s[j] >= '0' && s[j] <= '9') || s[j] == 'e' || s[j] == 'E') {
+	if j < len(s) && (s[j] == '+' || s[j] == '-') {
 		j++
 	}
-	f, _ := strconv.ParseFloat(s[i:j], 64)
-	if j >= len(s) {
+	dig := 0
+	for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+		j++
+		dig++
+	}
+	if j < len(s) && s[j] == '.' {
+		j++
+		for j < len(s) && s[j] >= '0' && s[j] <= '9' {
+			j++
+			dig++
+		}
+	}
+	if dig == 0 {
+		return 0
+	}
+	f, err := strconv.ParseFloat(s[i:j], 64)
+	if err != nil || j >= len(s) {
 		return f
 	}
 	mult := 1024.0
@@ -2604,7 +2798,7 @@ func skipNFields(s string, n int) string {
 	return s[i:]
 }
 
-func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdUniq(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("uniq", hc.Stderr)
 	count := fs.Bool("c", false, "")
 	dupOnly := fs.Bool("d", false, "")
@@ -2705,9 +2899,9 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 	var prev, prevRaw string
 	n := 0
 	firstGroup := true
-	flush := func() {
+	flush := func(forceFlush bool) error {
 		if n == 0 {
-			return
+			return nil
 		}
 		show := true
 		if *dupOnly && n < 2 {
@@ -2726,7 +2920,10 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 				io.WriteString(w, prevRaw)
 				io.WriteString(w, "\n")
 			}
-			return
+			if (forceFlush && bw.Buffered() > 0) || bw.Buffered() >= 4096 {
+				return bw.Flush()
+			}
+			return nil
 		}
 		if show {
 			if *count {
@@ -2735,15 +2932,24 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 				io.WriteString(w, prevRaw)
 				io.WriteString(w, "\n")
 			}
+			if (forceFlush && bw.Buffered() > 0) || bw.Buffered() >= 4096 {
+				return bw.Flush()
+			}
 		}
+		return nil
 	}
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			line := sc.Text()
 			key := norm(line)
 			if n == 0 || key != prev {
-				flush()
+				if err := flush(sc.br.Buffered() == 0); err != nil {
+					return err
+				}
 				prev, prevRaw, n = key, line, 1
 			} else {
 				n++
@@ -2754,8 +2960,10 @@ func cmdUniq(_ context.Context, hc interp.HandlerContext, args []string) error {
 			return exitError{1}
 		}
 	}
-	flush()
-	return nil
+	if err := flush(true); err != nil {
+		return err
+	}
+	return bw.Flush()
 }
 
 func cmdWc(_ context.Context, hc interp.HandlerContext, args []string) error {
@@ -2985,7 +3193,7 @@ func cmdTee(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	return err
 }
 
-func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdTr(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("tr", hc.Stderr)
 	del := fs.Bool("d", false, "")
 	squeeze := fs.Bool("s", false, "")
@@ -2995,7 +3203,6 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if err := fs.Parse(args[1:]); err != nil {
 		return err
 	}
-	_ = truncate // accepted for parity; mapping loop below already truncates SET1 to len(SET2)
 	rest := fs.Args()
 	if len(rest) == 0 {
 		fmt.Fprintln(hc.Stderr, "tr: missing operand")
@@ -3007,8 +3214,24 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	if *complement && !*del && len(rest) < 2 {
-		_, err := io.Copy(hc.Stdout, hc.Stdin)
-		return err
+		buf := make([]byte, 256*1024)
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			n, rerr := hc.Stdin.Read(buf)
+			if n > 0 {
+				if _, werr := hc.Stdout.Write(buf[:n]); werr != nil {
+					return werr
+				}
+			}
+			if rerr == io.EOF {
+				return nil
+			}
+			if rerr != nil {
+				return rerr
+			}
+		}
 	}
 	if *complement {
 		present := make(map[byte]bool, len(from))
@@ -3030,6 +3253,9 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 		buf := make([]byte, 256*1024)
 		out := make([]byte, 256*1024)
 		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			n, err := hc.Stdin.Read(buf)
 			if n > 0 {
 				k := 0
@@ -3058,6 +3284,9 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 			var carry byte
 			hasCarry := false
 			for {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 				n, err := hc.Stdin.Read(buf)
 				if n > 0 {
 					chunk := squeezeBytes(buf[:n], from, &carry, &hasCarry)
@@ -3080,6 +3309,10 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 	to, err := expandTrSet(rest[1])
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tr:", err)
+		return exitError{1}
+	}
+	if !*truncate && len(to) == 0 && len(from) > 0 {
+		fmt.Fprintln(hc.Stderr, "tr: when not truncating set1, string2 must be non-empty")
 		return exitError{1}
 	}
 	var table [256]byte
@@ -3106,6 +3339,9 @@ func cmdTr(_ context.Context, hc interp.HandlerContext, args []string) error {
 	var carry byte
 	hasCarry := false
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		n, err := hc.Stdin.Read(buf)
 		if n > 0 {
 			for i := 0; i < n; i++ {
@@ -3145,46 +3381,54 @@ func squeezeBytes(data, set []byte, carry *byte, hasCarry *bool) []byte {
 	return out
 }
 
+func nextTrAtom(s string, i int) (byte, int, bool) {
+	if i >= len(s) {
+		return 0, i, false
+	}
+	if s[i] == '[' && strings.HasPrefix(s[i:], "[:") {
+		if strings.Index(s[i:], ":]") >= 0 {
+			return 0, i, false
+		}
+	}
+	if s[i] == '\\' && i+1 < len(s) {
+		if c := s[i+1]; c >= '0' && c <= '7' {
+			k, val := i+1, 0
+			for k < len(s) && k < i+4 && s[k] >= '0' && s[k] <= '7' {
+				val = val*8 + int(s[k]-'0')
+				k++
+			}
+			return byte(val & 0xFF), k, true
+		}
+		var b byte
+		switch s[i+1] {
+		case 'a':
+			b = '\a'
+		case 'b':
+			b = '\b'
+		case 'v':
+			b = '\v'
+		case 'f':
+			b = '\f'
+		case 'n':
+			b = '\n'
+		case 't':
+			b = '\t'
+		case 'r':
+			b = '\r'
+		case '\\':
+			b = '\\'
+		default:
+			b = s[i+1]
+		}
+		return b, i + 2, true
+	}
+	return s[i], i + 1, true
+}
+
 func expandTrSet(s string) ([]byte, error) {
 	var out []byte
 	i := 0
 	for i < len(s) {
-		if s[i] == '\\' && i+1 < len(s) {
-			if c := s[i+1]; c >= '0' && c <= '7' {
-				k, val := i+1, 0
-				for k < len(s) && k < i+4 && s[k] >= '0' && s[k] <= '7' {
-					val = val*8 + int(s[k]-'0')
-					k++
-				}
-				out = append(out, byte(val&0xFF))
-				i = k
-				continue
-			}
-			switch s[i+1] {
-			case '0':
-				out = append(out, 0)
-			case 'a':
-				out = append(out, '\a')
-			case 'b':
-				out = append(out, '\b')
-			case 'v':
-				out = append(out, '\v')
-			case 'f':
-				out = append(out, '\f')
-			case 'n':
-				out = append(out, '\n')
-			case 't':
-				out = append(out, '\t')
-			case 'r':
-				out = append(out, '\r')
-			case '\\':
-				out = append(out, '\\')
-			default:
-				out = append(out, s[i+1])
-			}
-			i += 2
-			continue
-		}
 		if s[i] == '[' && strings.HasPrefix(s[i:], "[:") {
 			if e := strings.Index(s[i:], ":]"); e >= 0 {
 				out = append(out, expandTrClass(s[i:i+e+2])...)
@@ -3192,18 +3436,26 @@ func expandTrSet(s string) ([]byte, error) {
 				continue
 			}
 		}
-		if i+2 < len(s) && s[i+1] == '-' {
-			if s[i] > s[i+2] {
-				return nil, fmt.Errorf("range-endpoints of '%s' are in reverse collating sequence order", s[i:i+3])
-			}
-			for c := s[i]; c <= s[i+2]; c++ {
-				out = append(out, c)
-			}
-			i += 3
+		lo, next1, ok := nextTrAtom(s, i)
+		if !ok {
+			out = append(out, s[i])
+			i++
 			continue
 		}
-		out = append(out, s[i])
-		i++
+		if next1 < len(s) && s[next1] == '-' && next1+1 < len(s) {
+			if hi, next2, ok2 := nextTrAtom(s, next1+1); ok2 {
+				if lo > hi {
+					return nil, fmt.Errorf("range-endpoints of '%s' are in reverse collating sequence order", s[i:next2])
+				}
+				for c := int(lo); c <= int(hi); c++ {
+					out = append(out, byte(c))
+				}
+				i = next2
+				continue
+			}
+		}
+		out = append(out, lo)
+		i = next1
 	}
 	return out, nil
 }
@@ -3244,7 +3496,7 @@ func expandTrClass(class string) []byte {
 	return out
 }
 
-func cmdSeq(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdSeq(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	// GNU seq flags: -w (equal width), -s SEP (separator), -f FMT.
 	var padWidth bool
 	sep := "\n"
@@ -3328,8 +3580,111 @@ func cmdSeq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "Try 'seq --help' for more information.")
 		return exitError{1}
 	}
-	var sb strings.Builder
-	sb.Grow(4096)
+	bw := bufio.NewWriterSize(hc.Stdout, 64*1024)
+	steps := 0
+	checkStep := func() error {
+		steps++
+		if steps&1023 == 0 {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		if bw.Buffered() >= 4096 {
+			if err := bw.Flush(); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	parseSeqInt := func(s string) (int64, bool) {
+		s = strings.TrimSpace(s)
+		if s == "" || strings.ContainsAny(s, ".eExX") {
+			return 0, false
+		}
+		v, err := strconv.ParseInt(s, 10, 64)
+		return v, err == nil
+	}
+	if format == "" {
+		iv, istep, ilast := int64(1), int64(1), int64(0)
+		intOK := false
+		switch len(rest) {
+		case 1:
+			ilast, intOK = parseSeqInt(rest[0])
+		case 2:
+			var ok1, ok2 bool
+			iv, ok1 = parseSeqInt(rest[0])
+			ilast, ok2 = parseSeqInt(rest[1])
+			intOK = ok1 && ok2
+		case 3:
+			var ok1, ok2, ok3 bool
+			iv, ok1 = parseSeqInt(rest[0])
+			istep, ok2 = parseSeqInt(rest[1])
+			ilast, ok3 = parseSeqInt(rest[2])
+			intOK = ok1 && ok2 && ok3
+		}
+		if intOK && istep != 0 {
+			if (istep > 0 && iv > ilast) || (istep < 0 && iv < ilast) {
+				return nil
+			}
+			padW := 0
+			if padWidth {
+				var endVal int64
+				if istep > 0 {
+					diff := uint64(ilast) - uint64(iv)
+					endVal = int64(uint64(ilast) - diff%uint64(istep))
+				} else {
+					diff := uint64(iv) - uint64(ilast)
+					endVal = int64(uint64(ilast) + diff%(-uint64(istep)))
+				}
+				padW = max(len(strconv.FormatInt(iv, 10)), len(strconv.FormatInt(endVal, 10)))
+			}
+			buf := make([]byte, 0, 32)
+			firstOut := true
+			for {
+				if (istep > 0 && iv > ilast) || (istep < 0 && iv < ilast) {
+					break
+				}
+				if !firstOut && sep != "\n" {
+					bw.WriteString(sep)
+				}
+				firstOut = false
+				buf = strconv.AppendInt(buf[:0], iv, 10)
+				if padW > len(buf) {
+					if buf[0] == '-' {
+						bw.WriteByte('-')
+						for z := 0; z < padW-len(buf); z++ {
+							bw.WriteByte('0')
+						}
+						bw.Write(buf[1:])
+					} else {
+						for z := 0; z < padW-len(buf); z++ {
+							bw.WriteByte('0')
+						}
+						bw.Write(buf)
+					}
+				} else {
+					bw.Write(buf)
+				}
+				if sep == "\n" {
+					bw.WriteByte('\n')
+				}
+				if err := checkStep(); err != nil {
+					return err
+				}
+				if istep > 0 && iv > 0 && istep > math.MaxInt64-iv {
+					break
+				}
+				if istep < 0 && iv < 0 && istep < math.MinInt64-iv {
+					break
+				}
+				iv += istep
+			}
+			if !firstOut && sep != "\n" {
+				bw.WriteByte('\n')
+			}
+			return bw.Flush()
+		}
+	}
 	fmtNum := func(v float64) string {
 		if format != "" {
 			return sprintfSeq(format, v)
@@ -3337,70 +3692,73 @@ func cmdSeq(_ context.Context, hc interp.HandlerContext, args []string) error {
 		if decimals > 0 {
 			return strconv.FormatFloat(v, 'f', decimals, 64)
 		}
-		if v == float64(int64(v)) {
+		if v >= -9e18 && v <= 9e18 && v == float64(int64(v)) {
 			return strconv.FormatInt(int64(v), 10)
 		}
 		return strconv.FormatFloat(v, 'f', -1, 64)
 	}
-	// Integer fast path: stream straight into the builder (the common
-	// `seq 100000` shape), avoiding a per-value allocation.
-	if !padWidth && format == "" && decimals == 0 &&
-		first == float64(int64(first)) && step == float64(int64(step)) && last == float64(int64(last)) {
-		iv, istep, ilast := int64(first), int64(step), int64(last)
-		buf := make([]byte, 0, 24)
-		firstOut := true
-		for {
-			if (istep > 0 && iv > ilast) || (istep < 0 && iv < ilast) {
-				break
-			}
-			if !firstOut && sep != "\n" {
-				sb.WriteString(sep)
-			}
-			firstOut = false
-			buf = strconv.AppendInt(buf[:0], iv, 10)
-			sb.Write(buf)
-			if sep == "\n" {
-				sb.WriteByte('\n')
-			}
-			iv += istep
-		}
-		if sep != "\n" {
-			sb.WriteByte('\n')
-		}
-		_, err := io.WriteString(hc.Stdout, sb.String())
-		return err
+	inBounds := func(v float64) bool {
+		return (step > 0 && v <= last+1e-12) || (step < 0 && v >= last-1e-12)
 	}
-	var vals []string
-	for v := first; (step > 0 && v <= last+1e-12) || (step < 0 && v >= last-1e-12); v += step {
-		vals = append(vals, fmtNum(v))
-		if len(vals) > 10000000 {
+	if !inBounds(first) {
+		return nil
+	}
+	padW := 0
+	if padWidth && format == "" {
+		padW = len(fmtNum(first))
+		estSteps := math.Floor((last - first) / step)
+		if estSteps < 0 || math.IsInf(estSteps, 0) || math.IsNaN(estSteps) {
+			estSteps = 0
+		}
+		vEnd := first + estSteps*step
+		for adj := 0; adj < 8 && inBounds(vEnd+step) && vEnd+step != vEnd; adj++ {
+			estSteps++
+			vEnd = first + estSteps*step
+		}
+		for adj := 0; adj < 8 && estSteps > 0 && !inBounds(vEnd); adj++ {
+			estSteps--
+			vEnd = first + estSteps*step
+		}
+		if w2 := len(fmtNum(vEnd)); w2 > padW {
+			padW = w2
+		}
+	}
+	padStr := func(s string) string {
+		if padW == 0 || len(s) >= padW {
+			return s
+		}
+		if strings.HasPrefix(s, "-") {
+			return "-" + strings.Repeat("0", padW-len(s)) + s[1:]
+		}
+		return strings.Repeat("0", padW-len(s)) + s
+	}
+	firstOut := true
+	var prevV float64
+	for k := uint64(0); ; k++ {
+		v := first + float64(k)*step
+		if k > 0 && v == prevV {
 			break
 		}
-	}
-	if padWidth {
-		w := 0
-		for _, s := range vals {
-			if len(s) > w {
-				w = len(s)
-			}
+		prevV = v
+		if !inBounds(v) {
+			break
 		}
-		for i, s := range vals {
-			if len(s) < w {
-				vals[i] = strings.Repeat("0", w-len(s)) + s
-			}
+		if !firstOut && sep != "\n" {
+			bw.WriteString(sep)
+		}
+		firstOut = false
+		bw.WriteString(padStr(fmtNum(v)))
+		if sep == "\n" {
+			bw.WriteByte('\n')
+		}
+		if err := checkStep(); err != nil {
+			return err
 		}
 	}
-	if sep == "\n" {
-		for _, s := range vals {
-			sb.WriteString(s)
-			sb.WriteByte('\n')
-		}
-	} else {
-		sb.WriteString(strings.Join(vals, sep))
-		sb.WriteByte('\n')
+	if !firstOut && sep != "\n" {
+		bw.WriteByte('\n')
 	}
-	_, err := io.WriteString(hc.Stdout, sb.String())
-	return err
+	return bw.Flush()
 }
 
 // parseSeqNum parses a seq operand, returning value + decimals shown.
@@ -3444,7 +3802,7 @@ func sprintfSeq(format string, v float64) string {
 	return format
 }
 
-func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdCut(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("cut", hc.Stderr)
 	delim := fs.String("d", "\t", "")
 	fields := fs.String("f", "", "")
@@ -3485,7 +3843,7 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 		*chars = *bytes_
 	}
 	if *chars != "" {
-		return cmdCutChars(hc, *chars, fs.Args(), *complement)
+		return cmdCutChars(ctx, hc, *chars, fs.Args(), *complement)
 	}
 	if *fields == "" {
 		fmt.Fprintln(hc.Stderr, "cut: specify -f (fields) or -c (characters)")
@@ -3530,11 +3888,21 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 		delimB := d[0]
 		joinerB := joiner
 		for _, r := range readers {
-			err := streamLines(r, func(line []byte, terminated bool) bool {
+			var writeErr error
+			err := streamLinesChunked(ctx, r, func(line []byte, terminated bool) bool {
+				if ctx.Err() != nil {
+					return false
+				}
 				if bytes.IndexByte(line, delimB) < 0 {
 					if !*onlyDelim {
 						bw.Write(line)
 						bw.WriteByte('\n')
+						if bw.Buffered() >= 4096 {
+							if werr := bw.Flush(); werr != nil {
+								writeErr = werr
+								return false
+							}
+						}
 					}
 					return true
 				}
@@ -3555,22 +3923,44 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 					fstart = j + 1
 				}
 				bw.WriteByte('\n')
+				if bw.Buffered() >= 4096 {
+					if werr := bw.Flush(); werr != nil {
+						writeErr = werr
+						return false
+					}
+				}
 				return true
+			}, func() error {
+				if bw.Buffered() > 0 {
+					return bw.Flush()
+				}
+				return nil
 			})
+			if writeErr != nil {
+				err = writeErr
+			}
 			if err != nil {
+				if isPipeClosed(err) || ctx.Err() != nil {
+					return err
+				}
 				fmt.Fprintln(hc.Stderr, "cut:", err)
 				return exitError{1}
 			}
 		}
-		return nil
+		return bw.Flush()
 	}
 	for _, r := range readers {
 		sc := newLineReader(r)
 		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
 			line := sc.Text()
 			if !strings.Contains(line, d) {
 				if !*onlyDelim {
-					fmt.Fprintln(hc.Stdout, line)
+					if _, werr := fmt.Fprintln(hc.Stdout, line); werr != nil {
+						return werr
+					}
 				}
 				continue
 			}
@@ -3581,7 +3971,9 @@ func cmdCut(_ context.Context, hc interp.HandlerContext, args []string) error {
 					out = append(out, parts[i])
 				}
 			}
-			fmt.Fprintln(hc.Stdout, strings.Join(out, joiner))
+			if _, werr := fmt.Fprintln(hc.Stdout, strings.Join(out, joiner)); werr != nil {
+				return werr
+			}
 		}
 		if err := sc.Err(); err != nil {
 			fmt.Fprintln(hc.Stderr, "cut:", err)
@@ -3602,6 +3994,9 @@ func parseFieldList(s string) ([]fieldSpan, error) {
 		}
 		if strings.Contains(part, "-") {
 			ab := strings.SplitN(part, "-", 2)
+			if ab[0] == "" && ab[1] == "" {
+				return nil, fmt.Errorf("invalid range with no endpoint: -")
+			}
 			lo, hi := 1, -1
 			if ab[0] != "" {
 				v, err := strconv.Atoi(ab[0])
@@ -3617,11 +4012,20 @@ func parseFieldList(s string) ([]fieldSpan, error) {
 				}
 				hi = v
 			}
+			if lo < 1 || (hi != -1 && hi < 1) {
+				return nil, fmt.Errorf("fields and positions are numbered from 1")
+			}
+			if hi != -1 && hi < lo {
+				return nil, fmt.Errorf("invalid decreasing range")
+			}
 			spans = append(spans, fieldSpan{lo, hi})
 		} else {
 			v, err := strconv.Atoi(part)
 			if err != nil {
 				return nil, fmt.Errorf("invalid field: %s", part)
+			}
+			if v < 1 {
+				return nil, fmt.Errorf("fields and positions are numbered from 1")
 			}
 			spans = append(spans, fieldSpan{v, v})
 		}
@@ -3632,7 +4036,7 @@ func parseFieldList(s string) ([]fieldSpan, error) {
 	return spans, nil
 }
 
-func cmdCutChars(hc interp.HandlerContext, list string, files []string, complement bool) error {
+func cmdCutChars(ctx context.Context, hc interp.HandlerContext, list string, files []string, complement bool) error {
 	spans, err := parseFieldList(list)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "cut:", err)
@@ -3665,7 +4069,11 @@ func cmdCutChars(hc interp.HandlerContext, list string, files []string, compleme
 	defer bw.Flush()
 	out := make([]byte, 0, 256)
 	for _, r := range readers {
-		err := streamLines(r, func(line []byte, terminated bool) bool {
+		var writeErr error
+		err := streamLinesChunked(ctx, r, func(line []byte, terminated bool) bool {
+			if ctx.Err() != nil {
+				return false
+			}
 			out = out[:0]
 			for j := 0; j < len(line); j++ {
 				if in(j + 1) {
@@ -3674,17 +4082,34 @@ func cmdCutChars(hc interp.HandlerContext, list string, files []string, compleme
 			}
 			bw.Write(out)
 			bw.WriteByte('\n')
+			if bw.Buffered() >= 4096 {
+				if werr := bw.Flush(); werr != nil {
+					writeErr = werr
+					return false
+				}
+			}
 			return true
+		}, func() error {
+			if bw.Buffered() > 0 {
+				return bw.Flush()
+			}
+			return nil
 		})
+		if writeErr != nil {
+			err = writeErr
+		}
 		if err != nil {
+			if isPipeClosed(err) || ctx.Err() != nil {
+				return err
+			}
 			fmt.Fprintln(hc.Stderr, "cut:", err)
 			return exitError{1}
 		}
 	}
-	return nil
+	return bw.Flush()
 }
 
-func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdPaste(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("paste", hc.Stderr)
 	delims := fs.String("d", "\t", "")
 	serial := fs.Bool("s", false, "")
@@ -3692,64 +4117,63 @@ func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error 
 		return err
 	}
 	files := fs.Args()
-	if len(files) == 0 {
-		data, err := io.ReadAll(hc.Stdin)
-		if err != nil {
-			return err
-		}
-		lines := strings.Split(string(data), "\n")
-		if len(lines) > 0 && lines[len(lines)-1] == "" {
-			lines = lines[:len(lines)-1]
-		}
-		d := []rune(*delims)
-		if len(d) == 0 {
-			d = []rune{'\t'}
-		}
-		if *serial {
-			fmt.Fprintln(hc.Stdout, strings.Join(lines, string(d[0])))
-			return nil
-		}
-		for _, l := range lines {
-			fmt.Fprintln(hc.Stdout, l)
-		}
-		return nil
-	}
 	d := []rune(*delims)
 	if len(d) == 0 {
 		d = []rune{'\t'}
 	}
+	if len(files) == 0 {
+		sc := newLineReader(hc.Stdin)
+		if *serial {
+			bw := bufio.NewWriterSize(hc.Stdout, 64*1024)
+			first := true
+			for sc.Scan() {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
+				if !first {
+					bw.WriteRune(d[0])
+				}
+				first = false
+				bw.WriteString(sc.Text())
+				if bw.Buffered() >= 4096 {
+					if err := bw.Flush(); err != nil {
+						return err
+					}
+				}
+			}
+			if err := sc.Err(); err != nil {
+				return err
+			}
+			bw.WriteByte('\n')
+			return bw.Flush()
+		}
+		for sc.Scan() {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			if _, err := fmt.Fprintln(hc.Stdout, sc.Text()); err != nil {
+				return err
+			}
+		}
+		return sc.Err()
+	}
 	// GNU: repeated "-" operands read SUCCESSIVE lines from the same
-	// stdin stream. Buffer stdin once; each "-" scanner consumes the
-	// next line round-robin (shared cursor), not an independent copy.
-	var stdinLines []string
-	stdinBuffered := false
+	// stdin stream. Share a single lineReader across "-" operands so
+	// infinite streams (e.g. `yes | paste - - | head -n 2`) stream in O(1) memory.
 	var openFiles []io.Closer
 	defer func() {
 		for _, f := range openFiles {
 			f.Close()
 		}
 	}()
-	type src2 struct {
-		sc    *lineReader
-		lines *[]string
-		pos   *int
-	}
-	var srcs []src2
-	var shared []string
-	var sharedPos int
+	var srcs []*lineReader
+	var stdinSC *lineReader
 	for _, f := range files {
 		if f == "-" || f == "/dev/stdin" {
-			if !stdinBuffered {
-				data, err := io.ReadAll(hc.Stdin)
-				if err != nil {
-					fmt.Fprintln(hc.Stderr, "paste:", err)
-					return exitError{1}
-				}
-				stdinLines = splitLinesDropLast(string(data))
-				shared = stdinLines
-				stdinBuffered = true
+			if stdinSC == nil {
+				stdinSC = newLineReader(hc.Stdin)
 			}
-			srcs = append(srcs, src2{lines: &shared, pos: &sharedPos})
+			srcs = append(srcs, stdinSC)
 			continue
 		}
 		fh, err := openShellFile(resolve(hc.Dir, f))
@@ -3758,45 +4182,53 @@ func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error 
 			return exitError{1}
 		}
 		openFiles = append(openFiles, fh)
-		sc := newLineReader(fh)
-		srcs = append(srcs, src2{sc: sc})
-	}
-	nextLine := func(s src2) (string, bool) {
-		if s.sc != nil {
-			if s.sc.Scan() {
-				return s.sc.Text(), true
-			}
-			return "", false
-		}
-		if *s.pos < len(*s.lines) {
-			l := (*s.lines)[*s.pos]
-			*s.pos++
-			return l, true
-		}
-		return "", false
+		srcs = append(srcs, newLineReader(fh))
 	}
 	if *serial {
-		for i, s := range srcs {
-			var parts []string
-			for {
-				l, ok := nextLine(s)
-				if !ok {
-					break
+		bw := bufio.NewWriterSize(hc.Stdout, 64*1024)
+		for i, sc := range srcs {
+			first := true
+			for sc.Scan() {
+				if err := ctx.Err(); err != nil {
+					return err
 				}
-				parts = append(parts, l)
+				if !first {
+					bw.WriteRune(d[i%len(d)])
+				}
+				first = false
+				bw.WriteString(sc.Text())
+				if bw.Buffered() >= 4096 {
+					if err := bw.Flush(); err != nil {
+						return err
+					}
+				}
 			}
-			fmt.Fprintln(hc.Stdout, strings.Join(parts, string(d[i%len(d)])))
+			if err := sc.Err(); err != nil {
+				fmt.Fprintln(hc.Stderr, "paste:", err)
+				return exitError{1}
+			}
+			bw.WriteByte('\n')
+			if err := bw.Flush(); err != nil {
+				return err
+			}
 		}
 		return nil
 	}
 	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		var parts []string
 		any := false
-		for _, s := range srcs {
-			if l, ok := nextLine(s); ok {
-				parts = append(parts, l)
+		for _, sc := range srcs {
+			if sc.Scan() {
+				parts = append(parts, sc.Text())
 				any = true
 			} else {
+				if err := sc.Err(); err != nil {
+					fmt.Fprintln(hc.Stderr, "paste:", err)
+					return exitError{1}
+				}
 				parts = append(parts, "")
 			}
 		}
@@ -3810,7 +4242,9 @@ func cmdPaste(_ context.Context, hc interp.HandlerContext, args []string) error 
 			}
 			sb.WriteString(p)
 		}
-		fmt.Fprintln(hc.Stdout, sb.String())
+		if _, err := fmt.Fprintln(hc.Stdout, sb.String()); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -4056,7 +4490,7 @@ func parseSize(s string) (int64, error) {
 	return n * mult, nil
 }
 
-func cmdDiff(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdDiff(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("diff", hc.Stderr)
 	brief := fs.Bool("q", false, "")
 	unified := fs.Bool("u", false, "")
@@ -4126,42 +4560,25 @@ func cmdDiff(_ context.Context, hc interp.HandlerContext, args []string) error {
 		return exitError{1}
 	}
 	n, m := len(a), len(b)
-	dp := make([][]int, n+1)
-	for x := range dp {
-		dp[x] = make([]int, m+1)
+	p := 0
+	for p < n && p < m && a[p] == b[p] {
+		p++
 	}
-	for x := n - 1; x >= 0; x-- {
-		for y := m - 1; y >= 0; y-- {
-			if a[x] == b[y] {
-				dp[x][y] = dp[x+1][y+1] + 1
-			} else if dp[x+1][y] >= dp[x][y+1] {
-				dp[x][y] = dp[x+1][y]
-			} else {
-				dp[x][y] = dp[x][y+1]
-			}
-		}
+	s := 0
+	for s < n-p && s < m-p && a[n-1-s] == b[m-1-s] {
+		s++
 	}
-	var ops []diffOp
-	i, j := 0, 0
-	for i < n || j < m {
-		switch {
-		case i < n && j < m && a[i] == b[j]:
-			ops = append(ops, diffOp{'=', a[i]})
-			i++
-			j++
-		case i >= n:
-			ops = append(ops, diffOp{'+', b[j]})
-			j++
-		case j >= m:
-			ops = append(ops, diffOp{'-', a[i]})
-			i++
-		case dp[i+1][j] >= dp[i][j+1]:
-			ops = append(ops, diffOp{'-', a[i]})
-			i++
-		default:
-			ops = append(ops, diffOp{'+', b[j]})
-			j++
-		}
+	midOps, err := computeDiffOps(ctx, a[p:n-s], b[p:m-s])
+	if err != nil {
+		return err
+	}
+	ops := make([]diffOp, 0, p+len(midOps)+s)
+	for i := 0; i < p; i++ {
+		ops = append(ops, diffOp{'=', a[i]})
+	}
+	ops = append(ops, midOps...)
+	for i := n - s; i < n; i++ {
+		ops = append(ops, diffOp{'=', a[i]})
 	}
 	if *unified {
 		emitUnified(hc, files, a, b, ops, labels)
@@ -4244,6 +4661,163 @@ func itoa(n int) string { return strconv.Itoa(n) }
 type diffOp struct {
 	kind byte
 	text string
+}
+
+func computeDiffOps(ctx context.Context, a, b []string) ([]diffOp, error) {
+	n, m := len(a), len(b)
+	if n == 0 {
+		ops := make([]diffOp, m)
+		for j := 0; j < m; j++ {
+			ops[j] = diffOp{'+', b[j]}
+		}
+		return ops, nil
+	}
+	if m == 0 {
+		ops := make([]diffOp, n)
+		for i := 0; i < n; i++ {
+			ops[i] = diffOp{'-', a[i]}
+		}
+		return ops, nil
+	}
+	// Use exact flat 1D LCS DP for small/medium windows (<= ~4MB),
+	// and bounded Myers O(ND) diff for large inputs to avoid O(N*M) OOM/hangs.
+	if int64(n+1)*int64(m+1) <= 1_000_000 {
+		stride := m + 1
+		dp := make([]int32, (n+1)*stride)
+		for x := n - 1; x >= 0; x-- {
+			if x&63 == 0 {
+				if err := ctx.Err(); err != nil {
+					return nil, err
+				}
+			}
+			row := x * stride
+			nextRow := (x + 1) * stride
+			ax := a[x]
+			for y := m - 1; y >= 0; y-- {
+				if ax == b[y] {
+					dp[row+y] = dp[nextRow+y+1] + 1
+				} else if dp[nextRow+y] >= dp[row+y+1] {
+					dp[row+y] = dp[nextRow+y]
+				} else {
+					dp[row+y] = dp[row+y+1]
+				}
+			}
+		}
+		ops := make([]diffOp, 0, n+m)
+		i, j := 0, 0
+		for i < n || j < m {
+			switch {
+			case i < n && j < m && a[i] == b[j]:
+				ops = append(ops, diffOp{'=', a[i]})
+				i++
+				j++
+			case i >= n:
+				ops = append(ops, diffOp{'+', b[j]})
+				j++
+			case j >= m:
+				ops = append(ops, diffOp{'-', a[i]})
+				i++
+			case dp[(i+1)*stride+j] >= dp[i*stride+j+1]:
+				ops = append(ops, diffOp{'-', a[i]})
+				i++
+			default:
+				ops = append(ops, diffOp{'+', b[j]})
+				j++
+			}
+		}
+		return ops, nil
+	}
+	return myersDiffOps(ctx, a, b, 2048)
+}
+
+func myersDiffOps(ctx context.Context, a, b []string, maxEditDist int) ([]diffOp, error) {
+	n, m := len(a), len(b)
+	limit := n + m
+	if limit > maxEditDist {
+		limit = maxEditDist
+	}
+	size := 2*limit + 3
+	offset := limit + 1
+	v := make([]int, size)
+	var trace [][]int
+	foundD := -1
+	for d := 0; d <= limit; d++ {
+		if d&31 == 0 {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+		}
+		for k := -d; k <= d; k += 2 {
+			var x int
+			if k == -d || (k != d && v[offset+k-1] < v[offset+k+1]) {
+				x = v[offset+k+1]
+			} else {
+				x = v[offset+k-1] + 1
+			}
+			y := x - k
+			for x < n && y < m && a[x] == b[y] {
+				x++
+				y++
+			}
+			v[offset+k] = x
+			if x == n && y == m {
+				snap := make([]int, size)
+				copy(snap, v)
+				trace = append(trace, snap)
+				foundD = d
+				break
+			}
+		}
+		if foundD >= 0 {
+			break
+		}
+		snap := make([]int, size)
+		copy(snap, v)
+		trace = append(trace, snap)
+	}
+	if foundD < 0 {
+		ops := make([]diffOp, 0, n+m)
+		for i := 0; i < n; i++ {
+			ops = append(ops, diffOp{'-', a[i]})
+		}
+		for j := 0; j < m; j++ {
+			ops = append(ops, diffOp{'+', b[j]})
+		}
+		return ops, nil
+	}
+	x, y := n, m
+	rev := make([]diffOp, 0, n+m)
+	for d := foundD; d > 0; d-- {
+		prevV := trace[d-1]
+		k := x - y
+		var prevK int
+		if k == -d || (k != d && prevV[offset+k-1] < prevV[offset+k+1]) {
+			prevK = k + 1
+		} else {
+			prevK = k - 1
+		}
+		prevX := prevV[offset+prevK]
+		prevY := prevX - prevK
+		for x > prevX && y > prevY {
+			rev = append(rev, diffOp{'=', a[x-1]})
+			x--
+			y--
+		}
+		if x == prevX {
+			rev = append(rev, diffOp{'+', b[y-1]})
+			y--
+		} else {
+			rev = append(rev, diffOp{'-', a[x-1]})
+			x--
+		}
+	}
+	for x > 0 && y > 0 {
+		rev = append(rev, diffOp{'=', a[x-1]})
+		x--
+		y--
+	}
+	slices.Reverse(rev)
+	return rev, nil
 }
 
 func emitUnified(hc interp.HandlerContext, files []string, a, b []string, ops []diffOp, labels []string) {
@@ -4400,7 +4974,45 @@ func cmdCmp(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) error {
+func readStreamChunk(ctx context.Context, r io.Reader, buf []byte) (int, error) {
+	total := 0
+	for total < len(buf) {
+		if err := ctx.Err(); err != nil {
+			return total, err
+		}
+		n, err := r.Read(buf[total:])
+		total += n
+		if err == io.EOF {
+			return total, io.EOF
+		}
+		if err != nil {
+			return total, err
+		}
+	}
+	return total, nil
+}
+
+func discardStreamBytes(ctx context.Context, r io.Reader, skip uint64) (uint64, error) {
+	var discarded uint64
+	var scratch [32 * 1024]byte
+	for discarded < skip {
+		if err := ctx.Err(); err != nil {
+			return discarded, err
+		}
+		want := skip - discarded
+		if want > uint64(len(scratch)) {
+			want = uint64(len(scratch))
+		}
+		n, err := r.Read(scratch[:want])
+		discarded += uint64(n)
+		if err != nil {
+			return discarded, err
+		}
+	}
+	return discarded, nil
+}
+
+func cmdHexdump(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("hexdump", hc.Stderr)
 	canonical := fs.Bool("C", false, "")
 	verbose := fs.Bool("v", false, "")
@@ -4411,7 +5023,6 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 		return err
 	}
 	_ = verbose // -v: no line suppression in our output anyway; accept for parity.
-	_ = format  // -e custom formats: accepted; raw format string echoed? no — GNU applies it; we apply simple %02x passthrough below
 	readers, _, closeAll, err := openInputs(hc.Dir, fs.Args(), hc.Stdin)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "hexdump:", err)
@@ -4439,94 +5050,100 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 			return exitError{1}
 		}
 	}
+	var chunkBuf [16]byte
 	for _, r := range readers {
-		data, err := io.ReadAll(r)
-		if err != nil {
+		if err := ctx.Err(); err != nil {
 			return err
 		}
 		if *skip > 0 {
-			if uint64(len(data)) <= *skip {
+			got, derr := discardStreamBytes(ctx, r, *skip)
+			if derr != nil && derr != io.EOF {
+				return derr
+			}
+			var one [1]byte
+			n1, rerr := readStreamChunk(ctx, r, one[:])
+			if rerr != nil && rerr != io.EOF {
+				return rerr
+			}
+			if got < *skip || n1 == 0 {
 				fmt.Fprintln(hc.Stderr, "hexdump: stdin: Illegal seek")
 				hexCode = 1
 				continue
 			}
-			data = data[*skip:]
 			off += *skip
+			r = io.MultiReader(bytes.NewReader(one[:1]), r)
 		}
-		if *limit > 0 && uint64(len(data)) > *limit {
-			data = data[:*limit]
+		if *limit > 0 {
+			r = io.LimitReader(r, int64(*limit))
 		}
 		if *format != "" {
-			// GNU -e 'FORMAT': apply the format string. The common shape is
-			//   N/ITER "FMT"   e.g. 16/1 "%c"  or  1/1 "%02x "
-			// N bytes per line, ITER repetitions, then the printf format.
-			// A bare "FMT" applies once per byte.
-			applyHexdumpFormat(hc, data, *format)
-			off += uint64(len(data))
+			if err := applyHexdumpFormatStream(ctx, hc, r, *format, &off); err != nil {
+				return err
+			}
 			continue
 		}
-		if !*canonical {
-			for i := 0; i < len(data); i += 16 {
-				end := i + 16
-				if end > len(data) {
-					end = len(data)
-				}
-				chunk := data[i:end]
+		for {
+			n, rerr := readStreamChunk(ctx, r, chunkBuf[:])
+			if n > 0 {
+				chunk := chunkBuf[:n]
 				var sb strings.Builder
-				fmt.Fprintf(&sb, "%07o", off+uint64(i))
-				for j := 0; j < 16; j += 2 {
-					if j+1 < len(chunk) {
-						fmt.Fprintf(&sb, " %02x%02x", chunk[j+1], chunk[j])
-					} else if j < len(chunk) {
-						fmt.Fprintf(&sb, "   %02x", chunk[j])
-					} else {
-						sb.WriteString("     ")
+				if !*canonical {
+					fmt.Fprintf(&sb, "%07o", off)
+					for j := 0; j < 16; j += 2 {
+						if j+1 < len(chunk) {
+							fmt.Fprintf(&sb, " %02x%02x", chunk[j+1], chunk[j])
+						} else if j < len(chunk) {
+							fmt.Fprintf(&sb, "   %02x", chunk[j])
+						} else {
+							sb.WriteString("     ")
+						}
 					}
-				}
-				fmt.Fprintln(hc.Stdout, sb.String())
-			}
-			off += uint64(len(data))
-			continue
-		}
-		for i := 0; i < len(data); i += 16 {
-			end := i + 16
-			if end > len(data) {
-				end = len(data)
-			}
-			chunk := data[i:end]
-			fmt.Fprintf(hc.Stdout, "%08x  ", off+uint64(i))
-			for j := 0; j < 16; j++ {
-				if j < len(chunk) {
-					fmt.Fprintf(hc.Stdout, "%02x ", chunk[j])
 				} else {
-					fmt.Fprint(hc.Stdout, "   ")
-				}
-				if j == 7 {
-					fmt.Fprint(hc.Stdout, " ")
-				}
-			}
-			if *canonical {
-				fmt.Fprint(hc.Stdout, " |")
-				for _, b := range chunk {
-					if b >= 32 && b < 127 {
-						fmt.Fprintf(hc.Stdout, "%c", b)
-					} else {
-						fmt.Fprint(hc.Stdout, ".")
+					fmt.Fprintf(&sb, "%08x  ", off)
+					for j := 0; j < 16; j++ {
+						if j < len(chunk) {
+							fmt.Fprintf(&sb, "%02x ", chunk[j])
+						} else {
+							sb.WriteString("   ")
+						}
+						if j == 7 {
+							sb.WriteByte(' ')
+						}
 					}
+					sb.WriteString(" |")
+					for _, b := range chunk {
+						if b >= 32 && b < 127 {
+							sb.WriteByte(b)
+						} else {
+							sb.WriteByte('.')
+						}
+					}
+					sb.WriteByte('|')
 				}
-				fmt.Fprint(hc.Stdout, "|")
+				if _, werr := fmt.Fprintln(hc.Stdout, sb.String()); werr != nil {
+					return werr
+				}
+				off += uint64(n)
 			}
-			fmt.Fprintln(hc.Stdout)
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return rerr
+			}
 		}
-		off += uint64(len(data))
 	}
 	// GNU hexdump prints no final offset for empty input — nor any
 	// offset at all when -e custom formats are used.
 	if off > 0 && *format == "" {
+		var werr error
 		if *canonical {
-			fmt.Fprintf(hc.Stdout, "%08x\n", off)
+			_, werr = fmt.Fprintf(hc.Stdout, "%08x\n", off)
 		} else {
-			fmt.Fprintf(hc.Stdout, "%07o\n", off)
+			_, werr = fmt.Fprintf(hc.Stdout, "%07o\n", off)
+		}
+		if werr != nil {
+			return werr
 		}
 	}
 	if hexCode != 0 {
@@ -4535,7 +5152,7 @@ func cmdHexdump(_ context.Context, hc interp.HandlerContext, args []string) erro
 	return nil
 }
 
-func cmdStrings(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdStrings(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("strings", hc.Stderr)
 	minLen := fs.Uint64("n", 4, "")
 	offsetFmt := fs.String("t", "", "")
@@ -4562,34 +5179,52 @@ func cmdStrings(_ context.Context, hc interp.HandlerContext, args []string) erro
 		return exitError{1}
 	}
 	defer closeAll()
+	buf := make([]byte, 64*1024)
 	for _, r := range readers {
-		data, err := io.ReadAll(r)
-		if err != nil {
-			return err
-		}
 		var cur []byte
 		curOff := 0
-		flush := func() {
+		pos := 0
+		flush := func() error {
 			if uint64(len(cur)) >= *minLen {
+				var werr error
 				if showOff != "" {
-					fmt.Fprintf(hc.Stdout, "%s %s\n", formatOffset(curOff, showOff), string(cur))
+					_, werr = fmt.Fprintf(hc.Stdout, "%s %s\n", formatOffset(curOff, showOff), string(cur))
 				} else {
-					fmt.Fprintln(hc.Stdout, string(cur))
+					_, werr = fmt.Fprintln(hc.Stdout, string(cur))
 				}
+				cur = nil
+				return werr
 			}
 			cur = nil
+			return nil
 		}
-		for k, b := range data {
-			if b >= 32 && b < 127 || b == '\t' {
-				if cur == nil {
-					curOff = k
+		for {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			n, rerr := r.Read(buf)
+			for i := 0; i < n; i++ {
+				b := buf[i]
+				if (b >= 32 && b < 127) || b == '\t' {
+					if cur == nil {
+						curOff = pos
+					}
+					cur = append(cur, b)
+				} else if werr := flush(); werr != nil {
+					return werr
 				}
-				cur = append(cur, b)
-			} else {
-				flush()
+				pos++
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				return rerr
 			}
 		}
-		flush()
+		if werr := flush(); werr != nil {
+			return werr
+		}
 	}
 	return nil
 }
@@ -4739,7 +5374,7 @@ func splitSuffixDefault(n int) string {
 // common "N/ITER \"FMT\"" shape: N bytes per line, ITER repetitions of
 // the printf format. A bare quoted format applies once per byte. This
 // covers the idioms used in practice (16/1 "%02x ", 16/1 "%c", etc.).
-func applyHexdumpFormat(hc interp.HandlerContext, data []byte, format string) {
+func applyHexdumpFormatStream(ctx context.Context, hc interp.HandlerContext, r io.Reader, format string, off *uint64) error {
 	perLine, iter, f := parseHexdumpFormat(format)
 	if f == "" {
 		f = "%02x "
@@ -4750,19 +5385,22 @@ func applyHexdumpFormat(hc interp.HandlerContext, data []byte, format string) {
 	if iter <= 0 {
 		iter = 1
 	}
-	// A format that consumes one byte per iteration (like %c or %02x)
-	// repeats ITER times per line; the total bytes shown per line is the
-	// product only when the format consumes one byte.
-	for i := 0; i < len(data); i += perLine {
-		end := i + perLine
-		if end > len(data) {
-			end = len(data)
+	buf := make([]byte, perLine)
+	for {
+		n, rerr := readStreamChunk(ctx, r, buf)
+		if n > 0 {
+			for j := 0; j < n; j++ {
+				if _, werr := fmt.Fprintf(hc.Stdout, f, buf[j]); werr != nil {
+					return werr
+				}
+			}
+			*off += uint64(n)
 		}
-		for j := i; j < end; j++ {
-			fmt.Fprintf(hc.Stdout, f, data[j])
+		if rerr == io.EOF {
+			return nil
 		}
-		if end == len(data) {
-			break
+		if rerr != nil {
+			return rerr
 		}
 	}
 }

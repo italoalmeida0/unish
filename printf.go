@@ -84,23 +84,39 @@ func parsePrintfSpecs(format string) []printfSpec {
 		}
 		var sp printfSpec
 		for i < len(format) && strings.IndexByte("-+ #0", format[i]) >= 0 {
-			sp.flags += string(format[i])
+			if strings.IndexByte(sp.flags, format[i]) < 0 {
+				sp.flags += string(format[i])
+			}
 			i++
 		}
-		if i < len(format) && (format[i] == '*' || (format[i] >= '0' && format[i] <= '9')) {
-			start := i
-			for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
+		if i < len(format) {
+			if format[i] == '*' {
+				sp.width = "*"
 				i++
+			} else if format[i] >= '0' && format[i] <= '9' {
+				start := i
+				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
+				sp.width = format[start:i]
 			}
-			sp.width = format[start:i]
 		}
 		if i < len(format) && format[i] == '.' {
 			i++
-			start := i
-			for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
+			if i < len(format) && format[i] == '*' {
+				sp.prec = "*"
 				i++
+			} else {
+				start := i
+				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
+				if i == start {
+					sp.prec = "0"
+				} else {
+					sp.prec = format[start:i]
+				}
 			}
-			sp.prec = format[start:i]
 		}
 		if i < len(format) {
 			sp.verb = format[i]
@@ -189,13 +205,23 @@ func buildPrintfTemplate(format string) *printfTemplate {
 		for i < len(format) && strings.IndexByte("-+ #0", format[i]) >= 0 {
 			i++
 		}
-		for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
-			i++
+		if i < len(format) {
+			if format[i] == '*' {
+				i++
+			} else {
+				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
+			}
 		}
 		if i < len(format) && format[i] == '.' {
 			i++
-			for i < len(format) && ((format[i] >= '0' && format[i] <= '9') || format[i] == '*') {
+			if i < len(format) && format[i] == '*' {
 				i++
+			} else {
+				for i < len(format) && format[i] >= '0' && format[i] <= '9' {
+					i++
+				}
 			}
 		}
 		if i < len(format) {
@@ -231,10 +257,51 @@ func (t *printfTemplate) render(operands []string) (string, []string) {
 			// Resolve * width/precision from operands.
 			width, prec, flags := sp.width, sp.prec, sp.flags
 			if nd.wStar {
-				width, _, ai = nextOperand(operands, ai)
+				var wArg string
+				var wOK bool
+				wArg, wOK, ai = nextOperand(operands, ai)
+				if wOK {
+					wv, wWarn := printfIntArg(wArg)
+					if wWarn != "" {
+						warnings = append(warnings, wWarn)
+					}
+					if wv < 0 {
+						if strings.IndexByte(flags, '-') < 0 {
+							flags += "-"
+						}
+						var absW uint64
+						if wv == -1<<63 {
+							absW = 1 << 63
+						} else {
+							absW = uint64(-wv)
+						}
+						width = strconv.FormatUint(absW, 10)
+					} else if wv == 0 {
+						width = ""
+					} else {
+						width = strconv.FormatInt(wv, 10)
+					}
+				} else {
+					width = ""
+				}
 			}
 			if nd.pStar {
-				prec, _, ai = nextOperand(operands, ai)
+				var pArg string
+				var pOK bool
+				pArg, pOK, ai = nextOperand(operands, ai)
+				if pOK {
+					pv, pWarn := printfIntArg(pArg)
+					if pWarn != "" {
+						warnings = append(warnings, pWarn)
+					}
+					if pv < 0 {
+						prec = ""
+					} else {
+						prec = strconv.FormatInt(pv, 10)
+					}
+				} else {
+					prec = "0"
+				}
 			}
 			arg := ""
 			argOK := true
@@ -482,7 +549,7 @@ func printfQuote(s string) string {
 // applyStrFormat implements %s width/precision (precision truncates).
 func applyStrFormat(flags, width, prec, s string) string {
 	if prec != "" && prec != "*" {
-		if n, err := strconv.Atoi(prec); err == nil && n < len(s) {
+		if n, err := strconv.Atoi(prec); err == nil && n >= 0 && n < len(s) {
 			s = s[:n]
 		}
 	}
@@ -605,7 +672,7 @@ func formatCFloat(kind byte, flags, width, prec string, upper bool, f float64) s
 	_ = kind
 	p := 6
 	if prec != "" {
-		if n, err := strconv.Atoi(prec); err == nil {
+		if n, err := strconv.Atoi(prec); err == nil && n >= 0 {
 			p = n
 		}
 	}
