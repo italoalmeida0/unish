@@ -8,9 +8,11 @@ package interp
 import (
 	"context"
 	"errors"
+	"os"
 	"os/user"
 	"strconv"
 	"syscall"
+	"time"
 
 	"golang.org/x/sys/unix"
 	"mvdan.cc/sh/v3/syntax"
@@ -18,6 +20,38 @@ import (
 
 func mkfifo(path string, mode uint32) error {
 	return unix.Mkfifo(path, mode)
+}
+
+func unblockAbandonedFIFO(path string, subshellFlag int, subshellOpenDone <-chan struct{}) {
+	if subshellFlag == os.O_WRONLY {
+		f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+		if err != nil {
+			return
+		}
+		select {
+		case <-subshellOpenDone:
+		case <-time.After(2 * time.Second):
+		}
+		_ = f.Close()
+		return
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		f, err := os.OpenFile(path, os.O_WRONLY|syscall.O_NONBLOCK, 0)
+		if err == nil {
+			_ = f.Close()
+			return
+		}
+		select {
+		case <-subshellOpenDone:
+			return
+		default:
+		}
+		if time.Now().After(deadline) {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
 }
 
 // defaultAccess is similar to checking the permission bits from [io/fs.FileInfo],

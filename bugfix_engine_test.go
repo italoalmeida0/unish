@@ -46,7 +46,7 @@ func engineTestBinary(t *testing.T) string {
 		if runtime.GOOS == "windows" {
 			bin += ".exe"
 		}
-		cmd := exec.Command("go", "build", "-mod=vendor", "-o", bin, ".")
+		cmd := exec.Command("go", "build", "-buildvcs=false", "-mod=vendor", "-o", bin, ".")
 		if out, err := cmd.CombinedOutput(); err != nil {
 			engineBinErr = &os.PathError{Op: "go build", Path: string(out), Err: err}
 			return
@@ -407,7 +407,7 @@ func TestBugfixEngine_JobsStableIDsWaitCodeAndFastEmpty(t *testing.T) {
 	}
 
 	// Part B: job 1 finishes and is swept while job 2 is still running -> %2 must still resolve to job 2.
-	c1 := exec.Command(bin, "-c", "true")
+	c1 := exec.Command(bin, "-c", "sleep 10")
 	if err := c1.Start(); err != nil {
 		t.Fatalf("start c1: %v", err)
 	}
@@ -415,16 +415,21 @@ func TestBugfixEngine_JobsStableIDsWaitCodeAndFastEmpty(t *testing.T) {
 
 	c2 := exec.Command(bin, "-c", "sleep 10")
 	if err := c2.Start(); err != nil {
-		j1.proc.Kill()
+		_ = j1.proc.Kill()
+		<-j1.done
+		globalJobs.sweep(0)
 		t.Fatalf("start c2: %v", err)
 	}
 	j2 := globalJobs.track(c2, []string{"job_two"})
 	defer func() {
+		_ = j1.proc.Kill()
+		<-j1.done
 		_ = j2.proc.Kill()
 		<-j2.done
 		globalJobs.sweep(0)
 	}()
 
+	_ = j1.proc.Kill()
 	<-j1.done
 	globalJobs.sweep(0)
 

@@ -59,3 +59,7 @@ func killProc(proc *os.Process, sig string) error {
 func signalExitCode(ee *exec.ExitError) int {
 	return -1
 }
+
+func defaultSelfExitCode(sig string) int {
+	return 0
+}

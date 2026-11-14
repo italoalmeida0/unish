@@ -580,7 +580,15 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 				if p2, err := os.FindProcess(os.Getpid()); err == nil {
 					if err := killProc(p2, sig); err != nil {
 						code = 1
+						continue
 					}
+				}
+				// On Unix, Go's runtime installs handlers with _SigNotify (without
+				// _SigKill) for signals such as SIGUSR1/SIGUSR2/SIGALRM, and main.go
+				// catches SIGINT/SIGTERM/SIGHUP/SIGQUIT asynchronously. Exit with the
+				// POSIX 128+signum status immediately for default-terminating signals.
+				if ec := defaultSelfExitCode(sig); ec > 0 {
+					os.Exit(ec)
 				}
 			}
 			continue

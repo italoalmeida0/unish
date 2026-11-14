@@ -687,16 +687,61 @@ func DefaultProcSubstHandler() ProcSubstHandlerFunc {
 				return nil, fmt.Errorf("giving up at creating fifo: %v", err)
 			}
 		}
+		var (
+			mu               sync.Mutex
+			abandoned        bool
+			consumerOpened   bool
+			subshellOpened   bool
+			subshellOpenDone = make(chan struct{})
+		)
 		return &ProcSubstFile{
 			Path: path,
 			OpenSubshell: func(ctx context.Context) (io.ReadWriteCloser, error) {
-				// Blocks until the consumer opens the other end.
-				return os.OpenFile(path, flag, 0)
+				defer close(subshellOpenDone)
+				mu.Lock()
+				if abandoned {
+					mu.Unlock()
+					return os.OpenFile(os.DevNull, flag, 0)
+				}
+				mu.Unlock()
+				// Blocks until the consumer opens the other end (or StmtDone
+				// unblocks an unconsumed FIFO).
+				f, err := os.OpenFile(path, flag, 0)
+				if err == nil {
+					mu.Lock()
+					subshellOpened = true
+					mu.Unlock()
+				}
+				return f, err
 			},
 			OpenConsumer: func(ctx context.Context, flag int) (io.ReadWriteCloser, error) {
+				mu.Lock()
+				consumerOpened = true
+				mu.Unlock()
 				// A named pipe can only be opened via [os.OpenFile];
 				// a custom [OpenHandlerFunc] would not work with it.
 				return os.OpenFile(path, flag, 0)
+			},
+			StmtDone: func() {
+				mu.Lock()
+				if consumerOpened || subshellOpened {
+					mu.Unlock()
+					return
+				}
+				mu.Unlock()
+				select {
+				case <-subshellOpenDone:
+					return
+				case <-time.After(2 * time.Millisecond):
+				}
+				mu.Lock()
+				if consumerOpened || subshellOpened {
+					mu.Unlock()
+					return
+				}
+				abandoned = true
+				mu.Unlock()
+				unblockAbandonedFIFO(path, flag, subshellOpenDone)
 			},
 			Cleanup: func() error { return os.Remove(path) },
 		}, nil

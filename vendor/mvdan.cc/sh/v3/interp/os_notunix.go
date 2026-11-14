@@ -16,6 +16,8 @@ func mkfifo(path string, mode uint32) error {
 	return fmt.Errorf("unsupported")
 }
 
+func unblockAbandonedFIFO(path string, subshellFlag int, subshellOpenDone <-chan struct{}) {}
+
 // defaultAccess attempts to emulate access(2) on Windows.
 // Windows seems to have a different system of permissions than Unix,
 // so for now just rely on what [io/fs.FileInfo] gives us

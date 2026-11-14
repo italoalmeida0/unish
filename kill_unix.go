@@ -5,6 +5,7 @@ package main
 import (
 	"os"
 	"os/exec"
+	"strconv"
 	"syscall"
 )
 
@@ -60,4 +61,43 @@ func signalExitCode(ee *exec.ExitError) int {
 		return 128 + int(st.Signal())
 	}
 	return -1
+}
+
+func defaultSelfExitCode(sig string) int {
+	s, ok := map[string]syscall.Signal{
+		"HUP":    syscall.SIGHUP,
+		"INT":    syscall.SIGINT,
+		"QUIT":   syscall.SIGQUIT,
+		"ILL":    syscall.SIGILL,
+		"TRAP":   syscall.SIGTRAP,
+		"ABRT":   syscall.SIGABRT,
+		"IOT":    syscall.SIGABRT,
+		"BUS":    syscall.SIGBUS,
+		"FPE":    syscall.SIGFPE,
+		"KILL":   syscall.SIGKILL,
+		"USR1":   syscall.SIGUSR1,
+		"SEGV":   syscall.SIGSEGV,
+		"USR2":   syscall.SIGUSR2,
+		"PIPE":   syscall.SIGPIPE,
+		"ALRM":   syscall.SIGALRM,
+		"TERM":   syscall.SIGTERM,
+		"XCPU":   syscall.SIGXCPU,
+		"XFSZ":   syscall.SIGXFSZ,
+		"VTALRM": syscall.SIGVTALRM,
+		"PROF":   syscall.SIGPROF,
+		"SYS":    syscall.SIGSYS,
+	}[sig]
+	if ok {
+		return 128 + int(s)
+	}
+	if n, err := strconv.Atoi(sig); err == nil && n > 0 {
+		switch syscall.Signal(n) {
+		case syscall.SIGCHLD, syscall.SIGCONT, syscall.SIGURG, syscall.SIGWINCH, syscall.SIGIO,
+			syscall.SIGSTOP, syscall.SIGTSTP, syscall.SIGTTIN, syscall.SIGTTOU:
+			return 0
+		default:
+			return 128 + n
+		}
+	}
+	return 0
 }
