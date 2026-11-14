@@ -3,6 +3,7 @@ package unish
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -122,8 +123,11 @@ func cmdPatch(ctx context.Context, hc interp.HandlerContext, args []string) erro
 
 	baseDir := hc.Dir
 	if opts.workDir != "" {
-		baseDir = resolve(hc.Dir, opts.workDir)
-		fi, serr := os.Stat(baseDir)
+		if _, cerr := checkChdir(ctx, hc.Dir, "patch", opts.workDir); cerr != nil {
+			fmt.Fprintf(hc.Stderr, "patch: **** Can't change to directory %s : %v\n", opts.workDir, cerr)
+			return exitError{2}
+		}
+		fi, serr := fsStat(ctx, hc.Dir, "patch", opts.workDir)
 		if serr != nil || !fi.IsDir() {
 			if serr != nil {
 				fmt.Fprintf(hc.Stderr, "patch: **** Can't change to directory %s : %v\n", opts.workDir, serr)
@@ -132,6 +136,7 @@ func cmdPatch(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			}
 			return exitError{2}
 		}
+		baseDir = resolveHostPath(hc.Dir, opts.workDir)
 	}
 
 	// Read patch input (stdin by default, or -i / positional patchfile).
@@ -145,18 +150,24 @@ func cmdPatch(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			fmt.Fprintf(hc.Stderr, "patch: **** read error: %v\n", err)
 			return exitError{2}
 		}
-	} else if isToolDevNull(opts.inputFile) {
+	} else if isNullDevPath(opts.inputFile) || isToolDevNull(opts.inputFile) {
 		patchData = nil
 	} else {
-		pPath := resolve(baseDir, opts.inputFile)
-		if _, serr := os.Stat(pPath); serr != nil && opts.workDir != "" {
-			if alt := resolve(hc.Dir, opts.inputFile); alt != pPath {
-				if _, serr2 := os.Stat(alt); serr2 == nil {
-					pPath = alt
+		pDir := baseDir
+		if !isActiveProcSubstPath(opts.inputFile) && opts.workDir != "" {
+			if _, serr := fsStat(ctx, baseDir, "patch", opts.inputFile); serr != nil {
+				if errors.Is(serr, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "patch: **** Can't open patch file %s : %v\n", opts.inputFile, serr)
+					return exitError{2}
+				}
+				if resolveHostPath(hc.Dir, opts.inputFile) != resolveHostPath(baseDir, opts.inputFile) {
+					if _, serr2 := fsStat(ctx, hc.Dir, "patch", opts.inputFile); serr2 == nil {
+						pDir = hc.Dir
+					}
 				}
 			}
 		}
-		patchData, err = readShellFile(pPath)
+		patchData, err = fsReadShellFile(ctx, pDir, "patch", opts.inputFile)
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "patch: **** Can't open patch file %s : %v\n", opts.inputFile, err)
 			return exitError{2}
@@ -187,13 +198,13 @@ func cmdPatch(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			fp = reverseFilePatch(fp)
 		}
 
-		displayRel, targetAbs, rerr := resolvePatchTarget(&fp, origTargetArg, baseDir, opts.strip)
+		displayRel, targetRaw, rerr := resolvePatchTarget(ctx, &fp, origTargetArg, baseDir, opts.strip)
 		if rerr != nil {
 			fmt.Fprintf(hc.Stderr, "patch: **** %v\n", rerr)
 			return exitError{2}
 		}
 
-		st, aerr := applySingleFilePatch(ctx, hc, &fp, displayRel, targetAbs, baseDir, &opts)
+		st, aerr := applySingleFilePatch(ctx, hc, &fp, displayRel, targetRaw, baseDir, &opts)
 		if aerr != nil {
 			if isPipeClosed(aerr) {
 				return aerr
@@ -645,9 +656,9 @@ func stripPatchPath(raw string, strip int) (string, bool) {
 	return s[pos:], true
 }
 
-func resolvePatchTarget(fp *filePatch, explicitTarget, baseDir string, strip int) (displayRel, targetAbs string, err error) {
+func resolvePatchTarget(ctx context.Context, fp *filePatch, explicitTarget, baseDir string, strip int) (displayRel, targetRaw string, err error) {
 	if explicitTarget != "" {
-		return explicitTarget, resolve(baseDir, explicitTarget), nil
+		return explicitTarget, explicitTarget, nil
 	}
 
 	candidates := []string{}
@@ -677,14 +688,15 @@ func resolvePatchTarget(fp *filePatch, explicitTarget, baseDir string, strip int
 			return "", "", fmt.Errorf("can't find file to patch (unable to strip %d path components from %q / %q)", strip, fp.oldPath, fp.newPath)
 		}
 		for _, sp := range stripped {
-			abs := resolve(baseDir, sp)
-			if _, serr := os.Stat(abs); serr == nil {
-				return sp, abs, nil
+			if _, serr := fsStat(ctx, baseDir, "patch", sp); serr == nil {
+				return sp, sp, nil
+			} else if errors.Is(serr, os.ErrPermission) {
+				return "", "", serr
 			}
 		}
 		// Creation or missing target: use last (newPath) candidate
 		pick := stripped[len(stripped)-1]
-		return pick, resolve(baseDir, pick), nil
+		return pick, pick, nil
 	}
 
 	// Default when -p was NOT explicitly specified:
@@ -693,25 +705,28 @@ func resolvePatchTarget(fp *filePatch, explicitTarget, baseDir string, strip int
 	// 3. Check basename (classic POSIX/GNU patch default when -p is omitted)
 	for _, c := range candidates {
 		s := strings.ReplaceAll(c, `\`, "/")
-		abs := resolve(baseDir, s)
-		if _, serr := os.Stat(abs); serr == nil {
-			return s, abs, nil
+		if _, serr := fsStat(ctx, baseDir, "patch", s); serr == nil {
+			return s, s, nil
+		} else if errors.Is(serr, os.ErrPermission) {
+			return "", "", serr
 		}
 	}
 	for _, c := range candidates {
 		if sp, ok := stripPatchPath(c, 1); ok && sp != "/dev/null" {
-			abs := resolve(baseDir, sp)
-			if _, serr := os.Stat(abs); serr == nil {
-				return sp, abs, nil
+			if _, serr := fsStat(ctx, baseDir, "patch", sp); serr == nil {
+				return sp, sp, nil
+			} else if errors.Is(serr, os.ErrPermission) {
+				return "", "", serr
 			}
 		}
 	}
 	for _, c := range candidates {
 		base := gnuBasename(c)
 		if base != "" && base != "/" {
-			abs := resolve(baseDir, base)
-			if _, serr := os.Stat(abs); serr == nil {
-				return base, abs, nil
+			if _, serr := fsStat(ctx, baseDir, "patch", base); serr == nil {
+				return base, base, nil
+			} else if errors.Is(serr, os.ErrPermission) {
+				return "", "", serr
 			}
 		}
 	}
@@ -724,11 +739,14 @@ func resolvePatchTarget(fp *filePatch, explicitTarget, baseDir string, strip int
 		// Already basename
 	} else {
 		// If parent dir of full pick doesn't exist and strip wasn't given, GNU patch uses basename.
-		if _, serr := os.Stat(filepath.Dir(resolve(baseDir, pick))); serr != nil {
+		if _, serr := fsStat(ctx, baseDir, "patch", filepath.Dir(pick)); serr != nil {
+			if errors.Is(serr, os.ErrPermission) {
+				return "", "", serr
+			}
 			pick = gnuBasename(pick)
 		}
 	}
-	return pick, resolve(baseDir, pick), nil
+	return pick, pick, nil
 }
 
 // ---- Hunk Matching & Application ----
@@ -783,11 +801,13 @@ func applySingleFilePatch(
 	ctx context.Context,
 	hc interp.HandlerContext,
 	fp *filePatch,
-	displayRel, targetAbs, baseDir string,
+	displayRel, targetRaw, baseDir string,
 	opts *patchOptions,
 ) (int, error) {
-	_ = ctx
-	origFi, statErr := os.Stat(targetAbs)
+	origFi, statErr := fsStat(ctx, baseDir, "patch", targetRaw)
+	if statErr != nil && !os.IsNotExist(statErr) {
+		return 2, fmt.Errorf("Can't access file %s : %v", displayRel, statErr)
+	}
 	origExists := statErr == nil
 
 	var origData []byte
@@ -802,7 +822,7 @@ func applySingleFilePatch(
 		}
 		origPerm = origFi.Mode().Perm()
 		var rerr error
-		origData, rerr = os.ReadFile(targetAbs)
+		origData, rerr = fsReadFile(ctx, baseDir, "patch", targetRaw)
 		if rerr != nil {
 			return 2, fmt.Errorf("Can't read file %s : %v", displayRel, rerr)
 		}
@@ -887,7 +907,9 @@ func applySingleFilePatch(
 	if failedHunks > 0 {
 		fmt.Fprintf(hc.Stderr, "%d out of %d hunk%s FAILED\n", failedHunks, len(fp.hunks), pluralS(len(fp.hunks)))
 		if opts.rejectFile != "" && opts.rejectFile != "-" && !opts.dryRun {
-			_ = writeRejectFile(resolve(baseDir, opts.rejectFile), rejectedHunks)
+			if rerr := writeRejectFile(ctx, baseDir, opts.rejectFile, rejectedHunks); rerr != nil && errors.Is(rerr, os.ErrPermission) {
+				return 2, fmt.Errorf("can't write reject file %s: %v", opts.rejectFile, rerr)
+			}
 		}
 	}
 
@@ -911,9 +933,8 @@ func applySingleFilePatch(
 			if _, werr := hc.Stdout.Write(resultBytes); werr != nil {
 				return 2, werr
 			}
-		} else if !isToolDevNull(opts.outputFile) {
-			outAbs := resolve(baseDir, opts.outputFile)
-			if werr := atomicWriteFile(outAbs, resultBytes, origPerm); werr != nil {
+		} else if !isNullDevPath(opts.outputFile) && !isToolDevNull(opts.outputFile) {
+			if werr := fsAtomicWriteFile(ctx, baseDir, "patch", opts.outputFile, resultBytes, origPerm); werr != nil {
 				return 2, werr
 			}
 		}
@@ -925,7 +946,7 @@ func applySingleFilePatch(
 
 	// Backup original file if -b / --backup requested and original existed.
 	if opts.backup && origExists {
-		if berr := atomicWriteFile(targetAbs+".orig", origData, origPerm); berr != nil {
+		if berr := fsAtomicWriteFile(ctx, baseDir, "patch", targetRaw+".orig", origData, origPerm); berr != nil {
 			return 2, fmt.Errorf("can't create backup %s.orig: %v", displayRel, berr)
 		}
 	}
@@ -933,15 +954,18 @@ func applySingleFilePatch(
 	shouldDelete := len(resultBytes) == 0 && (fp.isDeletedFile || opts.removeEmptyFiles) && failedHunks == 0
 	if shouldDelete {
 		if origExists {
-			if runtime.GOOS == "windows" {
-				_ = os.Chmod(targetAbs, 0o666)
+			if _, derr := checkFSNoFollowLeaf(ctx, baseDir, "patch", targetRaw, OpDelete); derr != nil {
+				return 2, fmt.Errorf("can't remove file %s: %v", displayRel, derr)
 			}
-			if rerr := os.Remove(targetAbs); rerr != nil && !os.IsNotExist(rerr) {
+			if runtime.GOOS == "windows" && origFi.Mode()&0o200 == 0 {
+				_ = fsChmod(ctx, baseDir, "patch", targetRaw, 0o666)
+			}
+			if rerr := fsRemove(ctx, baseDir, "patch", targetRaw); rerr != nil && !os.IsNotExist(rerr) {
 				return 2, fmt.Errorf("can't remove file %s: %v", displayRel, rerr)
 			}
 		}
 	} else {
-		if werr := atomicWriteFile(targetAbs, resultBytes, origPerm); werr != nil {
+		if werr := fsAtomicWriteFile(ctx, baseDir, "patch", targetRaw, resultBytes, origPerm); werr != nil {
 			return 2, fmt.Errorf("can't write file %s: %v", displayRel, werr)
 		}
 	}
@@ -1129,7 +1153,7 @@ func collapseWS(s string) string {
 	return strings.Join(strings.Fields(s), " ")
 }
 
-func writeRejectFile(path string, hunks []patchHunk) error {
+func writeRejectFile(ctx context.Context, dir, rawPath string, hunks []patchHunk) error {
 	var b bytes.Buffer
 	for _, h := range hunks {
 		b.WriteString(h.header)
@@ -1140,24 +1164,42 @@ func writeRejectFile(path string, hunks []patchHunk) error {
 			b.WriteByte('\n')
 		}
 	}
-	return atomicWriteFile(path, b.Bytes(), 0o644)
+	return fsAtomicWriteFile(ctx, dir, "patch", rawPath, b.Bytes(), 0o644)
 }
 
-func atomicWriteFile(targetPath string, data []byte, perm os.FileMode) error {
-	if runtime.GOOS == "windows" && strings.EqualFold(targetPath, "NUL") || targetPath == "/dev/null" {
+func fsAtomicWriteFile(ctx context.Context, dir, cmdName, rawPath string, data []byte, perm os.FileMode) error {
+	if isNullDevPath(rawPath) || isToolDevNull(rawPath) {
 		return nil
 	}
-	// Resolve symlinks if target already exists as a symlink so atomic replace updates the link target.
-	if lfi, lerr := os.Lstat(targetPath); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
-		if resolved, rerr := filepath.EvalSymlinks(targetPath); rerr == nil {
-			targetPath = resolved
+	if pw, ok, perr := openProcSubstOut(rawPath); ok {
+		if perr != nil {
+			return perr
 		}
+		_, werr := pw.Write(data)
+		cerr := pw.Close()
+		if werr != nil {
+			return werr
+		}
+		return cerr
 	}
-	dir := filepath.Dir(targetPath)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	checkedPath, err := checkFS(ctx, dir, cmdName, rawPath, OpWrite)
+	if err != nil {
 		return err
 	}
-	tmp, err := os.CreateTemp(dir, ".unish-atomic-*")
+	targetPath := checkedPath
+	if CapabilityHookFromContext(ctx) == nil {
+		// Resolve symlinks if target already exists as a symlink so atomic replace updates the link target.
+		if lfi, lerr := os.Lstat(targetPath); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
+			if resolved, rerr := filepath.EvalSymlinks(targetPath); rerr == nil {
+				targetPath = resolved
+			}
+		}
+	}
+	parentDir := filepath.Dir(targetPath)
+	if err := fsMkdirAll(ctx, "", cmdName, parentDir, 0o755); err != nil {
+		return err
+	}
+	tmp, err := fsCreateTemp(ctx, "", cmdName, parentDir, ".unish-atomic-*")
 	if err != nil {
 		return err
 	}
@@ -1166,7 +1208,7 @@ func atomicWriteFile(targetPath string, data []byte, perm os.FileMode) error {
 	defer func() {
 		if cleanup {
 			_ = tmp.Close()
-			_ = os.Remove(tmpName)
+			_ = fsRemove(ctx, "", cmdName, tmpName)
 		}
 	}()
 
@@ -1181,16 +1223,23 @@ func atomicWriteFile(targetPath string, data []byte, perm os.FileMode) error {
 	}
 	if runtime.GOOS == "windows" {
 		// Ensure read-only destination on Windows doesn't block Rename.
-		if dfi, derr := os.Stat(targetPath); derr == nil && dfi.Mode()&0o200 == 0 {
-			_ = os.Chmod(targetPath, 0o666)
-			defer func() { _ = os.Chmod(targetPath, perm) }()
+		if dfi, derr := fsStat(ctx, "", cmdName, targetPath); derr == nil && dfi.Mode()&0o200 == 0 {
+			_ = fsChmod(ctx, "", cmdName, targetPath, 0o666)
+			defer func() { _ = fsChmod(ctx, "", cmdName, targetPath, perm) }()
 		}
 	}
-	if err := os.Rename(tmpName, targetPath); err != nil {
+	if err := fsRename(ctx, "", cmdName, tmpName, targetPath); err != nil {
+		if errors.Is(err, os.ErrPermission) {
+			// If a policy allows OpWrite on targetPath/parentDir while denying OpDelete
+			// on the ephemeral temp file, fall back to direct fsWriteFile after removing temp.
+			if werr := fsWriteFile(ctx, dir, cmdName, rawPath, data, perm); werr == nil {
+				return nil
+			}
+		}
 		return err
 	}
 	if runtime.GOOS != "windows" && perm != 0 {
-		_ = os.Chmod(targetPath, perm)
+		_ = fsChmod(ctx, "", cmdName, targetPath, perm)
 	}
 	cleanup = false
 	return nil

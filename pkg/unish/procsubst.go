@@ -74,6 +74,46 @@ func winProcSubstRemove(name string) {
 	winProcSubstRegistry.mu.Unlock()
 }
 
+// unixProcSubstRegistry tracks active POSIX FIFO paths created by procSubstHandler
+// so builtins using fsOpenShellFile/fsReadShellFile can open runtime IPC pipes
+// without tripping workspace-only CapabilityHook jails.
+var unixProcSubstRegistry = struct {
+	mu sync.Mutex
+	m  map[string]syntax.ProcOperator
+}{m: map[string]syntax.ProcOperator{}}
+
+func unixProcSubstRegister(path string, op syntax.ProcOperator) {
+	unixProcSubstRegistry.mu.Lock()
+	unixProcSubstRegistry.m[path] = op
+	unixProcSubstRegistry.mu.Unlock()
+}
+
+func unixProcSubstLookup(path string) (syntax.ProcOperator, bool) {
+	unixProcSubstRegistry.mu.Lock()
+	op, ok := unixProcSubstRegistry.m[path]
+	unixProcSubstRegistry.mu.Unlock()
+	return op, ok
+}
+
+func unixProcSubstRemove(path string) {
+	unixProcSubstRegistry.mu.Lock()
+	delete(unixProcSubstRegistry.m, path)
+	unixProcSubstRegistry.mu.Unlock()
+}
+
+// isActiveProcSubstPath reports whether rawPath is a live process-substitution
+// IPC path synthesized by procSubstHandler in this process.
+func isActiveProcSubstPath(rawPath string) bool {
+	if rawPath == "" {
+		return false
+	}
+	if winProcSubstLookup(rawPath) != nil {
+		return true
+	}
+	_, ok := unixProcSubstLookup(rawPath)
+	return ok
+}
+
 // waitProcSubstProducer blocks until the producer of a `<(cmd)` process-
 // substitution temp file finishes (no-op for ordinary paths or `>(cmd)`).
 func waitProcSubstProducer(path string) {
@@ -213,7 +253,21 @@ func (f *countedFile) Close() error {
 // and to mvdan/sh's default (FIFO-based) implementation elsewhere.
 func procSubstHandler(ctx context.Context, op syntax.ProcOperator) (*interp.ProcSubstFile, error) {
 	if runtime.GOOS != "windows" {
-		return interp.DefaultProcSubstHandler()(ctx, op)
+		psf, err := interp.DefaultProcSubstHandler()(ctx, op)
+		if err != nil || psf == nil {
+			return psf, err
+		}
+		fifoPath := psf.Path
+		unixProcSubstRegister(fifoPath, op)
+		origCleanup := psf.Cleanup
+		psf.Cleanup = func() error {
+			defer unixProcSubstRemove(fifoPath)
+			if origCleanup != nil {
+				return origCleanup()
+			}
+			return nil
+		}
+		return psf, nil
 	}
 	f, err := os.CreateTemp("", "unish-procsub-*")
 	if err != nil {
@@ -349,6 +403,64 @@ func readShellFile(path string) ([]byte, error) {
 	}
 	defer f.Close()
 	return io.ReadAll(f)
+}
+
+// fsOpenShellFile resolves rawPath against dir, enforces CapabilityHook OpRead
+// on ordinary files, and allows active `<(cmd)` runtime IPC paths created by
+// procSubstHandler even when os.TempDir() is outside the workspace jail.
+func fsOpenShellFile(ctx context.Context, dir, cmdName, rawPath string) (io.ReadWriteCloser, error) {
+	if st := winProcSubstLookup(rawPath); st != nil && st.op == syntax.CmdIn {
+		select {
+		case <-st.producerDone:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(30 * time.Second):
+		}
+		f, err := openRetry(rawPath)
+		if err != nil {
+			return nil, err
+		}
+		st.consumerOpen()
+		return &refcountedFileShim{File: f, st: st}, nil
+	}
+	if op, ok := unixProcSubstLookup(rawPath); ok && op == syntax.CmdIn {
+		return os.Open(rawPath)
+	}
+	p, err := checkFS(ctx, dir, cmdName, rawPath, OpRead)
+	if err != nil {
+		return nil, err
+	}
+	return openRetry(p)
+}
+
+// fsReadShellFile reads an input file via fsOpenShellFile, enforcing OpRead
+// on ordinary files while supporting `<(cmd)` IPC paths inside strict jails.
+func fsReadShellFile(ctx context.Context, dir, cmdName, rawPath string) ([]byte, error) {
+	f, err := fsOpenShellFile(ctx, dir, cmdName, rawPath)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	return io.ReadAll(f)
+}
+
+// openProcSubstOut opens a `>(cmd)` process-substitution output sink when
+// rawPath is an active CmdOut IPC path synthesized by procSubstHandler.
+func openProcSubstOut(rawPath string) (io.WriteCloser, bool, error) {
+	if st := winProcSubstLookup(rawPath); st != nil && st.op == syntax.CmdOut {
+		w, err := openFileRetry(rawPath, os.O_WRONLY|os.O_TRUNC, 0o600)
+		if err != nil {
+			st.finishConsumer()
+			return nil, true, err
+		}
+		st.consumerOpen()
+		return &countedFile{File: w, onClose: st.consumerWriterClose}, true, nil
+	}
+	if op, ok := unixProcSubstLookup(rawPath); ok && op == syntax.CmdOut {
+		w, err := os.OpenFile(rawPath, os.O_WRONLY, 0o600)
+		return w, true, err
+	}
+	return nil, false, nil
 }
 
 // openRetry opens a file, retrying transient Windows sharing violations

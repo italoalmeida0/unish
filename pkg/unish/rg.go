@@ -3,6 +3,7 @@ package unish
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -199,7 +200,7 @@ func cmdRg(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		} else if isToolDevNull(pf) {
 			data = nil
 		} else {
-			data, rerr = readShellFile(resolve(hc.Dir, pf))
+			data, rerr = fsReadShellFile(ctx, hc.Dir, "rg", pf)
 		}
 		if rerr != nil {
 			if !opts.noMessages {
@@ -245,10 +246,10 @@ func cmdRg(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	hasDirTarget := false
 	if !searchStdinOnly {
 		for _, t := range targets {
-			if t == "-" || t == "/dev/stdin" {
+			if t == "-" || t == "/dev/stdin" || isActiveProcSubstPath(t) {
 				continue
 			}
-			if fi, serr := os.Stat(resolve(hc.Dir, t)); serr == nil && fi.IsDir() {
+			if fi, serr := fsStat(ctx, hc.Dir, "rg", t); serr == nil && fi.IsDir() {
 				hasDirTarget = true
 				break
 			}
@@ -1003,40 +1004,43 @@ func (m *rgMatcher) replaceLine(line []byte, spans []rgMatchSpan, repl string) [
 
 // ---- .gitignore / .ignore & Glob Engine ----
 
-func loadDirIgnoreRules(dir string) []rgIgnoreRule {
+func loadDirIgnoreRules(ctx context.Context, baseDir, rawDir, absDir string) []rgIgnoreRule {
 	var rules []rgIgnoreRule
 	for _, fname := range []string{".gitignore", ".ignore", ".rgignore"} {
-		data, err := os.ReadFile(filepath.Join(dir, fname))
+		data, err := fsReadFile(ctx, baseDir, "rg", filepath.Join(rawDir, fname))
 		if err != nil {
 			continue
 		}
-		rules = append(rules, parseGitignoreBytes(dir, data)...)
+		rules = append(rules, parseGitignoreBytes(absDir, data)...)
 	}
 	return rules
 }
 
-func loadAncestorIgnoreRules(startDir string) []rgIgnoreRule {
-	abs, err := filepath.Abs(startDir)
-	if err != nil {
+func loadAncestorIgnoreRules(ctx context.Context, startDir string) []rgIgnoreRule {
+	abs := absFromDir("", startDir)
+	if abs == "" {
 		return nil
 	}
 	// Walk upward to repo root (.git), collecting ancestor directories.
 	var chain []string
 	cur := abs
 	for {
+		if _, cerr := checkFS(ctx, "", "rg", cur, OpList); cerr != nil {
+			break
+		}
 		parent := filepath.Dir(cur)
-		if _, gerr := os.Lstat(filepath.Join(cur, ".git")); gerr == nil {
+		if _, gerr := fsLstat(ctx, "", "rg", filepath.Join(cur, ".git")); gerr == nil {
 			// Include repo-level .git/info/exclude if it is a directory.
 			var all []rgIgnoreRule
-			if exData, eerr := os.ReadFile(filepath.Join(cur, ".git", "info", "exclude")); eerr == nil {
+			if exData, eerr := fsReadFile(ctx, "", "rg", filepath.Join(cur, ".git", "info", "exclude")); eerr == nil {
 				all = append(all, parseGitignoreBytes(cur, exData)...)
 			}
 			// Add rules from repo root down to parent of startDir (startDir itself is loaded on entry).
 			if cur != abs {
-				all = append(all, loadDirIgnoreRules(cur)...)
+				all = append(all, loadDirIgnoreRules(ctx, "", cur, cur)...)
 			}
 			for i := len(chain) - 1; i >= 0; i-- {
-				all = append(all, loadDirIgnoreRules(chain[i])...)
+				all = append(all, loadDirIgnoreRules(ctx, "", chain[i], chain[i])...)
 			}
 			return all
 		}
@@ -1420,6 +1424,8 @@ func matchGlobClass(p string, sr rune) (string, bool) {
 
 type rgFileJob struct {
 	idx         int
+	baseDir     string
+	rawPath     string
 	absPath     string
 	displayPath string
 	isStdin     bool
@@ -1430,6 +1436,7 @@ type rgFileResult struct {
 	idx         int
 	displayPath string
 	isStdin     bool
+	explicit    bool
 	out         []byte
 	matched     bool
 	err         error
@@ -1456,31 +1463,38 @@ func walkRgTarget(
 	opts *rgOptions,
 	target string,
 	typeInc, typeExc []string,
-	emit func(absPath, displayPath string, isStdin, explicit bool) bool,
+	emit func(rawPath, absPath, displayPath string, isStdin, explicit bool) bool,
 	hadErr *atomic.Bool,
 ) {
 	if ctx.Err() != nil {
 		return
 	}
 	if target == "-" || target == "/dev/stdin" {
-		emit("", "<stdin>", true, true)
+		emit("", "", "<stdin>", true, true)
 		return
 	}
 	if isToolDevNull(target) {
-		emit(os.DevNull, filepath.ToSlash(target), false, true)
+		emit(target, os.DevNull, filepath.ToSlash(target), false, true)
 		return
 	}
-	full := resolve(hc.Dir, target)
+	if isActiveProcSubstPath(target) {
+		emit(target, target, filepath.ToSlash(target), false, true)
+		return
+	}
+	full := resolveHostPath(hc.Dir, target)
 	var fi os.FileInfo
 	var err error
 	if opts.followSymlinks {
-		fi, err = os.Stat(full)
+		fi, err = fsStat(ctx, hc.Dir, "rg", target)
 	} else {
-		fi, err = os.Lstat(full)
+		fi, err = fsLstat(ctx, hc.Dir, "rg", target)
 		if err == nil && fi.Mode()&os.ModeSymlink != 0 {
 			// Explicit symlink on CLI: follow like ripgrep!
-			if sfi, serr := os.Stat(full); serr == nil {
+			sfi, serr := fsStat(ctx, hc.Dir, "rg", target)
+			if serr == nil {
 				fi = sfi
+			} else if errors.Is(serr, os.ErrPermission) {
+				err = serr
 			}
 		}
 	}
@@ -1495,21 +1509,28 @@ func walkRgTarget(
 	disp := filepath.ToSlash(target)
 	if !fi.IsDir() {
 		// Explicit file target on CLI bypasses .gitignore/hidden, just like real ripgrep!
-		emit(full, disp, false, true)
+		if opts.filesMode {
+			if _, cerr := checkFS(ctx, hc.Dir, "rg", target, OpRead); cerr != nil {
+				hadErr.Store(true)
+				if !opts.noMessages {
+					fmt.Fprintf(hc.Stderr, "rg: %s: %v\n", target, cerr)
+				}
+				return
+			}
+		}
+		emit(target, full, disp, false, true)
 		return
 	}
 
-	absRoot, err := filepath.Abs(full)
-	if err != nil {
-		absRoot = full
-	}
+	absRoot := absFromDir(hc.Dir, target)
+	hookActive := CapabilityHookFromContext(ctx) != nil
 	var baseRules []rgIgnoreRule
 	if !opts.noIgnore {
-		baseRules = loadAncestorIgnoreRules(absRoot)
+		baseRules = loadAncestorIgnoreRules(ctx, absRoot)
 	}
 
-	var walkDir func(absDir, dispDir, relRoot string, depth int, rules []rgIgnoreRule) bool
-	walkDir = func(absDir, dispDir, relRoot string, depth int, rules []rgIgnoreRule) bool {
+	var walkDir func(absDir, rawDir, dispDir, relRoot string, depth int, rules []rgIgnoreRule) bool
+	walkDir = func(absDir, rawDir, dispDir, relRoot string, depth int, rules []rgIgnoreRule) bool {
 		if ctx.Err() != nil {
 			return false
 		}
@@ -1517,7 +1538,7 @@ func walkRgTarget(
 			return true
 		}
 		if !opts.noIgnore {
-			dirRules := loadDirIgnoreRules(absDir)
+			dirRules := loadDirIgnoreRules(ctx, hc.Dir, rawDir, absDir)
 			if len(dirRules) > 0 {
 				nextRules := make([]rgIgnoreRule, len(rules)+len(dirRules))
 				copy(nextRules, rules)
@@ -1526,9 +1547,11 @@ func walkRgTarget(
 			}
 		}
 
-		entries, rerr := os.ReadDir(absDir)
+		entries, rerr := fsReadDir(ctx, hc.Dir, "rg", rawDir)
 		if rerr != nil {
-			hadErr.Store(true)
+			if depth == 1 || !(hookActive && errors.Is(rerr, os.ErrPermission)) {
+				hadErr.Store(true)
+			}
 			if !opts.noMessages {
 				fmt.Fprintf(hc.Stderr, "rg: %s: %v\n", dispDir, rerr)
 			}
@@ -1550,6 +1573,9 @@ func walkRgTarget(
 				}
 			}
 
+			childRaw := filepath.Join(rawDir, name)
+			childDisp := formatRgChildDisplay(dispDir, name)
+
 			typ := e.Type()
 			isSymlink := typ&os.ModeSymlink != 0
 			isDir := e.IsDir()
@@ -1557,8 +1583,11 @@ func walkRgTarget(
 				if !opts.followSymlinks {
 					continue
 				}
-				sfi, serr := os.Stat(filepath.Join(absDir, name))
+				sfi, serr := fsStat(ctx, hc.Dir, "rg", childRaw)
 				if serr != nil {
+					if hookActive && errors.Is(serr, os.ErrPermission) && !opts.noMessages {
+						fmt.Fprintf(hc.Stderr, "rg: %s: %v\n", childDisp, serr)
+					}
 					continue
 				}
 				isDir = sfi.IsDir()
@@ -1580,10 +1609,9 @@ func walkRgTarget(
 				continue
 			}
 
-			childDisp := formatRgChildDisplay(dispDir, name)
 			if isDir {
 				if opts.maxDepth < 0 || depth < opts.maxDepth {
-					if !walkDir(childAbs, childDisp, childRel, depth+1, rules) {
+					if !walkDir(childAbs, childRaw, childDisp, childRel, depth+1, rules) {
 						return false
 					}
 				}
@@ -1593,7 +1621,18 @@ func walkRgTarget(
 			if !matchTypeGlobs(typeInc, typeExc, name) {
 				continue
 			}
-			if !emit(childAbs, childDisp, false, false) {
+			if hookActive {
+				if _, cerr := checkFS(ctx, hc.Dir, "rg", childRaw, OpRead); cerr != nil {
+					if !opts.noMessages {
+						fmt.Fprintf(hc.Stderr, "rg: %s: %v\n", childDisp, cerr)
+					}
+					if !errors.Is(cerr, os.ErrPermission) {
+						hadErr.Store(true)
+					}
+					continue
+				}
+			}
+			if !emit(childRaw, childAbs, childDisp, false, false) {
 				return false
 			}
 		}
@@ -1603,7 +1642,7 @@ func walkRgTarget(
 	if opts.maxDepth == 0 {
 		return
 	}
-	walkDir(absRoot, disp, "", 1, baseRules)
+	walkDir(absRoot, target, disp, "", 1, baseRules)
 }
 
 func runRgFiles(
@@ -1636,7 +1675,7 @@ func runRgFiles(
 
 	for _, t := range targets {
 		stopped := false
-		walkRgTarget(ctx, hc, opts, t, typeInc, typeExc, func(_, displayPath string, isStdin, _ bool) bool {
+		walkRgTarget(ctx, hc, opts, t, typeInc, typeExc, func(_, _, displayPath string, isStdin, _ bool) bool {
 			if isStdin {
 				return true
 			}
@@ -1732,7 +1771,7 @@ func runRgSearchTargets(
 					outCopy = append([]byte(nil), localBuf.Bytes()...)
 				}
 				select {
-				case results <- rgFileResult{idx: job.idx, out: outCopy, matched: matched, err: err}:
+				case results <- rgFileResult{idx: job.idx, explicit: job.explicit, out: outCopy, matched: matched, err: err}:
 				case <-searchCtx.Done():
 					return
 				}
@@ -1751,9 +1790,11 @@ func runRgSearchTargets(
 			if searchCtx.Err() != nil {
 				break
 			}
-			walkRgTarget(searchCtx, hc, opts, t, typeInc, typeExc, func(absPath, displayPath string, isStdin, explicit bool) bool {
+			walkRgTarget(searchCtx, hc, opts, t, typeInc, typeExc, func(rawPath, absPath, displayPath string, isStdin, explicit bool) bool {
 				job := rgFileJob{
 					idx:         idx,
+					baseDir:     hc.Dir,
+					rawPath:     rawPath,
 					absPath:     absPath,
 					displayPath: displayPath,
 					isStdin:     isStdin,
@@ -1781,11 +1822,14 @@ func runRgSearchTargets(
 	needCtxFileSep := (opts.beforeCtx > 0 || opts.afterCtx > 0) &&
 		!opts.filesWithMatches && !opts.filesWithoutMatch && !opts.count && !opts.vimgrep && !opts.onlyMatching && !opts.passthru
 	var pipeErr error
+	hookActive := CapabilityHookFromContext(ctx) != nil
 
 	for res := range results {
 		if res.err != nil {
 			if !isPipeClosed(res.err) && ctx.Err() == nil {
-				hadErr.Store(true)
+				if res.explicit || !(hookActive && errors.Is(res.err, os.ErrPermission)) {
+					hadErr.Store(true)
+				}
 				if !opts.noMessages {
 					fmt.Fprintf(hc.Stderr, "rg: %v\n", res.err)
 				}
@@ -1913,7 +1957,7 @@ func rgSearchFile(
 	var data []byte
 	if job.absPath != os.DevNull {
 		var err error
-		data, err = readShellFile(job.absPath)
+		data, err = fsReadShellFile(ctx, job.baseDir, "rg", job.rawPath)
 		if err != nil {
 			return false, fmt.Errorf("%s: %w", job.displayPath, err)
 		}

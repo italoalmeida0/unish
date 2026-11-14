@@ -73,9 +73,10 @@ func cmdCp(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "cp: missing destination")
 		return flag.ErrHelp
 	}
-	dst := resolve(hc.Dir, rest[len(rest)-1])
+	dstArg := rest[len(rest)-1]
+	dst := resolveHostPath(hc.Dir, dstArg)
 	srcs := rest[:len(rest)-1]
-	dstFi, dstErr := os.Stat(dst)
+	dstFi, dstErr := fsStat(ctx, hc.Dir, "cp", dstArg)
 	dstIsDir := dstErr == nil && dstFi.IsDir()
 	if len(srcs) > 1 && !dstIsDir {
 		fmt.Fprintln(hc.Stderr, "cp: target is not a directory")
@@ -90,36 +91,39 @@ func cmdCp(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		src := resolve(hc.Dir, s)
+		src := resolveHostPath(hc.Dir, s)
 		target := dst
+		targetSpec := dstArg
 		if dstIsDir {
-			target = filepath.Join(dst, filepath.Base(src))
+			base := filepath.Base(src)
+			target = filepath.Join(dst, base)
+			targetSpec = filepath.Join(dstArg, base)
 		}
 		// GNU: "cp: 'a' and 'b' are the same file" (exit 1).
-		if sameFile(src, target) {
-			fmt.Fprintf(hc.Stderr, "cp: '%s' and '%s' are the same file\n", s, rest[len(rest)-1])
+		if sameFile(ctx, hc.Dir, "cp", s, targetSpec) {
+			fmt.Fprintf(hc.Stderr, "cp: '%s' and '%s' are the same file\n", s, dstArg)
 			code = 1
 			continue
 		}
-		if lfi, lerr := os.Lstat(src); lerr == nil {
+		if lfi, lerr := fsLstat(ctx, hc.Dir, "cp", s); lerr == nil {
 			srcIsDir := lfi.IsDir()
 			if !srcIsDir && !*noDeref {
-				if sfi, serr := os.Stat(src); serr == nil && sfi.IsDir() {
+				if sfi, serr := fsStat(ctx, hc.Dir, "cp", s); serr == nil && sfi.IsDir() {
 					srcIsDir = true
 				}
 			}
-			if srcIsDir && *rec && isSameOrSubdir(src, target) {
+			if srcIsDir && *rec && isSameOrSubdir(ctx, hc.Dir, "cp", s, targetSpec) {
 				fmt.Fprintf(hc.Stderr, "cp: cannot copy a directory, '%s', into itself, '%s'\n", s, target)
 				code = 1
 				continue
 			}
 		}
 		if *noClobber {
-			if _, err := os.Lstat(target); err == nil {
+			if _, err := fsLstat(ctx, hc.Dir, "cp", targetSpec); err == nil {
 				continue
 			}
 		}
-		if err := copyOne(ctx, src, target, *rec, *force, *noDeref, *preserve); err != nil {
+		if err := copyOne(ctx, hc.Dir, s, targetSpec, src, target, *rec, *force, *noDeref, *preserve); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
@@ -137,79 +141,83 @@ func cmdCp(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func copyOne(ctx context.Context, src, dst string, rec, force, noDeref, preserve bool) error {
+func copyOne(ctx context.Context, dir, srcSpec, dstSpec, srcFull, dstFull string, rec, force, noDeref, preserve bool) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	fi, err := os.Lstat(src)
+	fi, err := fsLstat(ctx, dir, "cp", srcSpec)
 	if err != nil {
 		return err
 	}
 	if fi.IsDir() {
 		if !rec {
-			return fmt.Errorf("%s is a directory (use -r)", src)
+			return fmt.Errorf("%s is a directory (use -r)", srcFull)
 		}
-		return copyDir(ctx, src, dst, force, preserve)
+		return copyDir(ctx, dir, srcSpec, dstSpec, srcFull, dstFull, force, preserve)
 	}
 	if fi.Mode()&os.ModeSymlink != 0 && (noDeref || rec) {
-		link, err := os.Readlink(src)
+		link, err := fsReadlink(ctx, dir, "cp", srcSpec)
 		if err != nil {
 			return err
 		}
 		if force {
-			_ = os.Remove(dst)
+			if rerr := fsRemove(ctx, dir, "cp", dstSpec); rerr != nil && !os.IsNotExist(rerr) && errors.Is(rerr, os.ErrPermission) {
+				return rerr
+			}
 		}
-		return os.Symlink(link, dst)
+		return fsSymlink(ctx, dir, "cp", link, dstSpec)
 	}
 	// GNU default: follow the link, copying content into a new file.
-	st, err := os.Stat(src)
+	st, err := fsStat(ctx, dir, "cp", srcSpec)
 	if err != nil {
 		return err
 	}
 	if st.IsDir() {
 		if !rec {
-			return fmt.Errorf("%s is a directory (use -r)", src)
+			return fmt.Errorf("%s is a directory (use -r)", srcFull)
 		}
-		return copyDir(ctx, src, dst, force, preserve)
+		return copyDir(ctx, dir, srcSpec, dstSpec, srcFull, dstFull, force, preserve)
 	}
-	return copyFile(src, dst, st.Mode(), force, preserve)
+	return copyFile(ctx, dir, srcSpec, dstSpec, srcFull, dstFull, st.Mode(), force, preserve)
 }
 
 // preserveAttrs implements cp -p: copy mode and timestamps best-effort
 // (Windows cannot represent full POSIX modes; failures are non-fatal).
-func preserveAttrs(src, dst string) {
-	fi, err := os.Stat(src)
+func preserveAttrs(ctx context.Context, dir, srcSpec, dstSpec string) {
+	fi, err := fsStat(ctx, dir, "cp", srcSpec)
 	if err != nil {
 		return
 	}
-	_ = os.Chmod(dst, fi.Mode().Perm())
+	_ = fsChmod(ctx, dir, "cp", dstSpec, fi.Mode().Perm())
 	mt := fi.ModTime()
-	_ = os.Chtimes(dst, mt, mt)
+	_ = fsChtimes(ctx, dir, "cp", dstSpec, mt, mt)
 }
 
-func copyFile(src, dst string, mode os.FileMode, force, preserve bool) error {
-	if sameFile(src, dst) {
-		return fmt.Errorf("'%s' and '%s' are the same file", src, dst)
+func copyFile(ctx context.Context, dir, srcSpec, dstSpec, srcFull, dstFull string, mode os.FileMode, force, preserve bool) error {
+	if sameFile(ctx, dir, "cp", srcSpec, dstSpec) {
+		return fmt.Errorf("'%s' and '%s' are the same file", srcFull, dstFull)
 	}
-	in, err := os.Open(src)
+	in, err := fsOpen(ctx, dir, "cp", srcSpec)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
 	if force {
 		if runtime.GOOS == "windows" {
-			_ = os.Chmod(dst, 0o666)
+			_ = fsChmod(ctx, dir, "cp", dstSpec, 0o666)
 		}
-		_ = os.Remove(dst)
+		if rerr := fsRemove(ctx, dir, "cp", dstSpec); rerr != nil && !os.IsNotExist(rerr) && errors.Is(rerr, os.ErrPermission) {
+			return rerr
+		}
 	}
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+	out, err := fsOpenFile(ctx, dir, "cp", dstSpec, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
 	if err != nil {
 		return err
 	}
 	_, err = io.Copy(out, in)
 	cerr := out.Close()
 	if preserve {
-		preserveAttrs(src, dst)
+		preserveAttrs(ctx, dir, srcSpec, dstSpec)
 	}
 	if err != nil {
 		return err
@@ -217,18 +225,18 @@ func copyFile(src, dst string, mode os.FileMode, force, preserve bool) error {
 	return cerr
 }
 
-func copyDir(ctx context.Context, src, dst string, force, preserve bool) error {
+func copyDir(ctx context.Context, dir, srcSpec, dstSpec, srcFull, dstFull string, force, preserve bool) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	fi, err := os.Stat(src)
+	fi, err := fsStat(ctx, dir, "cp", srcSpec)
 	if err != nil {
 		return err
 	}
-	if err := os.MkdirAll(dst, fi.Mode().Perm()); err != nil {
+	if err := fsMkdirAll(ctx, dir, "cp", dstSpec, fi.Mode().Perm()); err != nil {
 		return err
 	}
-	entries, err := os.ReadDir(src)
+	entries, err := fsReadDir(ctx, dir, "cp", srcSpec)
 	if err != nil {
 		return err
 	}
@@ -236,29 +244,33 @@ func copyDir(ctx context.Context, src, dst string, force, preserve bool) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		s := filepath.Join(src, e.Name())
-		d := filepath.Join(dst, e.Name())
+		sSpec := filepath.Join(srcSpec, e.Name())
+		dSpec := filepath.Join(dstSpec, e.Name())
+		sFull := filepath.Join(srcFull, e.Name())
+		dFull := filepath.Join(dstFull, e.Name())
 		if e.Type()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(s)
+			link, err := fsReadlink(ctx, dir, "cp", sSpec)
 			if err != nil {
 				return err
 			}
-			if dfi, derr := os.Lstat(d); derr == nil {
+			if dfi, derr := fsLstat(ctx, dir, "cp", dSpec); derr == nil {
 				if dfi.IsDir() {
-					return fmt.Errorf("cannot overwrite directory '%s' with non-directory", d)
+					return fmt.Errorf("cannot overwrite directory '%s' with non-directory", dFull)
 				}
-				if sameFile(s, d) {
-					return fmt.Errorf("'%s' and '%s' are the same file", s, d)
+				if sameFile(ctx, dir, "cp", sSpec, dSpec) {
+					return fmt.Errorf("'%s' and '%s' are the same file", sFull, dFull)
 				}
-				_ = os.Remove(d)
+				if rerr := fsRemove(ctx, dir, "cp", dSpec); rerr != nil && !os.IsNotExist(rerr) {
+					return rerr
+				}
 			}
-			if err := os.Symlink(link, d); err != nil {
+			if err := fsSymlink(ctx, dir, "cp", link, dSpec); err != nil {
 				return err
 			}
 			continue
 		}
 		if e.IsDir() {
-			if err := copyDir(ctx, s, d, force, preserve); err != nil {
+			if err := copyDir(ctx, dir, sSpec, dSpec, sFull, dFull, force, preserve); err != nil {
 				return err
 			}
 			continue
@@ -267,12 +279,12 @@ func copyDir(ctx context.Context, src, dst string, force, preserve bool) error {
 		if err != nil {
 			return err
 		}
-		if err := copyFile(s, d, efi.Mode(), force, preserve); err != nil {
+		if err := copyFile(ctx, dir, sSpec, dSpec, sFull, dFull, efi.Mode(), force, preserve); err != nil {
 			return err
 		}
 	}
 	if preserve {
-		preserveAttrs(src, dst)
+		preserveAttrs(ctx, dir, srcSpec, dstSpec)
 	}
 	return nil
 }
@@ -294,9 +306,10 @@ func cmdMv(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "mv: missing destination")
 		return flag.ErrHelp
 	}
-	dst := resolve(hc.Dir, rest[len(rest)-1])
+	dstArg := rest[len(rest)-1]
+	dst := resolveHostPath(hc.Dir, dstArg)
 	srcs := rest[:len(rest)-1]
-	dstFi, dstErr := os.Stat(dst)
+	dstFi, dstErr := fsStat(ctx, hc.Dir, "mv", dstArg)
 	dstIsDir := dstErr == nil && dstFi.IsDir()
 	if len(srcs) > 1 && !dstIsDir {
 		fmt.Fprintln(hc.Stderr, "mv: target is not a directory")
@@ -307,62 +320,82 @@ func cmdMv(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		src := resolve(hc.Dir, s)
-		srcFi, serr := os.Lstat(src)
+		src := resolveHostPath(hc.Dir, s)
+		srcFi, serr := fsLstat(ctx, hc.Dir, "mv", s)
 		if serr != nil {
-			fmt.Fprintf(hc.Stderr, "mv: cannot stat '%s': No such file or directory\n", s)
+			if os.IsNotExist(serr) {
+				fmt.Fprintf(hc.Stderr, "mv: cannot stat '%s': No such file or directory\n", s)
+			} else {
+				fmt.Fprintf(hc.Stderr, "mv: cannot stat '%s': %v\n", s, serr)
+			}
 			code = 1
 			continue
 		}
 		target := dst
+		targetSpec := dstArg
 		if dstIsDir {
 			// Guard `mv dir dir` when dst == src or case-only dir rename.
-			if len(srcs) == 1 && isCaseOnlyRename(src, dst) {
+			if len(srcs) == 1 && isCaseOnlyRename(ctx, hc.Dir, "mv", s, dstArg) {
 				target = dst
+				targetSpec = dstArg
 			} else {
-				target = filepath.Join(dst, filepath.Base(src))
+				base := filepath.Base(src)
+				target = filepath.Join(dst, base)
+				targetSpec = filepath.Join(dstArg, base)
 			}
 		}
-		caseRename := isCaseOnlyRename(src, target)
+		caseRename := isCaseOnlyRename(ctx, hc.Dir, "mv", s, targetSpec)
 		if !caseRename && *noClobber {
-			if _, err := os.Lstat(target); err == nil {
+			if _, err := fsLstat(ctx, hc.Dir, "mv", targetSpec); err == nil {
 				continue
 			}
 		}
 		if !caseRename && *update {
-			if sfi, serr := os.Stat(src); serr == nil {
-				if dfi, derr := os.Stat(target); derr == nil && !sfi.ModTime().After(dfi.ModTime()) {
+			if sfi, serr := fsStat(ctx, hc.Dir, "mv", s); serr == nil {
+				if dfi, derr := fsStat(ctx, hc.Dir, "mv", targetSpec); derr == nil && !sfi.ModTime().After(dfi.ModTime()) {
 					continue
 				}
 			}
 		}
 		// GNU: "mv: 'a' and 'b' are the same file" (exit 1).
-		if !caseRename && sameFile(src, target) {
-			fmt.Fprintf(hc.Stderr, "mv: '%s' and '%s' are the same file\n", s, rest[len(rest)-1])
+		if !caseRename && sameFile(ctx, hc.Dir, "mv", s, targetSpec) {
+			fmt.Fprintf(hc.Stderr, "mv: '%s' and '%s' are the same file\n", s, dstArg)
 			code = 1
 			continue
 		}
-		if srcFi.IsDir() && !caseRename && isSameOrSubdir(src, target) {
+		if srcFi.IsDir() && !caseRename && isSameOrSubdir(ctx, hc.Dir, "mv", s, targetSpec) {
 			fmt.Fprintf(hc.Stderr, "mv: cannot move '%s' to a subdirectory of itself, '%s'\n", s, target)
 			code = 1
 			continue
 		}
+		if CapabilityHookFromContext(ctx) != nil {
+			if err := checkMvCapability(ctx, hc.Dir, s, targetSpec, srcFi); err != nil {
+				fmt.Fprintf(hc.Stderr, "mv: %v\n", err)
+				code = 1
+				continue
+			}
+		}
 		if !caseRename {
-			if tfi, terr := os.Lstat(target); terr == nil {
+			if tfi, terr := fsLstat(ctx, hc.Dir, "mv", targetSpec); terr == nil {
 				if srcFi.IsDir() {
 					if !tfi.IsDir() {
 						fmt.Fprintf(hc.Stderr, "mv: cannot overwrite non-directory '%s' with directory '%s'\n", target, s)
 						code = 1
 						continue
 					}
-					entries, rerr := os.ReadDir(target)
-					if rerr == nil && len(entries) > 0 {
+					entries, rerr := fsReadDir(ctx, hc.Dir, "mv", targetSpec)
+					if rerr != nil {
+						fmt.Fprintf(hc.Stderr, "mv: %v\n", rerr)
+						code = 1
+						continue
+					}
+					if len(entries) > 0 {
 						fmt.Fprintf(hc.Stderr, "mv: cannot move '%s' to '%s': Directory not empty\n", s, target)
 						code = 1
 						continue
 					}
-					if rerr == nil && len(entries) == 0 && runtime.GOOS == "windows" {
-						_ = os.Remove(target)
+					if len(entries) == 0 && runtime.GOOS == "windows" {
+						_ = fsRemove(ctx, hc.Dir, "mv", targetSpec)
 					}
 				} else {
 					if tfi.IsDir() {
@@ -371,18 +404,22 @@ func cmdMv(ctx context.Context, hc interp.HandlerContext, args []string) error {
 						continue
 					}
 					if *force && runtime.GOOS == "windows" {
-						_ = os.Chmod(target, 0o666)
+						_ = fsChmod(ctx, hc.Dir, "mv", targetSpec, 0o666)
 					}
 				}
+			} else if errors.Is(terr, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "mv: %v\n", terr)
+				code = 1
+				continue
 			}
 		}
-		if err := os.Rename(src, target); err != nil {
+		if err := fsRename(ctx, hc.Dir, "mv", s, targetSpec); err != nil {
 			if !isCrossDevice(err) {
 				fmt.Fprintf(hc.Stderr, "mv: %v\n", err)
 				code = 1
 				continue
 			}
-			if err := moveCrossDevice(ctx, src, target, srcFi); err != nil {
+			if err := moveCrossDevice(ctx, hc.Dir, s, targetSpec, src, target, srcFi); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -392,7 +429,7 @@ func cmdMv(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			}
 		}
 		if *verb {
-			dispDst := rest[len(rest)-1]
+			dispDst := dstArg
 			if dstIsDir && !caseRename {
 				dispDst = dispDst + "/" + filepath.Base(s)
 			}
@@ -449,13 +486,16 @@ func cmdRm(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			code = 1
 			continue
 		}
-		full := resolve(hc.Dir, p)
-		fi, err := os.Lstat(full)
+		fi, err := fsLstat(ctx, hc.Dir, "rm", p)
 		if err != nil {
-			if *force {
+			if *force && os.IsNotExist(err) {
 				continue
 			}
-			fmt.Fprintf(hc.Stderr, "rm: cannot remove '%s': No such file or directory\n", p)
+			if os.IsNotExist(err) {
+				fmt.Fprintf(hc.Stderr, "rm: cannot remove '%s': No such file or directory\n", p)
+			} else {
+				fmt.Fprintf(hc.Stderr, "rm: cannot remove '%s': %v\n", p, err)
+			}
 			code = 1
 			continue
 		}
@@ -465,12 +505,12 @@ func cmdRm(ctx context.Context, hc interp.HandlerContext, args []string) error {
 				code = 1
 				continue
 			}
-			err = os.RemoveAll(full)
+			err = fsRemoveTree(ctx, hc.Dir, "rm", p)
 		} else {
-			err = os.Remove(full)
-			if err != nil && runtime.GOOS == "windows" {
-				_ = os.Chmod(full, 0o666)
-				err = os.Remove(full)
+			err = fsRemove(ctx, hc.Dir, "rm", p)
+			if err != nil && runtime.GOOS == "windows" && !errors.Is(err, os.ErrPermission) && fi.Mode()&os.ModeSymlink == 0 {
+				_ = fsChmod(ctx, hc.Dir, "rm", p, 0o666)
+				err = fsRemove(ctx, hc.Dir, "rm", p)
 			}
 		}
 		if err != nil {
@@ -570,7 +610,7 @@ func cmdDir(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	return cmdLs(ctx, hc, norm)
 }
 
-func cmdMkdir(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdMkdir(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("mkdir", hc.Stderr)
 	parents := fs.Bool("p", false, "")
 	verb := fs.Bool("v", false, "")
@@ -591,16 +631,18 @@ func cmdMkdir(_ context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	code := 0
 	for _, p := range fs.Args() {
-		full := resolve(hc.Dir, p)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		var err error
 		if *parents {
-			err = os.MkdirAll(full, mode)
+			err = fsMkdirAll(ctx, hc.Dir, "mkdir", p, mode)
 		} else {
-			err = os.Mkdir(full, mode)
+			err = fsMkdir(ctx, hc.Dir, "mkdir", p, mode)
 		}
 		if err != nil {
-			if *parents {
-				if _, serr := os.Stat(full); serr == nil {
+			if *parents && !errors.Is(err, os.ErrPermission) {
+				if sfi, serr := fsStat(ctx, hc.Dir, "mkdir", p); serr == nil && sfi.IsDir() {
 					continue
 				}
 			}
@@ -623,7 +665,7 @@ func cmdMkdir(_ context.Context, hc interp.HandlerContext, args []string) error 
 	return nil
 }
 
-func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdTouch(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("touch", hc.Stderr)
 	noCreate := fs.Bool("c", false, "")
 	fs.BoolVar(noCreate, "no-create", false, "")
@@ -642,9 +684,13 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	mtime := time.Now()
 	if *refFile != "" {
-		fi, err := os.Stat(resolve(hc.Dir, *refFile))
+		fi, err := fsStat(ctx, hc.Dir, "touch", *refFile)
 		if err != nil {
-			fmt.Fprintf(hc.Stderr, "touch: failed to get attributes of '%s': No such file or directory\n", *refFile)
+			if os.IsNotExist(err) {
+				fmt.Fprintf(hc.Stderr, "touch: failed to get attributes of '%s': No such file or directory\n", *refFile)
+			} else {
+				fmt.Fprintf(hc.Stderr, "touch: failed to get attributes of '%s': %v\n", *refFile, err)
+			}
 			return exitError{1}
 		}
 		mtime = fi.ModTime()
@@ -660,12 +706,19 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	code := 0
 	for _, p := range fs.Args() {
-		full := resolve(hc.Dir, p)
-		if _, err := os.Stat(full); err != nil {
-			if *noCreate {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if _, err := fsStat(ctx, hc.Dir, "touch", p); err != nil {
+			if errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "touch: cannot touch '%s': %v\n", p, err)
+				code = 1
 				continue
 			}
-			f, err := os.OpenFile(full, os.O_CREATE|os.O_WRONLY, 0o666)
+			if *noCreate && os.IsNotExist(err) {
+				continue
+			}
+			f, err := fsOpenFile(ctx, hc.Dir, "touch", p, os.O_CREATE|os.O_WRONLY, 0o666)
 			if err != nil {
 				fmt.Fprintf(hc.Stderr, "touch: cannot touch '%s': %v\n", p, err)
 				code = 1
@@ -673,7 +726,7 @@ func cmdTouch(_ context.Context, hc interp.HandlerContext, args []string) error 
 			}
 			f.Close()
 		}
-		if err := os.Chtimes(full, mtime, mtime); err != nil {
+		if err := fsChtimes(ctx, hc.Dir, "touch", p, mtime, mtime); err != nil {
 			fmt.Fprintf(hc.Stderr, "touch: cannot touch '%s': %v\n", p, err)
 			code = 1
 		}
@@ -719,12 +772,12 @@ func cmdChmod(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		return flag.ErrHelp
 	}
 	modeStr, paths := rest[0], rest[1:]
-	apply := func(full, display string) error {
-		mode, err := parseChmodMode(modeStr, full)
+	apply := func(rawPath, display string) error {
+		mode, err := parseChmodMode(ctx, hc.Dir, modeStr, rawPath)
 		if err != nil {
 			return err
 		}
-		if err := os.Chmod(full, mode); err != nil {
+		if err := fsChmod(ctx, hc.Dir, "chmod", rawPath, mode); err != nil {
 			return err
 		}
 		if verb {
@@ -747,41 +800,66 @@ func cmdChmod(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		}
 	}
 	code := 0
+	var walkChmod func(rawPath, display string, isRoot bool) error
+	walkChmod = func(rawPath, display string, isRoot bool) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		info, err := fsLstat(ctx, hc.Dir, "chmod", rawPath)
+		if err != nil {
+			reportErr(display, err)
+			code = 1
+			return nil
+		}
+		// POSIX/GNU chmod -R skips symlinks encountered during directory traversal.
+		if !isRoot && info.Mode()&os.ModeSymlink != 0 {
+			return nil
+		}
+		if e := apply(rawPath, display); e != nil {
+			reportErr(display, e)
+			code = 1
+		}
+		if !info.IsDir() {
+			return nil
+		}
+		entries, err := fsReadDir(ctx, hc.Dir, "chmod", rawPath)
+		if err != nil {
+			reportErr(display, err)
+			code = 1
+			return nil
+		}
+		for _, ent := range entries {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			childRaw := filepath.Join(rawPath, ent.Name())
+			childDisp := filepath.Join(display, ent.Name())
+			if display == "." {
+				childDisp = ent.Name()
+			}
+			if err := walkChmod(childRaw, childDisp, false); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
 	for _, p := range paths {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		full := resolve(hc.Dir, p)
 		if rec {
-			walkErr := filepath.Walk(full, func(path string, info os.FileInfo, err error) error {
-				if ctx.Err() != nil {
-					return ctx.Err()
+			disp := p
+			if filepath.IsAbs(p) && hc.Dir != "" {
+				if rel, rerr := filepath.Rel(hc.Dir, p); rerr == nil && !strings.HasPrefix(rel, "..") {
+					disp = rel
 				}
-				if err != nil {
-					reportErr(p, err)
-					code = 1
-					return nil
-				}
-				// POSIX/GNU chmod -R skips symlinks encountered during directory traversal.
-				if path != full && info.Mode()&os.ModeSymlink != 0 {
-					return nil
-				}
-				rel, rerr := filepath.Rel(hc.Dir, path)
-				if rerr != nil {
-					rel = path
-				}
-				if e := apply(path, rel); e != nil {
-					reportErr(rel, e)
-					code = 1
-				}
-				return nil
-			})
-			if walkErr != nil && ctx.Err() != nil {
+			}
+			if walkErr := walkChmod(p, disp, true); walkErr != nil && ctx.Err() != nil {
 				return ctx.Err()
 			}
 			continue
 		}
-		if err := apply(full, p); err != nil {
+		if err := apply(p, p); err != nil {
 			reportErr(p, err)
 			code = 1
 		}
@@ -821,15 +899,17 @@ func isChmodSymbolicMode(s string) bool {
 	return true
 }
 
-func parseChmodMode(s, path string) (os.FileMode, error) {
+func parseChmodMode(ctx context.Context, dir, s, rawPath string) (os.FileMode, error) {
 	if m, err := strconv.ParseUint(s, 8, 32); err == nil {
 		return os.FileMode(m), nil
 	}
 	var cur os.FileMode
 	isDir := false
-	if fi, err := os.Stat(path); err == nil {
+	if fi, err := fsStat(ctx, dir, "chmod", rawPath); err == nil {
 		cur = fi.Mode()
 		isDir = fi.IsDir()
+	} else if errors.Is(err, os.ErrPermission) {
+		return 0, err
 	} else {
 		cur = 0o644
 	}
@@ -1008,13 +1088,17 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		if *trace {
 			fmt.Fprintf(hc.Stderr, "+ %s\n", strings.Join(rest, " "))
 		}
-		if err := runSubcommand(ctx, childHC, rest); err != nil {
+		if err := runSubcommandNamed(ctx, childHC, "xargs", rest); err != nil {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if isExecNotFound(err) {
 				fmt.Fprintf(hc.Stderr, "xargs: %s: No such file or directory\n", rest[0])
 				return exitError{127}
+			}
+			if errors.Is(err, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "xargs: %s: %v\n", rest[0], err)
+				return exitError{126}
 			}
 			if ec, ok := subcommandExitCode(err); ok && ec == 255 {
 				return exitError{124}
@@ -1070,13 +1154,17 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			if *trace {
 				fmt.Fprintf(hc.Stderr, "+ %s\n", strings.Join(cmdArgs, " "))
 			}
-			if err := runSubcommand(ctx, childHC, cmdArgs); err != nil {
+			if err := runSubcommandNamed(ctx, childHC, "xargs", cmdArgs); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
 				if isExecNotFound(err) {
 					fmt.Fprintf(hc.Stderr, "xargs: %s: No such file or directory\n", cmdArgs[0])
 					return exitError{127}
+				}
+				if errors.Is(err, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "xargs: %s: %v\n", cmdArgs[0], err)
+					return exitError{126}
 				}
 				if ec, ok := subcommandExitCode(err); ok && ec == 255 {
 					// GNU xargs aborts when a command exits 255.
@@ -1111,8 +1199,8 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	recordCode := func(c int) {
 		resMu.Lock()
 		defer resMu.Unlock()
-		// Fatal xargs codes (127/124) outrank normal batch failure (123).
-		if finalCode == 0 || (finalCode == 123 && (c == 124 || c == 127)) {
+		// Fatal xargs codes (126/127/124) outrank normal batch failure (123).
+		if finalCode == 0 || (finalCode == 123 && (c == 124 || c == 126 || c == 127)) {
 			finalCode = c
 		}
 	}
@@ -1133,7 +1221,7 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 				wHC := childHC
 				wHC.Stdout = wOut
 				wHC.Stderr = wErr
-				err := runSubcommand(batchCtx, wHC, cmdArgs)
+				err := runSubcommandNamed(batchCtx, wHC, "xargs", cmdArgs)
 				_ = wOut.Flush()
 				_ = wErr.Flush()
 				if err != nil {
@@ -1147,6 +1235,12 @@ func cmdXargs(ctx context.Context, hc interp.HandlerContext, args []string) erro
 					if isExecNotFound(err) {
 						fmt.Fprintf(errSync, "xargs: %s: No such file or directory\n", cmdArgs[0])
 						recordCode(127)
+						cancelBatches()
+						return
+					}
+					if errors.Is(err, os.ErrPermission) {
+						fmt.Fprintf(errSync, "xargs: %s: %v\n", cmdArgs[0], err)
+						recordCode(126)
 						cancelBatches()
 						return
 					}
@@ -1330,6 +1424,10 @@ func isExecNotFound(err error) bool {
 var errExecNotFound = errors.New("executable file not found in $PATH")
 
 func runSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) error {
+	return runSubcommandNamed(ctx, hc, "xargs", cmdArgs)
+}
+
+func runSubcommandNamed(ctx context.Context, hc interp.HandlerContext, callerCmd string, cmdArgs []string) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
@@ -1340,23 +1438,50 @@ func runSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []stri
 	case "printf":
 		return cmdPrintf(ctx, hc, cmdArgs)
 	case "test", "[":
-		err := runTest(hc, cmdArgs)
-		if err == nil {
-			return nil
+		_, ovErr := fastCallOverride(ctx, hc, cmdArgs)
+		if code, ok := interp.IsExitStatus(ovErr); ok {
+			if code == 0 {
+				return nil
+			}
+			return exitError{int(code)}
 		}
-		if errors.Is(err, errTestFalse) {
-			return exitError{1}
-		}
-		return exitError{2}
+		return ovErr
 	}
 	if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
 		return invokeExtra(ctx, hc, cmd, cmdArgs)
 	}
-	path, err := interp.LookPathDir(hc.Dir, hc.Env, cmdArgs[0])
-	if err != nil {
-		return errExecNotFound
+	if callerCmd == "" {
+		callerCmd = cmdArgs[0]
 	}
-	c := exec.CommandContext(ctx, path, cmdArgs[1:]...)
+	var checkedPath string
+	if CapabilityHookFromContext(ctx) == nil {
+		path, err := interp.LookPathDir(hc.Dir, hc.Env, cmdArgs[0])
+		if err != nil {
+			return errExecNotFound
+		}
+		checkedPath = path
+	} else {
+		if strings.ContainsAny(cmdArgs[0], `/\`) {
+			cp, cerr := checkExec(ctx, callerCmd, cmdArgs[0], cmdArgs, hc.Dir)
+			if cerr != nil {
+				return cerr
+			}
+			checkedPath = cp
+		}
+		path, err := interp.LookPathDir(hc.Dir, hc.Env, cmdArgs[0])
+		if err != nil {
+			return errExecNotFound
+		}
+		pathReal, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
+		if checkedPath == "" || !sameCleanPath(checkedPath, pathReal) {
+			cp, cerr := checkExec(ctx, callerCmd, path, cmdArgs, hc.Dir)
+			if cerr != nil {
+				return cerr
+			}
+			checkedPath = cp
+		}
+	}
+	c := exec.CommandContext(ctx, checkedPath, cmdArgs[1:]...)
 	c.Dir = hc.Dir
 	c.Stdin = hc.Stdin
 	c.Stdout = hc.Stdout
@@ -1375,7 +1500,7 @@ func runSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []stri
 	return nil
 }
 
-func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdBase64(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("base64", hc.Stderr)
 	decode := fs.Bool("d", false, "")
 	fs.BoolVar(decode, "decode", false, "")
@@ -1389,7 +1514,7 @@ func cmdBase64(_ context.Context, hc interp.HandlerContext, args []string) error
 	var data []byte
 	if len(fs.Args()) > 0 && fs.Args()[0] != "-" && fs.Args()[0] != "/dev/stdin" {
 		var err error
-		data, err = readShellFile(resolve(hc.Dir, fs.Args()[0]))
+		data, err = fsReadShellFile(ctx, hc.Dir, "base64", fs.Args()[0])
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "base64:", err)
 			return exitError{1}
@@ -1502,37 +1627,201 @@ func parseTouchDate(s string) (time.Time, error) {
 	return time.Time{}, fmt.Errorf("invalid date")
 }
 
+// absFromDir resolves p against dir without touching process-global os.Getwd()
+// whenever dir is absolute.
+func absFromDir(dir, p string) string {
+	resolved := resolveHostPath(dir, p)
+	if resolved != "" && !filepath.IsAbs(resolved) {
+		if abs, err := filepath.Abs(resolved); err == nil {
+			return filepath.Clean(abs)
+		}
+	}
+	return filepath.Clean(resolved)
+}
+
+func fsReadlink(ctx context.Context, dir, cmdName, rawPath string) (string, error) {
+	p, err := checkFSNoFollowLeaf(ctx, dir, cmdName, rawPath, OpStat)
+	if err != nil {
+		return "", err
+	}
+	return os.Readlink(p)
+}
+
+// fsRemoveTree recursively removes rawPath under dir, enforcing OpList and
+// OpDelete on every traversed entry when a CapabilityHook is active so
+// intra-workspace deny rules (e.g. Deny **/.env*) cannot be bypassed via rm -rf.
+func fsRemoveTree(ctx context.Context, dir, cmdName, rawPath string) error {
+	if CapabilityHookFromContext(ctx) == nil {
+		return fsRemoveAll(ctx, dir, cmdName, rawPath)
+	}
+	if ctx.Err() != nil {
+		return ctx.Err()
+	}
+	if _, err := checkFSNoFollowLeaf(ctx, dir, cmdName, rawPath, OpDelete); err != nil {
+		return err
+	}
+	lfi, err := fsLstat(ctx, dir, cmdName, rawPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	if !lfi.IsDir() {
+		rerr := fsRemove(ctx, dir, cmdName, rawPath)
+		if rerr != nil && runtime.GOOS == "windows" && !errors.Is(rerr, os.ErrPermission) && lfi.Mode()&os.ModeSymlink == 0 {
+			_ = fsChmod(ctx, dir, cmdName, rawPath, 0o666)
+			rerr = fsRemove(ctx, dir, cmdName, rawPath)
+		}
+		if os.IsNotExist(rerr) {
+			return nil
+		}
+		return rerr
+	}
+	entries, err := fsReadDir(ctx, dir, cmdName, rawPath)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		child := filepath.Join(rawPath, e.Name())
+		if err := fsRemoveTree(ctx, dir, cmdName, child); err != nil {
+			return err
+		}
+	}
+	rerr := fsRemove(ctx, dir, cmdName, rawPath)
+	if rerr != nil && runtime.GOOS == "windows" && !errors.Is(rerr, os.ErrPermission) {
+		_ = fsChmod(ctx, dir, cmdName, rawPath, 0o777)
+		rerr = fsRemove(ctx, dir, cmdName, rawPath)
+	}
+	if os.IsNotExist(rerr) {
+		return nil
+	}
+	return rerr
+}
+
+// checkMvCapability verifies that moving srcSpec to dstSpec does not violate
+// intra-directory deny rules or shift a relative symlink outside the jail.
+func checkMvCapability(ctx context.Context, dir, srcSpec, dstSpec string, srcFi os.FileInfo) error {
+	hook := CapabilityHookFromContext(ctx)
+	if hook == nil {
+		return nil
+	}
+	checkRelLink := func(sSpec, dSpec string) error {
+		link, err := fsReadlink(ctx, dir, "mv", sSpec)
+		if err != nil {
+			return err
+		}
+		newNoFollow, err := checkFSNoFollowLeaf(ctx, dir, "mv", dSpec, OpWrite)
+		if err != nil {
+			return err
+		}
+		targetResolved := resolveHostPath(filepath.Dir(newNoFollow), link)
+		targetReal, targetLex := canonicalizeForCheck(targetResolved)
+		if err := hook.CheckAccess(ctx, AccessRequest{
+			Op:         OpLink,
+			Command:    "mv",
+			Path:       targetReal,
+			RawPath:    link,
+			TargetPath: newNoFollow,
+		}); err != nil {
+			return err
+		}
+		checkLex := canonicalLexicalInDir(filepath.Dir(newNoFollow), link, targetLex)
+		if !sameCleanPath(checkLex, targetReal) {
+			if err := hook.CheckAccess(ctx, AccessRequest{
+				Op:         OpLink,
+				Command:    "mv",
+				Path:       checkLex,
+				RawPath:    link,
+				TargetPath: newNoFollow,
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if srcFi.Mode()&os.ModeSymlink != 0 {
+		return checkRelLink(srcSpec, dstSpec)
+	}
+	if !srcFi.IsDir() {
+		return nil
+	}
+	var walk func(sCur, dCur string) error
+	walk = func(sCur, dCur string) error {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if _, err := checkFSNoFollowLeaf(ctx, dir, "mv", sCur, OpDelete); err != nil {
+			return err
+		}
+		entries, err := fsReadDir(ctx, dir, "mv", sCur)
+		if err != nil {
+			return err
+		}
+		for _, e := range entries {
+			sChild := filepath.Join(sCur, e.Name())
+			dChild := filepath.Join(dCur, e.Name())
+			if e.Type()&os.ModeSymlink != 0 {
+				if _, err := checkFSNoFollowLeaf(ctx, dir, "mv", sChild, OpDelete); err != nil {
+					return err
+				}
+				if err := checkRelLink(sChild, dChild); err != nil {
+					return err
+				}
+				continue
+			}
+			if e.IsDir() {
+				if err := walk(sChild, dChild); err != nil {
+					return err
+				}
+				continue
+			}
+			if _, err := checkFS(ctx, dir, "mv", sChild, OpDelete); err != nil {
+				return err
+			}
+			if _, err := checkFSNoFollowLeaf(ctx, dir, "mv", dChild, OpWrite); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	return walk(srcSpec, dstSpec)
+}
+
 // sameFile reports whether two paths resolve to the same file.
-func sameFile(a, b string) bool {
-	fa, err1 := os.Stat(a)
-	fb, err2 := os.Stat(b)
+func sameFile(ctx context.Context, dir, cmdName, a, b string) bool {
+	fa, err1 := fsStat(ctx, dir, cmdName, a)
+	fb, err2 := fsStat(ctx, dir, cmdName, b)
 	if err1 == nil && err2 == nil {
 		return os.SameFile(fa, fb)
 	}
-	lfa, lerr1 := os.Lstat(a)
-	lfb, lerr2 := os.Lstat(b)
+	lfa, lerr1 := fsLstat(ctx, dir, cmdName, a)
+	lfb, lerr2 := fsLstat(ctx, dir, cmdName, b)
 	if lerr1 == nil && lerr2 == nil && os.SameFile(lfa, lfb) {
 		return true
 	}
-	aa, _ := filepath.Abs(a)
-	bb, _ := filepath.Abs(b)
+	aa := absFromDir(dir, a)
+	bb := absFromDir(dir, b)
 	return aa == bb && lerr1 == nil
 }
 
 // isSameOrSubdir reports whether target resolves to srcDir or any path inside srcDir.
-func isSameOrSubdir(srcDir, target string) bool {
-	srcFi, err := os.Stat(srcDir)
+func isSameOrSubdir(ctx context.Context, dir, cmdName, srcDirRaw, targetRaw string) bool {
+	srcFi, err := fsStat(ctx, dir, cmdName, srcDirRaw)
 	if err != nil {
 		return false
 	}
-	absTarget, err := filepath.Abs(target)
-	if err != nil {
+	absTarget := absFromDir(dir, targetRaw)
+	if absTarget == "" {
 		return false
 	}
 	// Find the deepest existing prefix of absTarget.
 	cur := absTarget
 	for {
-		if _, err := os.Stat(cur); err == nil {
+		if _, err := fsStat(ctx, "", cmdName, cur); err == nil {
 			break
 		}
 		parent := filepath.Dir(cur)
@@ -1541,12 +1830,16 @@ func isSameOrSubdir(srcDir, target string) bool {
 		}
 		cur = parent
 	}
-	if resolved, err := filepath.EvalSymlinks(cur); err == nil {
+	if resolved, _ := canonicalizeForCheck(cur); resolved != "" {
 		cur = resolved
 	}
 	for {
-		if fi, err := os.Stat(cur); err == nil && os.SameFile(srcFi, fi) {
+		fi, err := fsStat(ctx, "", cmdName, cur)
+		if err == nil && os.SameFile(srcFi, fi) {
 			return true
+		}
+		if errors.Is(err, os.ErrPermission) {
+			break
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
@@ -1559,18 +1852,22 @@ func isSameOrSubdir(srcDir, target string) bool {
 
 // isCaseOnlyRename reports whether src and dst refer to a single directory entry
 // whose spelling differs only in ASCII/Unicode case on a case-insensitive FS.
-func isCaseOnlyRename(src, dst string) bool {
+func isCaseOnlyRename(ctx context.Context, dir, cmdName, srcRaw, dstRaw string) bool {
+	src := resolveHostPath(dir, srcRaw)
+	dst := resolveHostPath(dir, dstRaw)
 	baseSrc := filepath.Base(src)
 	baseDst := filepath.Base(dst)
 	if baseSrc == baseDst || !strings.EqualFold(baseSrc, baseDst) {
 		return false
 	}
-	pSrc, err1 := os.Stat(filepath.Dir(src))
-	pDst, err2 := os.Stat(filepath.Dir(dst))
+	srcParent := filepath.Dir(srcRaw)
+	dstParent := filepath.Dir(dstRaw)
+	pSrc, err1 := fsStat(ctx, dir, cmdName, srcParent)
+	pDst, err2 := fsStat(ctx, dir, cmdName, dstParent)
 	if err1 != nil || err2 != nil || !os.SameFile(pSrc, pDst) {
 		return false
 	}
-	entries, err := os.ReadDir(filepath.Dir(src))
+	entries, err := fsReadDir(ctx, dir, cmdName, srcParent)
 	if err != nil {
 		return false
 	}
@@ -1596,30 +1893,35 @@ func isCrossDevice(err error) bool {
 
 // moveCrossDevice copies src to target across filesystems, syncs destination data,
 // and removes src only after the destination is completely committed.
-func moveCrossDevice(ctx context.Context, src, target string, srcFi os.FileInfo) error {
+func moveCrossDevice(ctx context.Context, dir, srcSpec, targetSpec, srcFull, targetFull string, srcFi os.FileInfo) error {
 	if srcFi.IsDir() {
-		if err := copyDir(ctx, src, target, true, true); err != nil {
+		if err := copyDir(ctx, dir, srcSpec, targetSpec, srcFull, targetFull, true, true); err != nil {
 			return err
 		}
-		return os.RemoveAll(src)
+		return fsRemoveTree(ctx, dir, "mv", srcSpec)
 	}
 	if srcFi.Mode()&os.ModeSymlink != 0 {
-		link, err := os.Readlink(src)
+		link, err := fsReadlink(ctx, dir, "mv", srcSpec)
 		if err != nil {
 			return err
 		}
-		_ = os.Remove(target)
-		if err := os.Symlink(link, target); err != nil {
+		if rerr := fsRemove(ctx, dir, "mv", targetSpec); rerr != nil && !os.IsNotExist(rerr) && errors.Is(rerr, os.ErrPermission) {
+			return rerr
+		}
+		if err := fsSymlink(ctx, dir, "mv", link, targetSpec); err != nil {
 			return err
 		}
-		return os.Remove(src)
+		return fsRemove(ctx, dir, "mv", srcSpec)
 	}
-	in, err := os.Open(src)
+	if _, err := checkFS(ctx, dir, "mv", targetSpec, OpWrite); err != nil {
+		return err
+	}
+	in, err := fsOpen(ctx, dir, "mv", srcSpec)
 	if err != nil {
 		return err
 	}
 	defer in.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(target), ".unish-mv-*")
+	tmp, err := fsCreateTemp(ctx, dir, "mv", filepath.Dir(targetSpec), ".unish-mv-*")
 	if err != nil {
 		return err
 	}
@@ -1634,21 +1936,21 @@ func moveCrossDevice(ctx context.Context, src, target string, srcFi os.FileInfo)
 		err = closeErr
 	}
 	if err != nil {
-		_ = os.Remove(tmpName)
+		_ = fsRemove(ctx, "", "mv", tmpName)
 		return err
 	}
 	_ = in.Close()
-	_ = os.Chmod(tmpName, srcFi.Mode().Perm())
+	_ = fsChmod(ctx, "", "mv", tmpName, srcFi.Mode().Perm())
 	mt := srcFi.ModTime()
-	_ = os.Chtimes(tmpName, mt, mt)
+	_ = fsChtimes(ctx, "", "mv", tmpName, mt, mt)
 	if runtime.GOOS == "windows" {
-		_ = os.Chmod(target, 0o666)
+		_ = fsChmod(ctx, dir, "mv", targetSpec, 0o666)
 	}
-	if err := os.Rename(tmpName, target); err != nil {
-		_ = os.Remove(tmpName)
+	if err := fsRename(ctx, "", "mv", tmpName, resolveHostPath(dir, targetSpec)); err != nil {
+		_ = fsRemove(ctx, "", "mv", tmpName)
 		return err
 	}
-	return os.Remove(src)
+	return fsRemove(ctx, dir, "mv", srcSpec)
 }
 
 // isDotOperand reports whether the rm operand p spells '.' or '..'
@@ -1678,13 +1980,13 @@ func isRootPath(dir, p string) bool {
 	if p == "/" {
 		return true
 	}
-	full := resolve(dir, p)
+	full := resolveHostPath(dir, p)
 	// Normalize: root has no parent.
 	parent := filepath.Dir(full)
 	if parent == full {
 		return true
 	}
-	// Windows drive root like C:\ (resolve may produce it for "/").
+	// Windows drive root like C:\ (resolveHostPath may produce it for "/").
 	if len(full) == 3 && full[1] == ':' && (full[2] == '\\' || full[2] == '/') {
 		return true
 	}

@@ -2,6 +2,7 @@ package unish
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -59,20 +60,28 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		full := resolve(hc.Dir, name)
-		fi, err := os.Lstat(full)
+		full := resolveHostPath(hc.Dir, name)
+		fi, err := fsLstat(ctx, hc.Dir, "ls", name)
 		if err != nil {
-			fmt.Fprintf(hc.Stderr, "ls: cannot access '%s': No such file or directory\n", name)
+			if os.IsNotExist(err) {
+				fmt.Fprintf(hc.Stderr, "ls: cannot access '%s': No such file or directory\n", name)
+			} else {
+				fmt.Fprintf(hc.Stderr, "ls: cannot access '%s': %v\n", name, err)
+			}
 			code = 2
 			continue
 		}
 		if !*dirOnly && fi.Mode()&os.ModeSymlink != 0 && (strings.HasSuffix(name, "/") || (!*long && !*classify)) {
-			if sfi, serr := os.Stat(full); serr == nil && sfi.IsDir() {
+			if sfi, serr := fsStat(ctx, hc.Dir, "ls", name); serr == nil && sfi.IsDir() {
 				fi = sfi
+			} else if serr != nil && strings.HasSuffix(name, "/") && errors.Is(serr, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "ls: cannot access '%s': %v\n", name, serr)
+				code = 2
+				continue
 			}
 		}
 		if !fi.IsDir() || *dirOnly {
-			if werr := printLsEntryInode(hc, name, full, fi, *long, *human, *classify, *quoted, *inode, *timeStyle); isPipeClosed(werr) {
+			if werr := printLsEntryInode(ctx, hc, hc.Dir, name, name, full, fi, *long, *human, *classify, *quoted, *inode, *timeStyle); isPipeClosed(werr) {
 				return werr
 			}
 			continue
@@ -89,7 +98,7 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		if *recurse {
 			first := true
-			if err := lsRecursive(ctx, hc, name, full, lsOpts{*all, *long, *human, *classify, *quoted, *sortSize, *reverse, *sortTime, *inode, *timeStyle}, &first, []os.FileInfo{fi}); err != nil {
+			if err := lsRecursive(ctx, hc, name, full, fi, lsOpts{*all, *long, *human, *classify, *quoted, *sortSize, *reverse, *sortTime, *inode, *timeStyle}, &first, []os.FileInfo{fi}); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -100,7 +109,7 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 			}
 			continue
 		}
-		entries, err := readDirSorted(full, *all, *sortSize, *reverse, *sortTime)
+		entries, err := readDirSorted(ctx, hc.Dir, name, full, fi, *all, *sortSize, *reverse, *sortTime)
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "ls: cannot open directory '%s': %v\n", name, err)
 			code = 2
@@ -109,7 +118,7 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		if *comma {
 			var names2 []string
 			for _, e := range entries {
-				names2 = append(names2, lsDisplayName(e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *classify, *quoted))
+				names2 = append(names2, lsDisplayName(e.Name(), filepath.Join(full, e.Name()), mustStat(ctx, hc.Dir, name, full, e), *classify, *quoted))
 			}
 			if _, werr := fmt.Fprintln(hc.Stdout, strings.Join(names2, ", ")); isPipeClosed(werr) {
 				return werr
@@ -117,7 +126,7 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 		} else if *cols || *across {
 			var names2 []string
 			for _, e := range entries {
-				names2 = append(names2, lsDisplayName(e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *classify, *quoted))
+				names2 = append(names2, lsDisplayName(e.Name(), filepath.Join(full, e.Name()), mustStat(ctx, hc.Dir, name, full, e), *classify, *quoted))
 			}
 			if _, werr := fmt.Fprintln(hc.Stdout, strings.Join(names2, "  ")); isPipeClosed(werr) {
 				return werr
@@ -127,7 +136,8 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
-				if werr := printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), *long, *human, *classify, *quoted, *inode, *timeStyle); isPipeClosed(werr) {
+				entryRaw := lsChildRaw(name, e.Name())
+				if werr := printLsEntryInode(ctx, hc, hc.Dir, entryRaw, e.Name(), filepath.Join(full, e.Name()), mustStat(ctx, hc.Dir, name, full, e), *long, *human, *classify, *quoted, *inode, *timeStyle); isPipeClosed(werr) {
 					return werr
 				}
 			}
@@ -139,17 +149,27 @@ func cmdLs(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
+func lsChildRaw(dirRaw, elem string) string {
+	if elem == "." {
+		return dirRaw
+	}
+	if elem == ".." {
+		return filepath.Join(dirRaw, "..")
+	}
+	return filepath.Join(dirRaw, elem)
+}
+
 type lsOpts struct {
 	all, long, human, classify, quoted, sortSize, reverse, sortTime bool
 	inode                                                           bool
 	timeStyle                                                       string
 }
 
-func lsRecursive(ctx context.Context, hc interp.HandlerContext, display, full string, o lsOpts, first *bool, ancestors []os.FileInfo) error {
+func lsRecursive(ctx context.Context, hc interp.HandlerContext, display, full string, dirFi os.FileInfo, o lsOpts, first *bool, ancestors []os.FileInfo) error {
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
-	entries, err := readDirSorted(full, o.all, o.sortSize, o.reverse, o.sortTime)
+	entries, err := readDirSorted(ctx, hc.Dir, display, full, dirFi, o.all, o.sortSize, o.reverse, o.sortTime)
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "ls: cannot open directory '%s': %v\n", display, err)
 		return exitError{2}
@@ -167,7 +187,8 @@ func lsRecursive(ctx context.Context, hc interp.HandlerContext, display, full st
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if werr := printLsEntryInode(hc, e.Name(), filepath.Join(full, e.Name()), mustStat(full, e), o.long, o.human, o.classify, o.quoted, o.inode, o.timeStyle); isPipeClosed(werr) {
+		entryRaw := lsChildRaw(display, e.Name())
+		if werr := printLsEntryInode(ctx, hc, hc.Dir, entryRaw, e.Name(), filepath.Join(full, e.Name()), mustStat(ctx, hc.Dir, display, full, e), o.long, o.human, o.classify, o.quoted, o.inode, o.timeStyle); isPipeClosed(werr) {
 			return werr
 		}
 	}
@@ -186,7 +207,9 @@ func lsRecursive(ctx context.Context, hc interp.HandlerContext, display, full st
 			subFull := filepath.Join(full, e.Name())
 			subDisp := strings.TrimSuffix(display, "/") + "/" + e.Name()
 			var subAnc []os.FileInfo
-			if sfi, serr := os.Stat(subFull); serr == nil {
+			var subFi os.FileInfo
+			if sfi, serr := fsStat(ctx, hc.Dir, "ls", subDisp); serr == nil {
+				subFi = sfi
 				loop := false
 				for _, anc := range ancestors {
 					if anc != nil && os.SameFile(anc, sfi) {
@@ -200,10 +223,14 @@ func lsRecursive(ctx context.Context, hc interp.HandlerContext, display, full st
 					continue
 				}
 				subAnc = append(ancestors[:len(ancestors):len(ancestors)], sfi)
+			} else if errors.Is(serr, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "ls: cannot open directory '%s': %v\n", subDisp, serr)
+				hadErr = true
+				continue
 			} else {
 				subAnc = ancestors
 			}
-			if err := lsRecursive(ctx, hc, subDisp, subFull, o, first, subAnc); err != nil {
+			if err := lsRecursive(ctx, hc, subDisp, subFull, subFi, o, first, subAnc); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
 				}
@@ -220,40 +247,69 @@ func lsRecursive(ctx context.Context, hc interp.HandlerContext, display, full st
 	return nil
 }
 
-func mustStat(dir string, e os.DirEntry) os.FileInfo {
+func mustStat(ctx context.Context, baseDir, rawDir, _ string, e os.DirEntry) os.FileInfo {
 	if de, ok := e.(*dotDirEntry); ok {
-		fi, _ := os.Stat(de.real)
+		fi, _ := de.Info()
 		return fi
+	}
+	if CapabilityHookFromContext(ctx) == nil {
+		if fi, err := e.Info(); err == nil {
+			return fi
+		}
+	}
+	if fi, err := fsLstat(ctx, baseDir, "ls", filepath.Join(rawDir, e.Name())); err == nil {
+		return fi
+	}
+	if CapabilityHookFromContext(ctx) != nil {
+		return nil
 	}
 	if fi, err := e.Info(); err == nil {
-		return fi
-	}
-	if fi, err := os.Lstat(filepath.Join(dir, e.Name())); err == nil {
 		return fi
 	}
 	return nil
 }
 
 type dotDirEntry struct {
-	name string
-	real string
+	ctx      context.Context
+	name     string
+	real     string
+	fallback os.FileInfo
 }
 
-func (d *dotDirEntry) Name() string               { return d.name }
-func (d *dotDirEntry) IsDir() bool                { return true }
-func (d *dotDirEntry) Type() os.FileMode          { return os.ModeDir }
-func (d *dotDirEntry) Info() (os.FileInfo, error) { return os.Stat(d.real) }
+type fallbackDirInfo struct{ name string }
 
-func readDirSorted(dir string, all, sortSize, reverse, sortTime bool) ([]os.DirEntry, error) {
-	entries, err := os.ReadDir(dir)
+func (d fallbackDirInfo) Name() string       { return d.name }
+func (d fallbackDirInfo) Size() int64        { return 0 }
+func (d fallbackDirInfo) Mode() os.FileMode  { return os.ModeDir | 0o755 }
+func (d fallbackDirInfo) ModTime() time.Time { return time.Time{} }
+func (d fallbackDirInfo) IsDir() bool        { return true }
+func (d fallbackDirInfo) Sys() any           { return nil }
+
+func (d *dotDirEntry) Name() string      { return d.name }
+func (d *dotDirEntry) IsDir() bool       { return true }
+func (d *dotDirEntry) Type() os.FileMode { return os.ModeDir }
+func (d *dotDirEntry) Info() (os.FileInfo, error) {
+	fi, err := fsStat(d.ctx, "", "ls", d.real)
+	if err != nil {
+		if d.fallback != nil {
+			return d.fallback, nil
+		}
+		return fallbackDirInfo{name: d.name}, nil
+	}
+	return fi, nil
+}
+
+func readDirSorted(ctx context.Context, baseDir, rawDir, fullDir string, dirFi os.FileInfo, all, sortSize, reverse, sortTime bool) ([]os.DirEntry, error) {
+	entries, err := fsReadDir(ctx, baseDir, "ls", rawDir)
 	if err != nil {
 		return nil, err
 	}
+	hookActive := CapabilityHookFromContext(ctx) != nil
 	var dots []os.DirEntry
 	if all {
 		dots = []os.DirEntry{
-			&dotDirEntry{name: ".", real: dir},
-			&dotDirEntry{name: "..", real: filepath.Dir(dir)},
+			&dotDirEntry{ctx: ctx, name: ".", real: fullDir, fallback: dirFi},
+			&dotDirEntry{ctx: ctx, name: "..", real: filepath.Dir(fullDir), fallback: dirFi},
 		}
 	} else {
 		filtered := entries[:0:0]
@@ -264,13 +320,29 @@ func readDirSorted(dir string, all, sortSize, reverse, sortTime bool) ([]os.DirE
 		}
 		entries = filtered
 	}
+	if hookActive {
+		allowed := entries[:0:0]
+		for _, e := range entries {
+			if _, lerr := checkFSNoFollowLeaf(ctx, baseDir, "ls", filepath.Join(rawDir, e.Name()), OpStat); lerr == nil {
+				allowed = append(allowed, e)
+			}
+		}
+		entries = allowed
+	}
 	entries = append(dots, entries...)
 	statCache := map[string]os.FileInfo{}
 	stat := func(e os.DirEntry) os.FileInfo {
 		if fi, ok := statCache[e.Name()]; ok {
 			return fi
 		}
-		fi, _ := e.Info()
+		var fi os.FileInfo
+		if de, ok := e.(*dotDirEntry); ok {
+			fi, _ = de.Info()
+		} else if !hookActive {
+			fi, _ = e.Info()
+		} else {
+			fi, _ = fsLstat(ctx, baseDir, "ls", filepath.Join(rawDir, e.Name()))
+		}
 		statCache[e.Name()] = fi
 		return fi
 	}
@@ -341,7 +413,7 @@ func lsTimeFormat(mt time.Time, style string) string {
 	return mt.Format("Jan _2 15:04")
 }
 
-func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted bool, timeStyle string) error {
+func printLsEntry(ctx context.Context, hc interp.HandlerContext, baseDir, rawEntry, display, _ string, fi os.FileInfo, long, human, classify, quoted bool, timeStyle string) error {
 	name := display
 	if quoted {
 		name = fmt.Sprintf("%q", display)
@@ -361,7 +433,7 @@ func printLsEntry(hc interp.HandlerContext, display, full string, fi os.FileInfo
 	}
 	// GNU `ls -l` renders symlinks as "name -> target".
 	if fi.Mode()&os.ModeSymlink != 0 {
-		if target, err := os.Readlink(full); err == nil {
+		if target, err := fsReadlink(ctx, baseDir, "ls", rawEntry); err == nil {
 			name += " -> " + target
 		}
 	}
@@ -486,28 +558,28 @@ func lsDisplayName(display, full string, fi os.FileInfo, classify, quoted bool) 
 	return name
 }
 
-func printLsEntryInode(hc interp.HandlerContext, display, full string, fi os.FileInfo, long, human, classify, quoted, inode bool, timeStyle string) error {
-	if inode && !long {
-		var ino string
-		if _, err := os.Lstat(full); err == nil {
-			ino = fmt.Sprintf("%d", inodeOf(full))
-		} else {
-			ino = "?"
+func printLsEntryInode(ctx context.Context, hc interp.HandlerContext, baseDir, rawEntry, display, full string, fi os.FileInfo, long, human, classify, quoted, inode bool, timeStyle string) error {
+	lookupIno := func() string {
+		if display == "." || display == ".." {
+			if _, err := fsStat(ctx, "", "ls", full); err == nil {
+				return fmt.Sprintf("%d", inodeOf(full))
+			}
+			return "?"
 		}
-		_, err := fmt.Fprintf(hc.Stdout, "%s %s\n", ino, lsDisplayName(display, full, fi, classify, quoted))
+		if _, err := fsLstat(ctx, baseDir, "ls", rawEntry); err == nil {
+			return fmt.Sprintf("%d", inodeOf(full))
+		}
+		return "?"
+	}
+	if inode && !long {
+		_, err := fmt.Fprintf(hc.Stdout, "%s %s\n", lookupIno(), lsDisplayName(display, full, fi, classify, quoted))
 		return err
 	}
 	if inode && long {
-		var ino string
-		if _, err := os.Lstat(full); err == nil {
-			ino = fmt.Sprintf("%d", inodeOf(full))
-		} else {
-			ino = "?"
-		}
-		if _, err := fmt.Fprintf(hc.Stdout, "%s ", ino); err != nil {
+		if _, err := fmt.Fprintf(hc.Stdout, "%s ", lookupIno()); err != nil {
 			return err
 		}
-		return printLsEntry(hc, display, full, fi, long, human, classify, quoted, timeStyle)
+		return printLsEntry(ctx, hc, baseDir, rawEntry, display, full, fi, long, human, classify, quoted, timeStyle)
 	}
-	return printLsEntry(hc, display, full, fi, long, human, classify, quoted, timeStyle)
+	return printLsEntry(ctx, hc, baseDir, rawEntry, display, full, fi, long, human, classify, quoted, timeStyle)
 }

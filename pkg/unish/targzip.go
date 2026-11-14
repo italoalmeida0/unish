@@ -12,6 +12,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 
 	"mvdan.cc/sh/v3/interp"
@@ -59,10 +60,18 @@ func cmdTar(ctx context.Context, hc interp.HandlerContext, args []string) error 
 	}
 	base := hc.Dir
 	if *dir != "" {
-		base = resolve(hc.Dir, *dir)
-		fi, err := os.Stat(base)
+		if _, err := checkChdir(ctx, hc.Dir, "tar", *dir); err != nil {
+			fmt.Fprintf(hc.Stderr, "tar: %s: Cannot open: %v\n", *dir, err)
+			fmt.Fprintln(hc.Stderr, "tar: Error is not recoverable: exiting now")
+			return exitError{2}
+		}
+		fi, err := fsStat(ctx, hc.Dir, "tar", *dir)
 		if err != nil {
-			fmt.Fprintf(hc.Stderr, "tar: %s: Cannot open: No such file or directory\n", *dir)
+			if os.IsNotExist(err) {
+				fmt.Fprintf(hc.Stderr, "tar: %s: Cannot open: No such file or directory\n", *dir)
+			} else {
+				fmt.Fprintf(hc.Stderr, "tar: %s: Cannot open: %v\n", *dir, err)
+			}
 			fmt.Fprintln(hc.Stderr, "tar: Error is not recoverable: exiting now")
 			return exitError{2}
 		}
@@ -71,28 +80,37 @@ func cmdTar(ctx context.Context, hc interp.HandlerContext, args []string) error 
 			fmt.Fprintln(hc.Stderr, "tar: Error is not recoverable: exiting now")
 			return exitError{2}
 		}
+		base = resolveHostPath(hc.Dir, *dir)
 	}
-	archive := resolve(hc.Dir, *file)
+	archiveRaw := *file
 	switch {
 	case *create:
-		return tarCreate(ctx, hc, archive, base, filterTarExcludes(fs.Args(), excludes), excludes, *zip, *verb, *absNames)
+		return tarCreate(ctx, hc, archiveRaw, base, filterTarExcludes(fs.Args(), excludes), excludes, *zip, *verb, *absNames)
 	case *extract:
-		return tarExtract(ctx, hc, archive, base, fs.Args(), excludes, *zip, *verb, *keepOld, *absNames)
+		return tarExtract(ctx, hc, archiveRaw, base, fs.Args(), excludes, *zip, *verb, *keepOld, *absNames)
 	default:
-		return tarList(ctx, hc, archive, fs.Args(), excludes, *zip, *verb)
+		return tarList(ctx, hc, archiveRaw, fs.Args(), excludes, *zip, *verb)
 	}
 }
 
-func tarOpenWriter(hc interp.HandlerContext, archive string, zip bool) (io.Closer, *gzip.Writer, *tar.Writer, error) {
-	var f *os.File
+func tarOpenWriter(ctx context.Context, hc interp.HandlerContext, archiveRaw string, zip bool) (io.Closer, *gzip.Writer, *tar.Writer, error) {
+	var f io.Closer
 	raw := hc.Stdout
-	if archive != "-" {
-		var err error
-		f, err = os.Create(archive)
-		if err != nil {
-			return nil, nil, nil, err
+	if archiveRaw != "-" {
+		if pw, ok, perr := openProcSubstOut(archiveRaw); ok {
+			if perr != nil {
+				return nil, nil, nil, perr
+			}
+			f = pw
+			raw = pw
+		} else {
+			cf, err := fsCreate(ctx, hc.Dir, "tar", archiveRaw)
+			if err != nil {
+				return nil, nil, nil, err
+			}
+			f = cf
+			raw = cf
 		}
-		raw = f
 	}
 	// tar writes 512-byte blocks; reuse a pooled 64 KB buffer to batch
 	// writes without per-invocation heap allocations.
@@ -111,7 +129,7 @@ func tarOpenWriter(hc interp.HandlerContext, archive string, zip bool) (io.Close
 // file, if any ("-" archives are stdout and must not be closed).
 type tarWriteCloser struct {
 	bw *bufio.Writer
-	f  *os.File
+	f  io.Closer
 }
 
 func (c *tarWriteCloser) Close() error {
@@ -163,10 +181,10 @@ func tarRelPath(base, path string, absNames bool) (rel string, inBase bool) {
 	return rel, inBase
 }
 
-func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base string, paths, excludes []string, zip, verb, absNames bool) error {
+func tarCreate(ctx context.Context, hc interp.HandlerContext, archiveRaw, base string, paths, excludes []string, zip, verb, absNames bool) error {
 	if len(paths) == 0 {
 		// GNU: excluding everything yields an empty (valid) archive, rc 0.
-		f, gz, tw, err := tarOpenWriter(hc, archive, zip)
+		f, gz, tw, err := tarOpenWriter(ctx, hc, archiveRaw, zip)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "tar:", err)
 			return exitError{1}
@@ -180,16 +198,17 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 		}
 		return nil
 	}
-	f, gz, tw, err := tarOpenWriter(hc, archive, zip)
+	f, gz, tw, err := tarOpenWriter(ctx, hc, archiveRaw, zip)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tar:", err)
 		return exitError{1}
 	}
 	var archFi os.FileInfo
-	if archive != "-" {
-		archFi, _ = os.Stat(archive)
+	if archiveRaw != "-" && !isActiveProcSubstPath(archiveRaw) {
+		archFi, _ = fsStat(ctx, hc.Dir, "tar", archiveRaw)
 	}
 	code := 0
+	hookActive := CapabilityHookFromContext(ctx) != nil
 	// Identity lookups read /etc/passwd+group; do them once per run,
 	// not once per archived file. Reuse a pooled 64 KB copy buffer.
 	_, uname, _, gname := identity()
@@ -197,13 +216,13 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 	defer bufPool64K.Put(bp)
 	copyBuf := (*bp)[:64*1024]
 	verbOut := hc.Stdout
-	if archive == "-" {
+	if archiveRaw == "-" {
 		// Never corrupt binary archive data written to stdout.
 		verbOut = hc.Stderr
 	}
 
-	var walkTar func(path, rel string, inBase bool, info os.FileInfo) error
-	walkTar = func(path, rel string, inBase bool, info os.FileInfo) error {
+	var walkTar func(rawSpec, path, rel string, inBase bool, info os.FileInfo) error
+	walkTar = func(rawSpec, path, rel string, inBase bool, info os.FileInfo) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -216,7 +235,7 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 		}
 		linkTarget := ""
 		if info.Mode()&os.ModeSymlink != 0 {
-			lt, lerr := os.Readlink(path)
+			lt, lerr := fsReadlink(ctx, base, "tar", rawSpec)
 			if lerr != nil {
 				return lerr
 			}
@@ -243,7 +262,7 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 			return err
 		}
 		if info.Mode().IsRegular() {
-			fh, err := os.Open(path)
+			fh, err := fsOpen(ctx, base, "tar", rawSpec)
 			if err != nil {
 				return err
 			}
@@ -284,7 +303,7 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 		if !isDir {
 			return nil
 		}
-		entries, err := os.ReadDir(path)
+		entries, err := fsReadDir(ctx, base, "tar", rawSpec)
 		if err != nil {
 			return err
 		}
@@ -300,11 +319,18 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
-			cinfo, ierr := e.Info()
+			ename := e.Name()
+			childSpec := filepath.Join(rawSpec, ename)
+			var cinfo os.FileInfo
+			var ierr error
+			if hookActive {
+				cinfo, ierr = fsLstat(ctx, base, "tar", childSpec)
+			} else {
+				cinfo, ierr = e.Info()
+			}
 			if ierr != nil {
 				return ierr
 			}
-			ename := e.Name()
 			childPath := dirPrefix + ename
 			var childRel string
 			childInBase := inBase
@@ -313,7 +339,7 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 			} else {
 				childRel, childInBase = tarRelPath(base, childPath, absNames)
 			}
-			if werr := walkTar(childPath, childRel, childInBase, cinfo); werr != nil {
+			if werr := walkTar(childSpec, childPath, childRel, childInBase, cinfo); werr != nil {
 				return werr
 			}
 		}
@@ -325,11 +351,11 @@ func tarCreate(ctx context.Context, hc interp.HandlerContext, archive, base stri
 			_ = closeTarWriters(tw, gz, f)
 			return ctx.Err()
 		}
-		full := resolve(base, p)
-		info, err := os.Lstat(full)
+		full := resolveHostPath(base, p)
+		info, err := fsLstat(ctx, base, "tar", p)
 		if err == nil {
 			rel, inBase := tarRelPath(base, full, absNames)
-			err = walkTar(full, rel, inBase, info)
+			err = walkTar(p, full, rel, inBase, info)
 		}
 		if err != nil {
 			if ctx.Err() != nil {
@@ -373,13 +399,13 @@ func (nopReadWriteCloser) Close() error                { return nil }
 // tarOpenReader opens the archive for reading; "-" is stdin, like GNU
 // tar. Gzip input is sniffed transparently; the sniffed bytes are
 // re-prepended so no seeking/reopening is needed (works for pipes).
-func tarOpenReader(hc interp.HandlerContext, archive string, zip bool) (io.ReadWriteCloser, *gzip.Reader, *tar.Reader, error) {
+func tarOpenReader(ctx context.Context, hc interp.HandlerContext, archiveRaw string, zip bool) (io.ReadWriteCloser, *gzip.Reader, *tar.Reader, error) {
 	var f io.ReadWriteCloser
-	if archive == "-" {
+	if archiveRaw == "-" {
 		f = nopReadWriteCloser{hc.Stdin}
 	} else {
 		var err error
-		f, err = openShellFile(archive)
+		f, err = fsOpenShellFile(ctx, hc.Dir, "tar", archiveRaw)
 		if err != nil {
 			return nil, nil, nil, err
 		}
@@ -409,13 +435,54 @@ func tarOpenReader(hc interp.HandlerContext, archive string, zip bool) (io.ReadW
 }
 
 type deferredHardLink struct {
-	hdrName string
-	src     string
-	target  string
+	hdrName    string
+	srcSpec    string
+	srcFull    string
+	targetSpec string
+	targetFull string
 }
 
-func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base string, only, excludes []string, zip, verb, keepOld, absNames bool) error {
-	f, gz, tr, err := tarOpenReader(hc, archive, zip)
+func precheckTarLink(ctx context.Context, base, oldSpec, targetSpec string, sym bool) error {
+	hook := CapabilityHookFromContext(ctx)
+	if hook == nil {
+		return nil
+	}
+	newPath, err := checkFSNoFollowLeaf(ctx, base, "tar", targetSpec, OpWrite)
+	if err != nil {
+		return err
+	}
+	linkBase := base
+	if sym {
+		linkBase = filepath.Dir(newPath)
+	}
+	resolved := resolveHostPath(linkBase, oldSpec)
+	realPath, lexPath := canonicalizeForCheck(resolved)
+	if err := hook.CheckAccess(ctx, AccessRequest{
+		Op:         OpLink,
+		Command:    "tar",
+		Path:       realPath,
+		RawPath:    oldSpec,
+		TargetPath: newPath,
+	}); err != nil {
+		return err
+	}
+	checkLex := canonicalLexicalInDir(linkBase, oldSpec, lexPath)
+	if !sameCleanPath(checkLex, realPath) {
+		if err := hook.CheckAccess(ctx, AccessRequest{
+			Op:         OpLink,
+			Command:    "tar",
+			Path:       checkLex,
+			RawPath:    oldSpec,
+			TargetPath: newPath,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func tarExtract(ctx context.Context, hc interp.HandlerContext, archiveRaw, base string, only, excludes []string, zip, verb, keepOld, absNames bool) error {
+	f, gz, tr, err := tarOpenReader(ctx, hc, archiveRaw, zip)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tar:", err)
 		return exitError{1}
@@ -448,8 +515,10 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 			continue
 		}
 		target := ""
+		targetSpec := ""
 		if absNames && (filepath.IsAbs(filepath.FromSlash(hdr.Name)) || strings.HasPrefix(hdr.Name, "/")) {
-			target = filepath.Clean(resolve(base, filepath.FromSlash(hdr.Name)))
+			target = filepath.Clean(resolveHostPath(base, filepath.FromSlash(hdr.Name)))
+			targetSpec = target
 		} else {
 			name := filepath.FromSlash(hdr.Name)
 			if filepath.IsAbs(name) || strings.HasPrefix(hdr.Name, "/") || filepath.VolumeName(name) != "" {
@@ -465,8 +534,9 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 				}
 				continue
 			}
+			targetSpec = name
 			target = filepath.Join(base, name)
-			if !isWithinDir(base, target) || !isSafeExtractAncestors(base, target) {
+			if !isWithinDir(base, target) || !isSafeExtractAncestors(ctx, base, target) {
 				fmt.Fprintf(hc.Stderr, "tar: skipping '%s': outside destination\n", hdr.Name)
 				code = 2
 				continue
@@ -482,9 +552,10 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 			}
 		}
 
+		parentSpec := filepath.Dir(targetSpec)
 		switch hdr.Typeflag {
 		case tar.TypeDir:
-			if err := os.MkdirAll(target, mode.Perm()|0o700); err != nil {
+			if err := fsMkdirAll(ctx, base, "tar", targetSpec, mode.Perm()|0o700); err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
@@ -503,11 +574,15 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 					continue
 				}
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := precheckTarLink(ctx, base, linkRaw, targetSpec, true); err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
-			if lfi, lerr := os.Lstat(target); lerr == nil {
+			if err := fsMkdirAll(ctx, base, "tar", parentSpec, 0o755); err != nil {
+				fmt.Fprintln(hc.Stderr, "tar:", err)
+				return exitError{1}
+			}
+			if lfi, lerr := fsLstat(ctx, base, "tar", targetSpec); lerr == nil {
 				if keepOld {
 					continue
 				}
@@ -516,31 +591,43 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 					code = 1
 					continue
 				}
-				_ = os.Remove(target)
+				if rerr := fsRemove(ctx, base, "tar", targetSpec); rerr != nil && !os.IsNotExist(rerr) {
+					fmt.Fprintln(hc.Stderr, "tar:", rerr)
+					return exitError{1}
+				}
+			} else if errors.Is(lerr, os.ErrPermission) {
+				fmt.Fprintln(hc.Stderr, "tar:", lerr)
+				return exitError{1}
 			}
-			if err := os.Symlink(linkRaw, target); err != nil {
+			if err := fsSymlink(ctx, base, "tar", linkRaw, targetSpec); err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
 		case tar.TypeLink:
 			linkName := filepath.FromSlash(hdr.Linkname)
-			var linkSrc string
+			var linkSrc, linkSrcSpec string
 			if absNames && (filepath.IsAbs(linkName) || strings.HasPrefix(hdr.Linkname, "/")) {
-				linkSrc = filepath.Clean(resolve(base, linkName))
+				linkSrc = filepath.Clean(resolveHostPath(base, linkName))
+				linkSrcSpec = linkSrc
 			} else {
 				linkName = stripLeadingRoot(linkName)
+				linkSrcSpec = linkName
 				linkSrc = filepath.Join(base, linkName)
-				if !isWithinDir(base, linkSrc) || !isSafeExtractAncestors(base, linkSrc) {
+				if !isWithinDir(base, linkSrc) || !isSafeExtractAncestors(ctx, base, linkSrc) {
 					fmt.Fprintf(hc.Stderr, "tar: skipping '%s': link target outside destination\n", hdr.Name)
 					code = 2
 					continue
 				}
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if err := precheckTarLink(ctx, base, linkSrcSpec, targetSpec, false); err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
-			if lfi, lerr := os.Lstat(target); lerr == nil {
+			if err := fsMkdirAll(ctx, base, "tar", parentSpec, 0o755); err != nil {
+				fmt.Fprintln(hc.Stderr, "tar:", err)
+				return exitError{1}
+			}
+			if lfi, lerr := fsLstat(ctx, base, "tar", targetSpec); lerr == nil {
 				if keepOld {
 					continue
 				}
@@ -549,25 +636,45 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 					code = 1
 					continue
 				}
-				_ = os.Remove(target)
+				if rerr := fsRemove(ctx, base, "tar", targetSpec); rerr != nil && !os.IsNotExist(rerr) {
+					fmt.Fprintln(hc.Stderr, "tar:", rerr)
+					return exitError{1}
+				}
+			} else if errors.Is(lerr, os.ErrPermission) {
+				fmt.Fprintln(hc.Stderr, "tar:", lerr)
+				return exitError{1}
 			}
-			if _, serr := os.Lstat(linkSrc); serr != nil {
-				pendingLinks = append(pendingLinks, deferredHardLink{hdrName: hdr.Name, src: linkSrc, target: target})
-			} else if err := os.Link(linkSrc, target); err != nil {
+			if _, serr := fsLstat(ctx, base, "tar", linkSrcSpec); serr != nil {
+				if errors.Is(serr, os.ErrPermission) {
+					fmt.Fprintln(hc.Stderr, "tar:", serr)
+					return exitError{1}
+				}
+				pendingLinks = append(pendingLinks, deferredHardLink{
+					hdrName:    hdr.Name,
+					srcSpec:    linkSrcSpec,
+					srcFull:    linkSrc,
+					targetSpec: targetSpec,
+					targetFull: target,
+				})
+			} else if err := fsLink(ctx, base, "tar", linkSrcSpec, targetSpec); err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
 		default:
-			if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+			if _, err := checkFSNoFollowLeaf(ctx, base, "tar", targetSpec, OpWrite); err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
-			if !absNames && !isSafeExtractAncestors(base, target) {
+			if err := fsMkdirAll(ctx, base, "tar", parentSpec, 0o755); err != nil {
+				fmt.Fprintln(hc.Stderr, "tar:", err)
+				return exitError{1}
+			}
+			if !absNames && !isSafeExtractAncestors(ctx, base, target) {
 				fmt.Fprintf(hc.Stderr, "tar: skipping '%s': outside destination\n", hdr.Name)
 				code = 2
 				continue
 			}
-			if lfi, lerr := os.Lstat(target); lerr == nil {
+			if lfi, lerr := fsLstat(ctx, base, "tar", targetSpec); lerr == nil {
 				if keepOld {
 					continue
 				}
@@ -577,9 +684,15 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 					continue
 				}
 				// Unlink existing file/symlink first so O_CREATE never writes through a symlink.
-				_ = os.Remove(target)
+				if rerr := fsRemove(ctx, base, "tar", targetSpec); rerr != nil && !os.IsNotExist(rerr) {
+					fmt.Fprintln(hc.Stderr, "tar:", rerr)
+					return exitError{1}
+				}
+			} else if errors.Is(lerr, os.ErrPermission) {
+				fmt.Fprintln(hc.Stderr, "tar:", lerr)
+				return exitError{1}
 			}
-			out, err := os.OpenFile(target, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
+			out, err := fsOpenFile(ctx, base, "tar", targetSpec, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode.Perm())
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
@@ -587,7 +700,7 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 			_, err = io.Copy(out, tr)
 			cerr := out.Close()
 			if err != nil {
-				_ = os.Remove(target)
+				_ = fsRemove(ctx, base, "tar", targetSpec)
 				fmt.Fprintln(hc.Stderr, "tar:", err)
 				return exitError{1}
 			}
@@ -602,12 +715,12 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 	}
 
 	for _, pl := range pendingLinks {
-		if !absNames && (!isSafeExtractAncestors(base, pl.src) || !isSafeExtractAncestors(base, pl.target)) {
+		if !absNames && (!isSafeExtractAncestors(ctx, base, pl.srcFull) || !isSafeExtractAncestors(ctx, base, pl.targetFull)) {
 			fmt.Fprintf(hc.Stderr, "tar: skipping '%s': outside destination\n", pl.hdrName)
 			code = 2
 			continue
 		}
-		if err := os.Link(pl.src, pl.target); err != nil {
+		if err := fsLink(ctx, base, "tar", pl.srcSpec, pl.targetSpec); err != nil {
 			fmt.Fprintln(hc.Stderr, "tar:", err)
 			return exitError{1}
 		}
@@ -625,8 +738,8 @@ func tarExtract(ctx context.Context, hc interp.HandlerContext, archive, base str
 	return nil
 }
 
-func tarList(ctx context.Context, hc interp.HandlerContext, archive string, only, excludes []string, zip, verb bool) error {
-	f, gz, tr, err := tarOpenReader(hc, archive, zip)
+func tarList(ctx context.Context, hc interp.HandlerContext, archiveRaw string, only, excludes []string, zip, verb bool) error {
+	f, gz, tr, err := tarOpenReader(ctx, hc, archiveRaw, zip)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "tar:", err)
 		return exitError{1}
@@ -710,19 +823,19 @@ func tarMatchOnly(hdrName string, only []string, matched []bool) bool {
 	return hit
 }
 
-func cmdGzip(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return gzipRun(hc, "gzip", args, false, true)
+func cmdGzip(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	return gzipRun(ctx, hc, "gzip", args, false, true)
 }
 
-func cmdGunzip(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return gzipRun(hc, "gunzip", args, true, true)
+func cmdGunzip(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	return gzipRun(ctx, hc, "gunzip", args, true, true)
 }
 
-func cmdGzcat(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return gzipRun(hc, "gzcat", args, true, false)
+func cmdGzcat(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	return gzipRun(ctx, hc, "gzcat", args, true, false)
 }
 
-func gzipRun(hc interp.HandlerContext, name string, args []string, decode, removeOrig bool) error {
+func gzipRun(ctx context.Context, hc interp.HandlerContext, name string, args []string, decode, removeOrig bool) error {
 	args = expandGzipArgs(args)
 	fs := newFlagSet(name, hc.Stderr)
 	keep := fs.Bool("k", false, "")
@@ -784,6 +897,9 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 	}
 	code := 0
 	for _, p := range files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		if p == "-" {
 			if decode {
 				if err := gunzipStream(hc.Stdin, hc.Stdout, *force); err != nil {
@@ -809,32 +925,36 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 			}
 			continue
 		}
-		full := resolve(hc.Dir, p)
-		sfi, serr := os.Stat(full)
-		if serr != nil {
-			fmt.Fprintf(hc.Stderr, "%s: %v\n", name, serr)
-			code = 1
-			continue
-		}
-		if sfi.IsDir() {
-			fmt.Fprintf(hc.Stderr, "%s: %s is a directory -- ignored\n", name, p)
-			code = 1
-			continue
+		if !isActiveProcSubstPath(p) {
+			sfi, serr := fsStat(ctx, hc.Dir, name, p)
+			if serr != nil {
+				fmt.Fprintf(hc.Stderr, "%s: %v\n", name, serr)
+				code = 1
+				continue
+			}
+			if sfi.IsDir() {
+				fmt.Fprintf(hc.Stderr, "%s: %s is a directory -- ignored\n", name, p)
+				code = 1
+				continue
+			}
 		}
 		if decode {
 			out := strings.TrimSuffix(p, ".gz")
 			if out == p {
 				out = p + ".out"
 			}
-			dst := resolve(hc.Dir, out)
 			if !toStdout && !*force {
-				if _, lerr := os.Lstat(dst); lerr == nil {
+				if _, lerr := fsLstat(ctx, hc.Dir, name, out); lerr == nil {
 					fmt.Fprintf(hc.Stderr, "%s: %s already exists; not overwritten\n", name, out)
+					code = 1
+					continue
+				} else if errors.Is(lerr, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "%s: %v\n", name, lerr)
 					code = 1
 					continue
 				}
 			}
-			if err := gunzipFile(hc, full, dst, toStdout, *force); err != nil {
+			if err := gunzipFile(ctx, hc, name, p, out, toStdout, *force); err != nil {
 				if isPipeClosed(err) {
 					return err
 				}
@@ -849,22 +969,25 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 				continue
 			}
 			if removeOrig && !*keep && !toStdout {
-				if rerr := os.Remove(full); rerr != nil {
+				if rerr := fsRemove(ctx, hc.Dir, name, p); rerr != nil {
 					fmt.Fprintf(hc.Stderr, "%s: %v\n", name, rerr)
 					code = 1
 				}
 			}
 		} else {
 			outDisp := p + ".gz"
-			out := full + ".gz"
 			if !toStdout && !*force {
-				if _, lerr := os.Lstat(out); lerr == nil {
+				if _, lerr := fsLstat(ctx, hc.Dir, name, outDisp); lerr == nil {
 					fmt.Fprintf(hc.Stderr, "%s: %s already exists; not overwritten\n", name, outDisp)
+					code = 1
+					continue
+				} else if errors.Is(lerr, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "%s: %v\n", name, lerr)
 					code = 1
 					continue
 				}
 			}
-			if err := gzipFile(hc, full, out, toStdout, *force); err != nil {
+			if err := gzipFile(ctx, hc, name, p, outDisp, toStdout, *force); err != nil {
 				if isPipeClosed(err) {
 					return err
 				}
@@ -873,7 +996,7 @@ func gzipRun(hc interp.HandlerContext, name string, args []string, decode, remov
 				continue
 			}
 			if removeOrig && !*keep && !toStdout {
-				if rerr := os.Remove(full); rerr != nil {
+				if rerr := fsRemove(ctx, hc.Dir, name, p); rerr != nil {
 					fmt.Fprintf(hc.Stderr, "%s: %v\n", name, rerr)
 					code = 1
 				}
@@ -955,8 +1078,8 @@ func gunzipStream(r io.Reader, w io.Writer, forcePassthrough bool) error {
 	return gr.Close()
 }
 
-func gzipFile(hc interp.HandlerContext, src, dst string, toStdout, force bool) error {
-	in, err := os.Open(src)
+func gzipFile(ctx context.Context, hc interp.HandlerContext, name, srcSpec, dstSpec string, toStdout, force bool) error {
+	in, err := fsOpenShellFile(ctx, hc.Dir, name, srcSpec)
 	if err != nil {
 		return err
 	}
@@ -969,7 +1092,10 @@ func gzipFile(hc interp.HandlerContext, src, dst string, toStdout, force bool) e
 		}
 		return err
 	}
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".unish-gzip-*")
+	if _, err := checkFS(ctx, hc.Dir, name, dstSpec, OpWrite); err != nil {
+		return err
+	}
+	tmp, err := fsCreateTemp(ctx, hc.Dir, name, filepath.Dir(dstSpec), ".unish-gzip-*")
 	if err != nil {
 		return err
 	}
@@ -985,23 +1111,28 @@ func gzipFile(hc interp.HandlerContext, src, dst string, toStdout, force bool) e
 		err = cerr
 	}
 	if err != nil {
-		_ = os.Remove(tmpName)
+		_ = fsRemove(ctx, "", name, tmpName)
 		return err
 	}
 	_ = in.Close()
 	if force {
-		_ = os.Chmod(dst, 0o666)
-		_ = os.Remove(dst)
+		if runtime.GOOS == "windows" {
+			_ = fsChmod(ctx, hc.Dir, name, dstSpec, 0o666)
+		}
+		if rerr := fsRemove(ctx, hc.Dir, name, dstSpec); rerr != nil && !os.IsNotExist(rerr) && errors.Is(rerr, os.ErrPermission) {
+			_ = fsRemove(ctx, "", name, tmpName)
+			return rerr
+		}
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		_ = os.Remove(tmpName)
+	if err := fsRename(ctx, "", name, tmpName, resolveHostPath(hc.Dir, dstSpec)); err != nil {
+		_ = fsRemove(ctx, "", name, tmpName)
 		return err
 	}
 	return nil
 }
 
-func gunzipFile(hc interp.HandlerContext, src, dst string, toStdout, force bool) error {
-	in, err := os.Open(src)
+func gunzipFile(ctx context.Context, hc interp.HandlerContext, name, srcSpec, dstSpec string, toStdout, force bool) error {
+	in, err := fsOpenShellFile(ctx, hc.Dir, name, srcSpec)
 	if err != nil {
 		return err
 	}
@@ -1009,12 +1140,15 @@ func gunzipFile(hc interp.HandlerContext, src, dst string, toStdout, force bool)
 	if toStdout {
 		return gunzipStream(in, hc.Stdout, force)
 	}
+	if _, err := checkFS(ctx, hc.Dir, name, dstSpec, OpWrite); err != nil {
+		return err
+	}
 	gr, err := gzip.NewReader(in)
 	if err != nil {
 		return errNotGzipFormat
 	}
 	defer gr.Close()
-	tmp, err := os.CreateTemp(filepath.Dir(dst), ".unish-gunzip-*")
+	tmp, err := fsCreateTemp(ctx, hc.Dir, name, filepath.Dir(dstSpec), ".unish-gunzip-*")
 	if err != nil {
 		return err
 	}
@@ -1029,16 +1163,21 @@ func gunzipFile(hc interp.HandlerContext, src, dst string, toStdout, force bool)
 		err = cerr
 	}
 	if err != nil {
-		_ = os.Remove(tmpName)
+		_ = fsRemove(ctx, "", name, tmpName)
 		return err
 	}
 	_ = in.Close()
 	if force {
-		_ = os.Chmod(dst, 0o666)
-		_ = os.Remove(dst)
+		if runtime.GOOS == "windows" {
+			_ = fsChmod(ctx, hc.Dir, name, dstSpec, 0o666)
+		}
+		if rerr := fsRemove(ctx, hc.Dir, name, dstSpec); rerr != nil && !os.IsNotExist(rerr) && errors.Is(rerr, os.ErrPermission) {
+			_ = fsRemove(ctx, "", name, tmpName)
+			return rerr
+		}
 	}
-	if err := os.Rename(tmpName, dst); err != nil {
-		_ = os.Remove(tmpName)
+	if err := fsRename(ctx, "", name, tmpName, resolveHostPath(hc.Dir, dstSpec)); err != nil {
+		_ = fsRemove(ctx, "", name, tmpName)
 		return err
 	}
 	return nil
@@ -1059,9 +1198,9 @@ func isGzipFormatError(err error) bool {
 
 // isWithinDir reports whether target resides inside base (after cleaning).
 func isWithinDir(base, target string) bool {
-	absBase, err1 := filepath.Abs(base)
-	absTarget, err2 := filepath.Abs(target)
-	if err1 != nil || err2 != nil {
+	absBase := absFromDir("", base)
+	absTarget := absFromDir("", target)
+	if absBase == "" || absTarget == "" {
 		return false
 	}
 	rel, err := filepath.Rel(absBase, absTarget)
@@ -1073,14 +1212,14 @@ func isWithinDir(base, target string) bool {
 
 // isSafeExtractAncestors verifies that no existing directory/symlink ancestor
 // between base and filepath.Dir(target) resolves outside base's real path.
-func isSafeExtractAncestors(base, target string) bool {
-	absBase, err1 := filepath.Abs(base)
-	absTarget, err2 := filepath.Abs(target)
-	if err1 != nil || err2 != nil {
+func isSafeExtractAncestors(ctx context.Context, base, target string) bool {
+	absBase := absFromDir("", base)
+	absTarget := absFromDir("", target)
+	if absBase == "" || absTarget == "" {
 		return false
 	}
 	realBase := absBase
-	if rb, err := filepath.EvalSymlinks(absBase); err == nil {
+	if rb, _ := canonicalizeForCheck(absBase); rb != "" {
 		realBase = rb
 	}
 	rel, err := filepath.Rel(absBase, filepath.Dir(absTarget))
@@ -1096,16 +1235,16 @@ func isSafeExtractAncestors(base, target string) bool {
 			continue
 		}
 		cur = filepath.Join(cur, part)
-		lfi, lerr := os.Lstat(cur)
+		lfi, lerr := fsLstat(ctx, "", "tar", cur)
 		if lerr != nil {
+			if errors.Is(lerr, os.ErrPermission) {
+				return false
+			}
 			// Remaining deeper components do not exist on disk yet.
 			break
 		}
-		realCur, rerr := filepath.EvalSymlinks(cur)
-		if rerr != nil {
-			return false
-		}
-		if !isWithinDir(realBase, realCur) {
+		realCur, _ := canonicalizeForCheck(cur)
+		if realCur == "" || !isWithinDir(realBase, realCur) {
 			return false
 		}
 		_ = lfi

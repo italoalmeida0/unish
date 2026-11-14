@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"hash"
@@ -108,22 +109,46 @@ const (
 	canonMissingOK
 )
 
-func canonicalizePath(abs string, mode int) (string, error) {
-	abs = filepath.Clean(abs)
-	if rp, err := filepath.EvalSymlinks(abs); err == nil {
+func evalSymlinksChecked(ctx context.Context, cmdName, abs string) (string, error) {
+	if CapabilityHookFromContext(ctx) == nil {
+		return filepath.EvalSymlinks(abs)
+	}
+	if _, err := checkFSNoFollowLeaf(ctx, "", cmdName, abs, OpStat); err != nil {
+		return "", err
+	}
+	p, err := checkFS(ctx, "", cmdName, abs, OpStat)
+	if err != nil {
+		return "", err
+	}
+	if _, err := os.Lstat(p); err != nil {
+		return "", err
+	}
+	return p, nil
+}
+
+func canonicalizePath(ctx context.Context, dir, cmdName, rawPath string, mode int) (string, error) {
+	if _, err := checkFSNoFollowLeaf(ctx, dir, cmdName, rawPath, OpStat); err != nil {
+		return "", err
+	}
+	if _, err := checkFS(ctx, dir, cmdName, rawPath, OpStat); err != nil {
+		return "", err
+	}
+	abs := absFromDir(dir, rawPath)
+	if rp, err := evalSymlinksChecked(ctx, cmdName, abs); err == nil {
 		return rp, nil
+	} else if errors.Is(err, os.ErrPermission) {
+		return "", err
 	}
 	if mode == canonAllExist {
-		_, err := os.Stat(abs)
-		if err != nil {
+		if _, err := fsStat(ctx, "", cmdName, abs); err != nil {
 			return "", err
 		}
-		return filepath.EvalSymlinks(abs)
+		return evalSymlinksChecked(ctx, cmdName, abs)
 	}
 	if mode == canonAllButLast {
 		cur := abs
 		for hops := 0; hops < 40; hops++ {
-			lfi, lerr := os.Lstat(cur)
+			lfi, lerr := fsLstat(ctx, "", cmdName, cur)
 			if lerr != nil {
 				if !os.IsNotExist(lerr) {
 					return "", lerr
@@ -132,20 +157,30 @@ func canonicalizePath(abs string, mode int) (string, error) {
 				if parent == cur {
 					return "", lerr
 				}
-				rpParent, perr := filepath.EvalSymlinks(parent)
+				rpParent, perr := evalSymlinksChecked(ctx, cmdName, parent)
 				if perr != nil {
 					return "", perr
 				}
-				pfi, serr := os.Stat(rpParent)
-				if serr != nil || !pfi.IsDir() {
+				pfi, serr := fsStat(ctx, "", cmdName, rpParent)
+				if serr != nil {
+					if errors.Is(serr, os.ErrPermission) {
+						return "", serr
+					}
 					return "", os.ErrNotExist
 				}
-				return filepath.Join(rpParent, filepath.Base(cur)), nil
+				if !pfi.IsDir() {
+					return "", os.ErrNotExist
+				}
+				res := filepath.Join(rpParent, filepath.Base(cur))
+				if _, err := checkFS(ctx, "", cmdName, res, OpStat); err != nil {
+					return "", err
+				}
+				return res, nil
 			}
 			if lfi.Mode()&os.ModeSymlink == 0 {
-				return filepath.EvalSymlinks(cur)
+				return evalSymlinksChecked(ctx, cmdName, cur)
 			}
-			target, rerr := os.Readlink(cur)
+			target, rerr := fsReadlink(ctx, "", cmdName, cur)
 			if rerr != nil {
 				return "", rerr
 			}
@@ -154,8 +189,13 @@ func canonicalizePath(abs string, mode int) (string, error) {
 			} else {
 				cur = filepath.Clean(filepath.Join(filepath.Dir(cur), target))
 			}
-			if rp, err := filepath.EvalSymlinks(cur); err == nil {
+			if _, err := checkFSNoFollowLeaf(ctx, "", cmdName, cur, OpStat); err != nil {
+				return "", err
+			}
+			if rp, err := evalSymlinksChecked(ctx, cmdName, cur); err == nil {
 				return rp, nil
+			} else if errors.Is(err, os.ErrPermission) {
+				return "", err
 			}
 		}
 		return "", fmt.Errorf("too many levels of symbolic links")
@@ -165,15 +205,21 @@ func canonicalizePath(abs string, mode int) (string, error) {
 	cur := abs
 	var tail []string
 	for {
-		if rp, err := filepath.EvalSymlinks(cur); err == nil {
+		if rp, err := evalSymlinksChecked(ctx, cmdName, cur); err == nil {
 			for i := len(tail) - 1; i >= 0; i-- {
 				rp = filepath.Join(rp, tail[i])
 			}
-			return filepath.Clean(rp), nil
+			res := filepath.Clean(rp)
+			if _, err := checkFS(ctx, "", cmdName, res, OpStat); err != nil {
+				return "", err
+			}
+			return res, nil
+		} else if errors.Is(err, os.ErrPermission) {
+			return "", err
 		}
 		// If cur itself is a dangling symlink, expand it and restart.
-		if lfi, lerr := os.Lstat(cur); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
-			if link, rerr := os.Readlink(cur); rerr == nil {
+		if lfi, lerr := fsLstat(ctx, "", cmdName, cur); lerr == nil && lfi.Mode()&os.ModeSymlink != 0 {
+			if link, rerr := fsReadlink(ctx, "", cmdName, cur); rerr == nil {
 				var next string
 				if filepath.IsAbs(link) {
 					next = link
@@ -185,11 +231,22 @@ func canonicalizePath(abs string, mode int) (string, error) {
 				}
 				// Guard against symlink cycles in -m mode by falling back lexically after one pass.
 				next = filepath.Clean(next)
-				if rp, err := filepath.EvalSymlinks(filepath.Dir(next)); err == nil {
-					return filepath.Join(rp, filepath.Base(next)), nil
+				if _, err := checkFS(ctx, "", cmdName, next, OpStat); err != nil {
+					return "", err
+				}
+				if rp, err := evalSymlinksChecked(ctx, cmdName, filepath.Dir(next)); err == nil {
+					res := filepath.Join(rp, filepath.Base(next))
+					if _, err := checkFS(ctx, "", cmdName, res, OpStat); err != nil {
+						return "", err
+					}
+					return res, nil
+				} else if errors.Is(err, os.ErrPermission) {
+					return "", err
 				}
 				return next, nil
 			}
+		} else if errors.Is(lerr, os.ErrPermission) {
+			return "", lerr
 		}
 		parent := filepath.Dir(cur)
 		if parent == cur {
@@ -200,7 +257,7 @@ func canonicalizePath(abs string, mode int) (string, error) {
 	}
 }
 
-func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdRealpath(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("realpath", hc.Stderr)
 	missing := fs.Bool("m", false, "")
 	fs.BoolVar(missing, "canonicalize-missing", false, "")
@@ -218,14 +275,7 @@ func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) err
 	}
 	code := 0
 	for _, p := range fs.Args() {
-		full := resolve(hc.Dir, p)
-		abs, err := filepath.Abs(full)
-		if err != nil {
-			fmt.Fprintln(hc.Stderr, "realpath:", err)
-			code = 1
-			continue
-		}
-		rp, err := canonicalizePath(abs, mode)
+		rp, err := canonicalizePath(ctx, hc.Dir, "realpath", p, mode)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "realpath:", err)
 			code = 1
@@ -239,7 +289,7 @@ func cmdRealpath(_ context.Context, hc interp.HandlerContext, args []string) err
 	return nil
 }
 
-func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdReadlink(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("readlink", hc.Stderr)
 	canonical := fs.Bool("f", false, "")
 	fs.BoolVar(canonical, "canonicalize", false, "")
@@ -257,22 +307,15 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 	}
 	code := 0
 	for _, p := range fs.Args() {
-		full := resolve(hc.Dir, p)
 		var dst string
 		if *canonical || *missing || *exists {
-			abs, err := filepath.Abs(full)
-			if err != nil {
-				fmt.Fprintln(hc.Stderr, "readlink:", err)
-				code = 1
-				continue
-			}
 			mode := canonAllButLast
 			if *missing {
 				mode = canonMissingOK
 			} else if *exists {
 				mode = canonAllExist
 			}
-			rp, err := canonicalizePath(abs, mode)
+			rp, err := canonicalizePath(ctx, hc.Dir, "readlink", p, mode)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, "readlink:", err)
 				code = 1
@@ -281,8 +324,11 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 			dst = rp
 		} else {
 			var err error
-			dst, err = os.Readlink(full)
+			dst, err = fsReadlink(ctx, hc.Dir, "readlink", p)
 			if err != nil {
+				if CapabilityHookFromContext(ctx) != nil && errors.Is(err, os.ErrPermission) {
+					fmt.Fprintln(hc.Stderr, "readlink:", err)
+				}
 				// GNU readlink on a non-symlink fails silently (exit 1).
 				code = 1
 				continue
@@ -300,7 +346,48 @@ func cmdReadlink(_ context.Context, hc interp.HandlerContext, args []string) err
 	return nil
 }
 
-func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
+func precheckLnCapability(ctx context.Context, dir, src, targetSpec string, sym bool) error {
+	hook := CapabilityHookFromContext(ctx)
+	if hook == nil {
+		return nil
+	}
+	newPath, err := checkFSNoFollowLeaf(ctx, dir, "ln", targetSpec, OpWrite)
+	if err != nil {
+		return err
+	}
+	var linkBase string
+	if sym {
+		linkBase = filepath.Dir(newPath)
+	} else {
+		linkBase = dir
+	}
+	resolved := resolveHostPath(linkBase, src)
+	realPath, lexPath := canonicalizeForCheck(resolved)
+	if err := hook.CheckAccess(ctx, AccessRequest{
+		Op:         OpLink,
+		Command:    "ln",
+		Path:       realPath,
+		RawPath:    src,
+		TargetPath: newPath,
+	}); err != nil {
+		return err
+	}
+	checkLex := canonicalLexicalInDir(linkBase, src, lexPath)
+	if !sameCleanPath(checkLex, realPath) {
+		if err := hook.CheckAccess(ctx, AccessRequest{
+			Op:         OpLink,
+			Command:    "ln",
+			Path:       checkLex,
+			RawPath:    src,
+			TargetPath: newPath,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func cmdLn(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("ln", hc.Stderr)
 	sym := fs.Bool("s", false, "")
 	fs.BoolVar(sym, "symbolic", false, "")
@@ -314,36 +401,51 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 		fmt.Fprintln(hc.Stderr, "ln: missing destination")
 		return flag.ErrHelp
 	}
-	dst := resolve(hc.Dir, rest[len(rest)-1])
-	dstFi, dstErr := os.Stat(dst)
+	dstArg := rest[len(rest)-1]
+	dst := resolveHostPath(hc.Dir, dstArg)
+	dstFi, dstErr := fsStat(ctx, hc.Dir, "ln", dstArg)
 	dstIsDir := dstErr == nil && dstFi.IsDir()
 	if len(rest) > 2 && !dstIsDir {
-		fmt.Fprintf(hc.Stderr, "ln: target '%s' is not a directory\n", rest[len(rest)-1])
+		fmt.Fprintf(hc.Stderr, "ln: target '%s' is not a directory\n", dstArg)
 		return exitError{1}
 	}
 	code := 0
 	for _, src := range rest[:len(rest)-1] {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		target := dst
+		targetSpec := dstArg
 		if dstIsDir {
-			target = filepath.Join(dst, filepath.Base(src))
+			base := filepath.Base(src)
+			target = filepath.Join(dst, base)
+			targetSpec = filepath.Join(dstArg, base)
+		}
+		if err := precheckLnCapability(ctx, hc.Dir, src, targetSpec, *sym); err != nil {
+			fmt.Fprintln(hc.Stderr, "ln:", err)
+			code = 1
+			continue
 		}
 		if !*sym {
-			srcFull := resolve(hc.Dir, src)
-			sfi, serr := os.Lstat(srcFull)
+			sfi, serr := fsLstat(ctx, hc.Dir, "ln", src)
 			if serr != nil {
-				fmt.Fprintf(hc.Stderr, "ln: failed to access '%s': No such file or directory\n", src)
+				if os.IsNotExist(serr) {
+					fmt.Fprintf(hc.Stderr, "ln: failed to access '%s': No such file or directory\n", src)
+				} else {
+					fmt.Fprintf(hc.Stderr, "ln: failed to access '%s': %v\n", src, serr)
+				}
 				code = 1
 				continue
 			}
-			if tfi, terr := os.Lstat(target); terr == nil && os.SameFile(sfi, tfi) {
+			if tfi, terr := fsLstat(ctx, hc.Dir, "ln", targetSpec); terr == nil && os.SameFile(sfi, tfi) {
 				fmt.Fprintf(hc.Stderr, "ln: '%s' and '%s' are the same file\n", src, target)
 				code = 1
 				continue
 			}
 		} else {
-			if tfi, terr := os.Lstat(target); terr == nil {
-				linkDest := resolve(filepath.Dir(target), src)
-				if sfi, serr := os.Lstat(linkDest); serr == nil && os.SameFile(sfi, tfi) {
+			if tfi, terr := fsLstat(ctx, hc.Dir, "ln", targetSpec); terr == nil {
+				linkDest := resolveHostPath(filepath.Dir(target), src)
+				if sfi, serr := fsLstat(ctx, "", "ln", linkDest); serr == nil && os.SameFile(sfi, tfi) {
 					fmt.Fprintf(hc.Stderr, "ln: '%s' and '%s' are the same file\n", src, target)
 					code = 1
 					continue
@@ -352,15 +454,21 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 		}
 		if *force {
 			if runtime.GOOS == "windows" {
-				_ = os.Chmod(target, 0o666)
+				if tfi, terr := fsLstat(ctx, hc.Dir, "ln", targetSpec); terr == nil && tfi.Mode()&os.ModeSymlink == 0 {
+					_ = fsChmod(ctx, hc.Dir, "ln", targetSpec, 0o666)
+				}
 			}
-			_ = os.Remove(target)
+			if rerr := fsRemove(ctx, hc.Dir, "ln", targetSpec); rerr != nil && !os.IsNotExist(rerr) && errors.Is(rerr, os.ErrPermission) {
+				fmt.Fprintln(hc.Stderr, "ln:", rerr)
+				code = 1
+				continue
+			}
 		}
 		var err error
 		if *sym {
-			err = os.Symlink(src, target)
+			err = fsSymlink(ctx, hc.Dir, "ln", src, targetSpec)
 		} else {
-			err = os.Link(resolve(hc.Dir, src), target)
+			err = fsLink(ctx, hc.Dir, "ln", src, targetSpec)
 		}
 		if err != nil {
 			// GNU wording: "ln: failed to create symbolic link 'DST': File exists".
@@ -369,7 +477,7 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 				if *sym {
 					kind = "symbolic link"
 				}
-				fmt.Fprintf(hc.Stderr, "ln: failed to create %s '%s': File exists\n", kind, rest[len(rest)-1])
+				fmt.Fprintf(hc.Stderr, "ln: failed to create %s '%s': File exists\n", kind, dstArg)
 			} else {
 				fmt.Fprintln(hc.Stderr, "ln:", err)
 			}
@@ -383,7 +491,7 @@ func cmdLn(_ context.Context, hc interp.HandlerContext, args []string) error {
 	return nil
 }
 
-func cmdDu(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdDu(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("du", hc.Stderr)
 	summary := fs.Bool("s", false, "")
 	human := fs.Bool("h", false, "")
@@ -396,11 +504,25 @@ func cmdDu(_ context.Context, hc interp.HandlerContext, args []string) error {
 	if len(paths) == 0 {
 		paths = []string{"."}
 	}
+	hookActive := CapabilityHookFromContext(ctx) != nil
+	code := 0
 	for _, p := range paths {
-		full := resolve(hc.Dir, p)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		fi, err := fsLstat(ctx, hc.Dir, "du", p)
+		if err != nil {
+			if os.IsNotExist(err) {
+				fmt.Fprintf(hc.Stderr, "du: cannot access '%s': No such file or directory\n", p)
+			} else {
+				fmt.Fprintf(hc.Stderr, "du: cannot access '%s': %v\n", p, err)
+			}
+			code = 1
+			continue
+		}
 		// GNU du without -L does not follow a symlink operand: it
 		// reports 0 blocks for the link itself.
-		if fi, err := os.Lstat(full); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+		if fi.Mode()&os.ModeSymlink != 0 {
 			if *human {
 				fmt.Fprintf(hc.Stdout, "%s\t%s\n", humanDu(0), p)
 			} else {
@@ -412,30 +534,49 @@ func cmdDu(_ context.Context, hc interp.HandlerContext, args []string) error {
 		// entry on most filesystems; unish approximates with apparent
 		// sizes rounded up to 4K blocks for parity on small trees.
 		var total int64
-		var entries int64
-		filepath.Walk(full, func(_ string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
+		var dirs int64
+		var walkDu func(rawCur string, info os.FileInfo)
+		walkDu = func(rawCur string, info os.FileInfo) {
+			if ctx.Err() != nil {
+				return
 			}
-			entries++
 			if !info.IsDir() {
 				total += info.Size()
+				return
 			}
-			return nil
-		})
-		blocks := (total + 4095) / 4096
-		if blocks < 1 {
-			blocks = 1
+			dirs++
+			entries, rerr := fsReadDir(ctx, hc.Dir, "du", rawCur)
+			if rerr != nil {
+				fmt.Fprintf(hc.Stderr, "du: cannot read directory '%s': %v\n", rawCur, rerr)
+				code = 1
+				return
+			}
+			for _, e := range entries {
+				if ctx.Err() != nil {
+					return
+				}
+				childRaw := filepath.Join(rawCur, e.Name())
+				var cfi os.FileInfo
+				var cerr error
+				if hookActive {
+					cfi, cerr = fsLstat(ctx, hc.Dir, "du", childRaw)
+				} else {
+					cfi, cerr = e.Info()
+				}
+				if cerr != nil {
+					if errors.Is(cerr, os.ErrPermission) {
+						fmt.Fprintf(hc.Stderr, "du: cannot access '%s': %v\n", childRaw, cerr)
+						code = 1
+					}
+					continue
+				}
+				walkDu(childRaw, cfi)
+			}
 		}
-		// +1 block per directory entry (d itself, subdirs), min like du.
-		var dirs int64
-		filepath.Walk(full, func(_ string, info os.FileInfo, err error) error {
-			if err == nil && info.IsDir() {
-				dirs++
-			}
-			return nil
-		})
-		_ = entries
+		walkDu(p, fi)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		// GNU sums one 4K block per file plus one per directory.
 		fblocks := (total + 4095) / 4096
 		if total > 0 && fblocks < 1 {
@@ -459,6 +600,9 @@ func cmdDu(_ context.Context, hc interp.HandlerContext, args []string) error {
 		} else {
 			fmt.Fprintf(hc.Stdout, "%d\t%s\n", kb, p)
 		}
+	}
+	if code != 0 {
+		return exitError{code}
 	}
 	return nil
 }
@@ -635,7 +779,7 @@ func cmdKill(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return nil
 }
 
-func cmdDate(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdDate(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	now := time.Now()
 	// Honor TZ from the environment like GNU date (at minimum UTC and
 	// IANA zones when tzdata is available).
@@ -673,9 +817,13 @@ func cmdDate(_ context.Context, hc interp.HandlerContext, args []string) error {
 				return exitError{1}
 			}
 			k++
-			fi, err := os.Stat(resolve(hc.Dir, argv[k]))
+			fi, err := fsStat(ctx, hc.Dir, "date", argv[k])
 			if err != nil {
-				fmt.Fprintf(hc.Stderr, "date: %s: No such file or directory\n", argv[k])
+				if os.IsNotExist(err) {
+					fmt.Fprintf(hc.Stderr, "date: %s: No such file or directory\n", argv[k])
+				} else {
+					fmt.Fprintf(hc.Stderr, "date: %s: %v\n", argv[k], err)
+				}
 				return exitError{1}
 			}
 			now = fi.ModTime()
@@ -795,7 +943,7 @@ func strftime(t time.Time, format string) string {
 	return sb.String()
 }
 
-func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdMktemp(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("mktemp", hc.Stderr)
 	isDir := fs.Bool("d", false, "")
 	fs.BoolVar(isDir, "directory", false, "")
@@ -808,16 +956,9 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 		return err
 	}
 	baseTmp := shellGetenv(hc, "TMPDIR")
-	if baseTmp != "" {
-		baseTmp = resolve(hc.Dir, baseTmp)
-	} else {
-		baseTmp = os.TempDir()
-	}
-	dir := *tmpdir
-	if dir == "" {
-		dir = baseTmp
-	} else {
-		dir = resolve(hc.Dir, dir)
+	dirSpec := *tmpdir
+	if dirSpec == "" {
+		dirSpec = baseTmp
 	}
 	pattern := "tmp.XXXXXXXXXX"
 	if len(fs.Args()) > 0 {
@@ -828,18 +969,39 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 			// A template directory of /tmp (or any absolute POSIX path
 			// that does not exist, e.g. on Windows) falls back to the
 			// temp dir, matching GNU's "create in /tmp" intent.
-			cand := resolve(hc.Dir, d)
-			if st, err := os.Stat(cand); err != nil || !st.IsDir() {
+			cand := d
+			st, serr := fsStat(ctx, hc.Dir, "mktemp", cand)
+			if serr != nil {
+				if errors.Is(serr, os.ErrPermission) {
+					if runtime.GOOS == "windows" && (d == "/tmp" || strings.HasPrefix(d, "/tmp/")) && baseTmp != "" {
+						cand = baseTmp
+					} else {
+						fmt.Fprintln(hc.Stderr, "mktemp:", serr)
+						return exitError{1}
+					}
+				} else if filepath.IsAbs(d) || strings.HasPrefix(d, "/") {
+					cand = baseTmp
+				}
+			} else if !st.IsDir() {
 				if filepath.IsAbs(d) || strings.HasPrefix(d, "/") {
 					cand = baseTmp
 				}
 			}
-			dir = cand
+			dirSpec = cand
 			pattern = filepath.Base(pattern)
 		}
 	}
 	prefix, suffix, xLen := splitMktempPattern(pattern)
 	if *dryRun {
+		rawDir := dirSpec
+		if rawDir == "" {
+			rawDir = os.TempDir()
+		}
+		checkedDir, err := checkFS(ctx, hc.Dir, "mktemp", rawDir, OpWrite)
+		if err != nil {
+			fmt.Fprintln(hc.Stderr, "mktemp:", err)
+			return exitError{1}
+		}
 		const alnum = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 		raw := make([]byte, xLen)
 		if _, err := rand.Read(raw); err != nil {
@@ -851,12 +1013,12 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 		for _, b := range raw {
 			rnd.WriteByte(alnum[int(b)%len(alnum)])
 		}
-		nm := filepath.Join(dir, prefix+rnd.String()+suffix)
+		nm := filepath.Join(checkedDir, prefix+rnd.String()+suffix)
 		fmt.Fprintln(hc.Stdout, filepath.ToSlash(nm))
 		return nil
 	}
 	if *isDir {
-		name, err := os.MkdirTemp(dir, prefix+"*"+suffix)
+		name, err := fsMkdirTemp(ctx, hc.Dir, "mktemp", dirSpec, prefix+"*"+suffix)
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, "mktemp:", err)
 			return exitError{1}
@@ -864,7 +1026,7 @@ func cmdMktemp(_ context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintln(hc.Stdout, filepath.ToSlash(name))
 		return nil
 	}
-	f, err := os.CreateTemp(dir, prefix+"*"+suffix)
+	f, err := fsCreateTemp(ctx, hc.Dir, "mktemp", dirSpec, prefix+"*"+suffix)
 	if err != nil {
 		fmt.Fprintln(hc.Stderr, "mktemp:", err)
 		return exitError{1}
@@ -889,17 +1051,20 @@ func splitMktempPattern(pattern string) (prefix, suffix string, xLen int) {
 }
 
 type findNode struct {
-	display  string
-	full     string
-	dirFull  string
-	name     string
-	ent      os.DirEntry
-	fi       os.FileInfo // loaded lazily (find -type f doesn't need it)
-	typ      os.FileMode // from d_type when known
-	typKnown bool
-	depth    int
-	pruned   bool
-	follow   bool
+	ctx        context.Context
+	baseDir    string
+	hookActive bool
+	display    string
+	full       string
+	dirFull    string
+	name       string
+	ent        os.DirEntry
+	fi         os.FileInfo // loaded lazily (find -type f doesn't need it)
+	typ        os.FileMode // from d_type when known
+	typKnown   bool
+	depth      int
+	pruned     bool
+	follow     bool
 }
 
 func (n *findNode) fullPath() string {
@@ -923,7 +1088,16 @@ func (n *findNode) stat() os.FileInfo {
 			fi  os.FileInfo
 			err error
 		)
-		if n.follow {
+		if n.hookActive {
+			if n.follow {
+				fi, err = fsStat(n.ctx, n.baseDir, "find", n.display)
+				if err != nil && !errors.Is(err, os.ErrPermission) {
+					fi, err = fsLstat(n.ctx, n.baseDir, "find", n.display)
+				}
+			} else {
+				fi, err = fsLstat(n.ctx, n.baseDir, "find", n.display)
+			}
+		} else if n.follow {
 			fp := n.fullPath()
 			fi, err = os.Stat(fp)
 			if err != nil {
@@ -1254,7 +1428,13 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 		case "-empty":
 			return func(n *findNode, _ interp.HandlerContext) bool {
 				if n.isDir() {
-					entries, err := os.ReadDir(n.fullPath())
+					var entries []os.DirEntry
+					var err error
+					if n.hookActive {
+						entries, err = fsReadDir(n.ctx, n.baseDir, "find", n.display)
+					} else {
+						entries, err = os.ReadDir(n.fullPath())
+					}
 					return err == nil && len(entries) == 0
 				}
 				return n.stat().Size() == 0
@@ -1378,11 +1558,10 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 				if n.depth == 0 && isDotOperand(n.display) {
 					return true
 				}
-				fp := n.fullPath()
-				err := os.Remove(fp)
-				if err != nil && runtime.GOOS == "windows" {
-					_ = os.Chmod(fp, 0o666)
-					err = os.Remove(fp)
+				err := fsRemove(ctx, hc.Dir, "find", n.display)
+				if err != nil && runtime.GOOS == "windows" && !errors.Is(err, os.ErrPermission) && !n.typeIs("l") {
+					_ = fsChmod(ctx, hc.Dir, "find", n.display, 0o666)
+					err = fsRemove(ctx, hc.Dir, "find", n.display)
 				}
 				if err != nil {
 					fmt.Fprintf(hc.Stderr, "find: cannot delete '%s': %v\n", n.display, err)
@@ -1424,10 +1603,14 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 				}
 				subHC := hc
 				subHC.Stdin = bytes.NewReader(nil)
-				err := runSubcommand(ctx, subHC, cmdLine)
+				err := runSubcommandNamed(ctx, subHC, "find", cmdLine)
 				if ctx.Err() != nil {
 					stop = true
 					return false
+				}
+				if errors.Is(err, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", cmdLine[0], err)
+					code = 1
 				}
 				return err == nil
 			}
@@ -1442,10 +1625,16 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 		case "-newer", "-anewer", "-cnewer":
 			ref := next()
-			refFull := resolve(hc.Dir, ref)
-			fi, err := os.Stat(refFull)
+			fi, err := fsStat(ctx, hc.Dir, "find", ref)
 			if err != nil {
-				fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", ref)
+				if os.IsNotExist(err) {
+					fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", ref)
+				} else {
+					fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", ref, err)
+				}
+				if errors.Is(err, os.ErrPermission) {
+					code = 1
+				}
 				return func(*findNode, interp.HandlerContext) bool { return false }
 			}
 			refTime := fi.ModTime()
@@ -1496,6 +1685,8 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 	}
 
 	opts := findWalkOpts{
+		baseDir:    hc.Dir,
+		hookActive: CapabilityHookFromContext(ctx) != nil,
 		maxdepth:   maxdepth,
 		mindepth:   mindepth,
 		followMode: followMode,
@@ -1508,7 +1699,7 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			return ctx.Err()
 		}
 		opts.needSlash = strings.ContainsRune(p, '\\')
-		full := resolve(hc.Dir, p)
+		full := resolveHostPath(hc.Dir, p)
 		walkFind(ctx, hc, p, full, "", "", 0, opts, rootPred, &code, &stop, nil, nil)
 	}
 	if ctx.Err() != nil {
@@ -1548,9 +1739,12 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 			}
 			subHC := hc
 			subHC.Stdin = bytes.NewReader(nil)
-			if err := runSubcommand(ctx, subHC, cmdLine); err != nil {
+			if err := runSubcommandNamed(ctx, subHC, "find", cmdLine); err != nil {
 				if ctx.Err() != nil {
 					return ctx.Err()
+				}
+				if errors.Is(err, os.ErrPermission) {
+					fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", cmdLine[0], err)
 				}
 				code = 1
 			}
@@ -1563,6 +1757,8 @@ func cmdFind(ctx context.Context, hc interp.HandlerContext, args []string) error
 }
 
 type findWalkOpts struct {
+	baseDir    string
+	hookActive bool
 	maxdepth   int
 	mindepth   int
 	followMode int
@@ -1578,15 +1774,68 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full, dirF
 	}
 	followHere := opts.followMode == 2 || (opts.followMode == 1 && depth == 0)
 	node := findNode{
-		display: display,
-		full:    full,
-		dirFull: dirFull,
-		name:    name,
-		ent:     ent,
-		depth:   depth,
-		follow:  followHere,
+		ctx:        ctx,
+		baseDir:    opts.baseDir,
+		hookActive: opts.hookActive,
+		display:    display,
+		full:       full,
+		dirFull:    dirFull,
+		name:       name,
+		ent:        ent,
+		depth:      depth,
+		follow:     followHere,
 	}
-	if followHere {
+	if opts.hookActive {
+		if followHere {
+			sfi, serr := fsStat(ctx, opts.baseDir, "find", display)
+			if serr == nil {
+				node.fi = sfi
+				node.typ = sfi.Mode().Type()
+				node.typKnown = true
+			} else if errors.Is(serr, os.ErrPermission) {
+				fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, serr)
+				*code = 1
+				return
+			} else {
+				lfi, lerr := fsLstat(ctx, opts.baseDir, "find", display)
+				if lerr != nil {
+					if os.IsNotExist(lerr) {
+						fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
+					} else {
+						fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, lerr)
+					}
+					*code = 1
+					return
+				}
+				if strings.Contains(strings.ToLower(serr.Error()), "too many links") ||
+					strings.Contains(strings.ToLower(serr.Error()), "too many levels") {
+					fmt.Fprintf(hc.Stderr, "find: File system loop detected; '%s' is part of the same file system loop\n", filepath.ToSlash(display))
+					*code = 1
+					return
+				}
+				node.fi = lfi
+				node.typ = lfi.Mode().Type()
+				node.typKnown = true
+			}
+		} else {
+			lfi, lerr := fsLstat(ctx, opts.baseDir, "find", display)
+			if lerr != nil {
+				if errors.Is(lerr, os.ErrPermission) && depth > 0 {
+					return
+				}
+				if os.IsNotExist(lerr) {
+					fmt.Fprintf(hc.Stderr, "find: '%s': No such file or directory\n", display)
+				} else {
+					fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, lerr)
+				}
+				*code = 1
+				return
+			}
+			node.fi = lfi
+			node.typ = lfi.Mode().Type()
+			node.typKnown = true
+		}
+	} else if followHere {
 		if ent == nil || !entTypeKnown(ent.Type()) || ent.Type()&os.ModeSymlink != 0 {
 			fp := node.fullPath()
 			sfi, serr := os.Stat(fp)
@@ -1637,7 +1886,14 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full, dirF
 	if node.isDir() && opts.followMode != 0 {
 		dirFi = node.fi
 		if dirFi == nil {
-			if sfi, err := os.Stat(node.fullPath()); err == nil {
+			var sfi os.FileInfo
+			var serr error
+			if opts.hookActive {
+				sfi, serr = fsStat(ctx, opts.baseDir, "find", display)
+			} else {
+				sfi, serr = os.Stat(node.fullPath())
+			}
+			if serr == nil {
 				dirFi = sfi
 			}
 		}
@@ -1685,7 +1941,13 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full, dirF
 			return
 		}
 		curFull := node.fullPath()
-		entries, err := os.ReadDir(curFull)
+		var entries []os.DirEntry
+		var err error
+		if opts.hookActive {
+			entries, err = fsReadDir(ctx, opts.baseDir, "find", display)
+		} else {
+			entries, err = os.ReadDir(curFull)
+		}
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "find: '%s': %v\n", display, err)
 			*code = 1
@@ -1726,19 +1988,19 @@ func walkFind(ctx context.Context, hc interp.HandlerContext, display, full, dirF
 	descendChildren()
 }
 
-func cmdMd5sum(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return cmdHash("md5sum", md5.New, hc, args)
+func cmdMd5sum(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	return cmdHash(ctx, "md5sum", md5.New, hc, args)
 }
 
-func cmdSha1sum(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return cmdHash("sha1sum", sha1.New, hc, args)
+func cmdSha1sum(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	return cmdHash(ctx, "sha1sum", sha1.New, hc, args)
 }
 
-func cmdSha256sum(_ context.Context, hc interp.HandlerContext, args []string) error {
-	return cmdHash("sha256sum", sha256.New, hc, args)
+func cmdSha256sum(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	return cmdHash(ctx, "sha256sum", sha256.New, hc, args)
 }
 
-func cmdShasum(_ context.Context, hc interp.HandlerContext, args []string) error {
+func cmdShasum(ctx context.Context, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet("shasum", hc.Stderr)
 	algo := fs.String("a", "1", "")
 	fs.StringVar(algo, "algorithm", "1", "")
@@ -1763,10 +2025,10 @@ func cmdShasum(_ context.Context, hc interp.HandlerContext, args []string) error
 		fmt.Fprintf(hc.Stderr, "shasum: unrecognized algorithm '%s'\n", *algo)
 		return exitError{1}
 	}
-	return runHash("shasum", newHash, hc, fs.Args())
+	return runHash(ctx, "shasum", newHash, hc, fs.Args())
 }
 
-func cmdHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, args []string) error {
+func cmdHash(ctx context.Context, name string, newHash func() hash.Hash, hc interp.HandlerContext, args []string) error {
 	fs := newFlagSet(name, hc.Stderr)
 	fs.Bool("b", false, "")
 	fs.Bool("binary", false, "")
@@ -1787,21 +2049,24 @@ func cmdHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, ar
 		return err
 	}
 	if *check {
-		return runHashCheck(name, newHash, hc, fs.Args(), *quiet, *status, *strict, *warn)
+		return runHashCheck(ctx, name, newHash, hc, fs.Args(), *quiet, *status, *strict, *warn)
 	}
-	return runHash(name, newHash, hc, fs.Args())
+	return runHash(ctx, name, newHash, hc, fs.Args())
 }
 
-func runHash(name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string) error {
+func runHash(ctx context.Context, name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string) error {
 	if len(files) == 0 {
 		files = []string{"-"}
 	}
 	code := 0
 	for _, f := range files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		var r io.Reader = hc.Stdin
 		label := f
 		if f != "-" && f != "/dev/stdin" {
-			fh, err := openShellFile(resolve(hc.Dir, f))
+			fh, err := fsOpenShellFile(ctx, hc.Dir, name, f)
 			if err != nil {
 				fmt.Fprintln(hc.Stderr, name+":", err)
 				code = 1
@@ -1838,7 +2103,7 @@ var _ = runtime.GOOS
 // runHashCheck implements `md5sum/sha*sum -c FILE`: reads checksum lines
 // ("<hex> [* ]<path>") and verifies each file, printing "path: OK" or
 // "path: FAILED" like GNU. Returns exit 0 iff all checked files match.
-func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string, quiet, status, strict, warn bool) error {
+func runHashCheck(ctx context.Context, name string, newHash func() hash.Hash, hc interp.HandlerContext, files []string, quiet, status, strict, warn bool) error {
 	if len(files) == 0 {
 		files = []string{"-"}
 	}
@@ -1847,12 +2112,15 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 	failed := 0
 	badFmt := 0
 	for _, f := range files {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		var data []byte
 		var err error
 		if f == "-" || f == "/dev/stdin" {
 			data, err = io.ReadAll(hc.Stdin)
 		} else {
-			data, err = readShellFile(resolve(hc.Dir, f))
+			data, err = fsReadShellFile(ctx, hc.Dir, name, f)
 		}
 		if err != nil {
 			fmt.Fprintln(hc.Stderr, name+":", err)
@@ -1873,7 +2141,7 @@ func runHashCheck(name string, newHash func() hash.Hash, hc interp.HandlerContex
 				continue
 			}
 			checked++
-			raw, err := readShellFile(resolve(hc.Dir, path))
+			raw, err := fsReadShellFile(ctx, hc.Dir, name, path)
 			if err != nil {
 				if !status {
 					fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", name, path, err)

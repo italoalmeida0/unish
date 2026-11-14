@@ -226,15 +226,36 @@ func cmdSponge(ctx context.Context, hc interp.HandlerContext, args []string) err
 		}
 		return nil
 	}
-	if isToolDevNull(pos[0]) {
+	if isNullDevPath(pos[0]) || isToolDevNull(pos[0]) {
+		return nil
+	}
+	if pw, ok, perr := openProcSubstOut(pos[0]); ok {
+		if perr != nil {
+			_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], perr)
+			return exitError{1}
+		}
+		_, werr := pw.Write(buf.Bytes())
+		cerr := pw.Close()
+		if werr != nil {
+			if isPipeClosed(werr) {
+				return nil
+			}
+			_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], werr)
+			return exitError{1}
+		}
+		if cerr != nil {
+			_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], cerr)
+			return exitError{1}
+		}
 		return nil
 	}
 
-	targetPath := resolve(hc.Dir, pos[0])
-	waitProcSubstProducerCtx(ctx, targetPath)
-
 	perm := os.FileMode(0o644)
-	fi, statErr := os.Stat(targetPath)
+	fi, statErr := fsStat(ctx, hc.Dir, "sponge", pos[0])
+	if statErr != nil && !os.IsNotExist(statErr) {
+		_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], statErr)
+		return exitError{1}
+	}
 	if statErr == nil {
 		perm = fi.Mode().Perm()
 		if !fi.Mode().IsRegular() {
@@ -245,7 +266,7 @@ func cmdSponge(ctx context.Context, hc interp.HandlerContext, args []string) err
 			} else {
 				oflags |= os.O_TRUNC
 			}
-			f, err := os.OpenFile(targetPath, oflags, perm)
+			f, err := fsOpenFile(ctx, hc.Dir, "sponge", pos[0], oflags, perm)
 			if err != nil {
 				_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], err)
 				return exitError{1}
@@ -269,7 +290,7 @@ func cmdSponge(ctx context.Context, hc interp.HandlerContext, args []string) err
 
 	outBytes := buf.Bytes()
 	if appendMode && statErr == nil {
-		existing, rerr := os.ReadFile(targetPath)
+		existing, rerr := fsReadFile(ctx, hc.Dir, "sponge", pos[0])
 		if rerr != nil {
 			_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], rerr)
 			return exitError{1}
@@ -280,7 +301,7 @@ func cmdSponge(ctx context.Context, hc interp.HandlerContext, args []string) err
 		outBytes = combined
 	}
 
-	if err := atomicWriteFile(targetPath, outBytes, perm); err != nil {
+	if err := fsAtomicWriteFile(ctx, hc.Dir, "sponge", pos[0], outBytes, perm); err != nil {
 		_, _ = fmt.Fprintf(hc.Stderr, "sponge: %s: %v\n", pos[0], err)
 		return exitError{1}
 	}
@@ -404,7 +425,11 @@ func cmdFlock(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	}
 
 	// Wrapper form: `flock [flags] lockfile [-c "script" | cmd args...]`
-	lockPath := resolve(hc.Dir, lockTarget)
+	lockPath, err := checkFS(ctx, hc.Dir, "flock", lockTarget, OpWrite)
+	if err != nil {
+		_, _ = fmt.Fprintf(hc.Stderr, "flock: cannot open lock file %s: %v\n", lockTarget, err)
+		return exitError{1}
+	}
 	f, err := openFlockFile(lockPath)
 	if err != nil {
 		_, _ = fmt.Fprintf(hc.Stderr, "flock: cannot open lock file %s: %v\n", lockTarget, err)
@@ -549,9 +574,13 @@ func runFlockShellCommand(ctx context.Context, hc interp.HandlerContext, src str
 }
 
 func runFlockSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []string) error {
-	err := runSubcommand(ctx, hc, cmdArgs)
+	err := runSubcommandNamed(ctx, hc, "flock", cmdArgs)
 	if err == nil {
 		return nil
+	}
+	if errors.Is(err, os.ErrPermission) {
+		_, _ = fmt.Fprintf(hc.Stderr, "flock: %s: %v\n", cmdArgs[0], err)
+		return exitError{126}
 	}
 	if isExecNotFound(err) {
 		_, _ = fmt.Fprintf(hc.Stderr, "flock: failed to execute %s: No such file or directory\n", cmdArgs[0])
@@ -674,12 +703,10 @@ func cmdColumn(ctx context.Context, hc interp.HandlerContext, args []string) err
 			}
 			continue
 		}
-		if isToolDevNull(farg) {
+		if isNullDevPath(farg) || isToolDevNull(farg) {
 			continue
 		}
-		p := resolve(hc.Dir, farg)
-		waitProcSubstProducerCtx(ctx, p)
-		f, err := os.Open(p)
+		f, err := fsOpenShellFile(ctx, hc.Dir, "column", farg)
 		if err != nil {
 			_, _ = fmt.Fprintf(hc.Stderr, "column: %s: %v\n", farg, err)
 			hadErr = true
@@ -997,33 +1024,33 @@ func cmdXxd(ctx context.Context, hc interp.HandlerContext, args []string) error 
 		}
 	}
 
+	type statReadSeeker interface {
+		io.Reader
+		io.Seeker
+		Stat() (os.FileInfo, error)
+	}
+
 	inReader := hc.Stdin
-	var inFile *os.File
+	var inFile statReadSeeker
 	if len(pos) >= 1 && pos[0] != "-" && pos[0] != "/dev/stdin" {
-		if isToolDevNull(pos[0]) {
+		if isNullDevPath(pos[0]) || isToolDevNull(pos[0]) {
 			inReader = bytes.NewReader(nil)
 		} else {
-			inPath := resolve(hc.Dir, pos[0])
-			waitProcSubstProducerCtx(ctx, inPath)
-			f, err := os.Open(inPath)
+			f, err := fsOpenShellFile(ctx, hc.Dir, "xxd", pos[0])
 			if err != nil {
 				_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", pos[0], err)
 				return exitError{2}
 			}
-			inFile = f
 			defer f.Close()
 			inReader = f
+			inFile, _ = f.(statReadSeeker)
 		}
 	}
 
 	outToFile := len(pos) == 2 && pos[1] != "-" && pos[1] != "/dev/stdout"
-	var outPath string
+	var outArg string
 	if outToFile {
-		if isToolDevNull(pos[1]) {
-			outPath = os.DevNull
-		} else {
-			outPath = resolve(hc.Dir, pos[1])
-		}
+		outArg = pos[1]
 	}
 
 	if revert {
@@ -1035,7 +1062,7 @@ func cmdXxd(ctx context.Context, hc interp.HandlerContext, args []string) error 
 				seekOff = seekVal
 			}
 		}
-		return xxdRevert(ctx, hc, inReader, outToFile, outPath, plain, hasLen, limitLen, seekOff)
+		return xxdRevert(ctx, hc, inReader, outToFile, outArg, plain, hasLen, limitLen, seekOff)
 	}
 
 	// Forward dump: apply seek if requested.
@@ -1134,15 +1161,20 @@ seekDone:
 	}
 
 	if outToFile {
-		if outPath == os.DevNull {
+		if isNullDevPath(outArg) || isToolDevNull(outArg) {
 			return nil
 		}
 		perm := os.FileMode(0o644)
-		if fi, err := os.Stat(outPath); err == nil {
-			perm = fi.Mode().Perm()
+		if !isActiveProcSubstPath(outArg) {
+			if fi, err := fsStat(ctx, hc.Dir, "xxd", outArg); err == nil {
+				perm = fi.Mode().Perm()
+			} else if !os.IsNotExist(err) {
+				_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", outArg, err)
+				return exitError{2}
+			}
 		}
-		if err := atomicWriteFile(outPath, outFileBuf.Bytes(), perm); err != nil {
-			_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", pos[1], err)
+		if err := fsAtomicWriteFile(ctx, hc.Dir, "xxd", outArg, outFileBuf.Bytes(), perm); err != nil {
+			_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", outArg, err)
 			return exitError{2}
 		}
 	}
@@ -1316,7 +1348,7 @@ func xxdRevert(
 	hc interp.HandlerContext,
 	r io.Reader,
 	outToFile bool,
-	outPath string,
+	outArg string,
 	plain bool,
 	hasLen bool,
 	limitLen int64,
@@ -1369,14 +1401,17 @@ func xxdRevert(
 		if haveHi && (!hasLen || decoded < limitLen) {
 			out = append(out, hi<<4)
 		}
-		return xxdWriteReverted(hc, outToFile, outPath, out)
+		return xxdWriteReverted(ctx, hc, outToFile, outArg, out)
 	}
 
 	// Canonical hexdump revert: parse "<hex-offset>: <grouped hex>  <ascii>"
 	var out []byte
-	if outToFile {
-		if existing, err := os.ReadFile(outPath); err == nil && seekOff != 0 {
+	if outToFile && seekOff != 0 && !isNullDevPath(outArg) && !isToolDevNull(outArg) && !isActiveProcSubstPath(outArg) {
+		if existing, err := fsReadFile(ctx, hc.Dir, "xxd", outArg); err == nil {
 			out = existing
+		} else if !os.IsNotExist(err) {
+			_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", outArg, err)
+			return exitError{2}
 		}
 	}
 
@@ -1465,20 +1500,25 @@ func xxdRevert(
 		return exitError{2}
 	}
 
-	return xxdWriteReverted(hc, outToFile, outPath, out)
+	return xxdWriteReverted(ctx, hc, outToFile, outArg, out)
 }
 
-func xxdWriteReverted(hc interp.HandlerContext, outToFile bool, outPath string, data []byte) error {
+func xxdWriteReverted(ctx context.Context, hc interp.HandlerContext, outToFile bool, outArg string, data []byte) error {
 	if outToFile {
-		if outPath == os.DevNull {
+		if isNullDevPath(outArg) || isToolDevNull(outArg) {
 			return nil
 		}
 		perm := os.FileMode(0o644)
-		if fi, err := os.Stat(outPath); err == nil {
-			perm = fi.Mode().Perm()
+		if !isActiveProcSubstPath(outArg) {
+			if fi, err := fsStat(ctx, hc.Dir, "xxd", outArg); err == nil {
+				perm = fi.Mode().Perm()
+			} else if !os.IsNotExist(err) {
+				_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", outArg, err)
+				return exitError{2}
+			}
 		}
-		if err := atomicWriteFile(outPath, data, perm); err != nil {
-			_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", outPath, err)
+		if err := fsAtomicWriteFile(ctx, hc.Dir, "xxd", outArg, data, perm); err != nil {
+			_, _ = fmt.Fprintf(hc.Stderr, "xxd: %s: %v\n", outArg, err)
 			return exitError{2}
 		}
 		return nil
