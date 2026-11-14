@@ -1150,7 +1150,7 @@ func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared boo
 
 func runSysSubcommand(ctx context.Context, hc interp.HandlerContext, childEnv []string, cleared bool, niceAdjust int, hasNice bool, cmdArgs []string) error {
 	if extra := lookupExtra(cmdArgs[0]); extra != nil {
-		return extra.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
+		return invokeExtra(ctx, hc, extra, cmdArgs)
 	}
 	if cmdArgs[0] == "printf" {
 		return cmdPrintf(ctx, hc, cmdArgs)

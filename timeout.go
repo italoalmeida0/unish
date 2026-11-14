@@ -44,7 +44,7 @@ func cmdTimeout(ctx context.Context, hc interp.HandlerContext, args []string) er
 		// GNU: DURATION 0 disables the timeout; run directly while still
 		// honoring parent context cancellation.
 		if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
-			return cmd.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
+			return invokeExtra(ctx, hc, cmd, cmdArgs)
 		}
 		tp, err := startTimeoutProc(ctx, hc, cmdArgs)
 		if err != nil {
@@ -79,7 +79,7 @@ func cmdTimeout(ctx context.Context, hc interp.HandlerContext, args []string) er
 		ghc, gate := gateHCOnDone(hc)
 		res := make(chan error, 1)
 		go func() {
-			res <- cmd.main(tctx, ghc, splitAttached(cmdArgs[0], cmdArgs))
+			res <- invokeExtra(tctx, ghc, cmd, cmdArgs)
 		}()
 		select {
 		case err := <-res:

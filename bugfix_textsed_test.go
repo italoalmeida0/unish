@@ -122,6 +122,22 @@ func TestBugfixLsColorNoStateLeakOrRace(t *testing.T) {
 		t.Fatalf("lsColorMode leaked into plain ls output: %q", out2)
 	}
 
+	// Wrapper-dispatched `ls --color=always` (xargs, env, timeout) must also
+	// synchronize lsColorMu and reset lsColorMode rather than leaking or failing.
+	for _, script := range []string{
+		"printf '.\\n' | xargs ls --color=always >/dev/null && ls\n",
+		"env ls --color=always >/dev/null && ls\n",
+		"timeout 5 ls --color=always >/dev/null && ls\n",
+	} {
+		outW, errOutW, errW := runParityScript(t, dir, script)
+		if errW != nil {
+			t.Fatalf("%q failed: %v (stderr=%q)", script, errW, errOutW)
+		}
+		if strings.Contains(outW, "\x1b[") {
+			t.Fatalf("lsColorMode leaked after %q: %q", script, outW)
+		}
+	}
+
 	// Concurrent invocations must not race or cross-contaminate color output.
 	var wg sync.WaitGroup
 	errCh := make(chan string, 40)

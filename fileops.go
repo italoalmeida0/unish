@@ -1348,11 +1348,9 @@ func runSubcommand(ctx context.Context, hc interp.HandlerContext, cmdArgs []stri
 			return exitError{1}
 		}
 		return exitError{2}
-	case "ls":
-		cmdArgs = filterLsArgs(cmdArgs)
 	}
 	if cmd := lookupExtra(cmdArgs[0]); cmd != nil {
-		return cmd.main(ctx, hc, splitAttached(cmdArgs[0], cmdArgs))
+		return invokeExtra(ctx, hc, cmd, cmdArgs)
 	}
 	path, err := interp.LookPathDir(hc.Dir, hc.Env, cmdArgs[0])
 	if err != nil {

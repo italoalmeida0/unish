@@ -93,6 +93,26 @@ func lookupExtra(name string) *extraCmd {
 	return nil
 }
 
+func invokeExtra(ctx context.Context, hc interp.HandlerContext, cmd *extraCmd, args []string) error {
+	if hasVersionFlag(args) {
+		fmt.Fprintf(hc.Stdout, "%s (unish coreutils) 1.0\n", args[0])
+		return nil
+	}
+	if hc.Stdin == nil {
+		hc.Stdin = strings.NewReader("")
+	}
+	if args[0] == "ls" {
+		lsColorMu.Lock()
+		lsColorMode = "never"
+		filtered := filterLsArgs(args)
+		err := cmd.main(ctx, hc, splitAttached(args[0], filtered))
+		lsColorMode = "never"
+		lsColorMu.Unlock()
+		return err
+	}
+	return cmd.main(ctx, hc, splitAttached(args[0], args))
+}
+
 func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		if len(args) == 0 {
@@ -122,26 +142,8 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			}
 			return next(ctx, args)
 		}
-		if hasVersionFlag(args) {
-			hc := interp.HandlerCtx(ctx)
-			fmt.Fprintf(hc.Stdout, "%s (unish coreutils) 1.0\n", args[0])
-			return nil
-		}
 		hc := interp.HandlerCtx(ctx)
-		if hc.Stdin == nil {
-			hc.Stdin = strings.NewReader("")
-		}
-		var err error
-		if args[0] == "ls" {
-			lsColorMu.Lock()
-			lsColorMode = "never"
-			filtered := filterLsArgs(args)
-			err = cmd.main(ctx, hc, splitAttached(args[0], filtered))
-			lsColorMode = "never"
-			lsColorMu.Unlock()
-		} else {
-			err = cmd.main(ctx, hc, splitAttached(args[0], args))
-		}
+		err := invokeExtra(ctx, hc, cmd, args)
 		if isPipeClosed(err) || isPipeClosed(ctx.Err()) {
 			// SIGPIPE semantics: downstream closed the pipe early
 			// (e.g. `seq 1 5 | head -n 0`). GNU tools exit 0 silently;
