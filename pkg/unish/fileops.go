@@ -815,14 +815,21 @@ func cmdChmod(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		if !isRoot && info.Mode()&os.ModeSymlink != 0 {
 			return nil
 		}
-		if e := apply(rawPath, display); e != nil {
-			reportErr(display, e)
-			code = 1
-		}
 		if !info.IsDir() {
+			if e := apply(rawPath, display); e != nil {
+				reportErr(display, e)
+				code = 1
+			}
 			return nil
 		}
+		appliedEarly := false
 		entries, err := fsReadDir(ctx, hc.Dir, "chmod", rawPath)
+		if err != nil && errors.Is(err, os.ErrPermission) && CapabilityHookFromContext(ctx) == nil {
+			if e := apply(rawPath, display); e == nil {
+				appliedEarly = true
+				entries, err = fsReadDir(ctx, hc.Dir, "chmod", rawPath)
+			}
+		}
 		if err != nil {
 			reportErr(display, err)
 			code = 1
@@ -839,6 +846,12 @@ func cmdChmod(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			}
 			if err := walkChmod(childRaw, childDisp, false); err != nil {
 				return err
+			}
+		}
+		if !appliedEarly {
+			if e := apply(rawPath, display); e != nil {
+				reportErr(display, e)
+				code = 1
 			}
 		}
 		return nil

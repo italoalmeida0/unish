@@ -244,6 +244,8 @@ base64 a.txt
 	if _, _, rc := runJailedScript(t, ctx, ws, nil, `chmod -R 644 appdir`); rc == 0 {
 		t.Fatal("SECURITY: chmod -R of directory containing denied .env succeeded without error")
 	}
+	// Restore search (+x) permission on appdir on Unix after testing `chmod -R 644 appdir`.
+	_ = os.Chmod(envDir, 0o755)
 	if _, _, rc := runJailedScript(t, ctx, ws, nil, `rm -rf appdir`); rc == 0 {
 		t.Fatal("SECURITY: rm -rf of directory containing denied .env succeeded")
 	}

@@ -539,6 +539,7 @@ func startExternalSleeper(t *testing.T, dir string) *exec.Cmd {
 			_ = cmd.Process.Kill()
 			_ = cmd.Wait()
 		}
+		removeExecutableWithRetry(sleeperBin)
 	})
 	deadline := time.Now().Add(5 * time.Second)
 	for time.Now().Before(deadline) {
@@ -650,10 +651,6 @@ func TestJailWrappers_OpExecGating(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	exeBytes, err := os.ReadFile(exe)
-	if err != nil {
-		t.Fatalf("read test exe: %v", err)
-	}
 
 	allowedDir := t.TempDir()
 	blockedDir := t.TempDir()
@@ -663,12 +660,8 @@ func TestJailWrappers_OpExecGating(t *testing.T) {
 	}
 	allowedBin := filepath.Join(allowedDir, "allowed_tool"+ext)
 	blockedBin := filepath.Join(blockedDir, "blocked_tool"+ext)
-	if err := os.WriteFile(allowedBin, exeBytes, 0o755); err != nil {
-		t.Fatalf("write allowedBin: %v", err)
-	}
-	if err := os.WriteFile(blockedBin, exeBytes, 0o755); err != nil {
-		t.Fatalf("write blockedBin: %v", err)
-	}
+	copyExecutableForTest(t, exe, allowedBin)
+	copyExecutableForTest(t, exe, blockedBin)
 
 	jailHook := newTestJailHook(t, allowedDir)
 	ctx := WithCapabilityHook(context.Background(), jailHook)
@@ -832,10 +825,6 @@ func TestConcurrentSessions_PerContextJobTableIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	exeBytes, err := os.ReadFile(exe)
-	if err != nil {
-		t.Fatalf("read test exe: %v", err)
-	}
 
 	dirA := t.TempDir()
 	dirB := t.TempDir()
@@ -845,12 +834,8 @@ func TestConcurrentSessions_PerContextJobTableIsolation(t *testing.T) {
 	}
 	binA := filepath.Join(dirA, "worker_a"+ext)
 	binB := filepath.Join(dirB, "worker_b"+ext)
-	if err := os.WriteFile(binA, exeBytes, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(binB, exeBytes, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	copyExecutableForTest(t, exe, binA)
+	copyExecutableForTest(t, exe, binB)
 
 	jtA := NewJobTable()
 	jtB := NewJobTable()
@@ -994,10 +979,6 @@ func TestJailRedTeam_VerifierFindings(t *testing.T) {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
-	exeBytes, err := os.ReadFile(exe)
-	if err != nil {
-		t.Fatalf("read test exe: %v", err)
-	}
 
 	rawAllowed := t.TempDir()
 	allowedDir, _ := canonicalizeForCheck(rawAllowed)
@@ -1014,9 +995,7 @@ func TestJailRedTeam_VerifierFindings(t *testing.T) {
 		ext = ".exe"
 	}
 	toolPath := filepath.Join(allowedDir, "mytool"+ext)
-	if err := os.WriteFile(toolPath, exeBytes, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	copyExecutableForTest(t, exe, toolPath)
 
 	// (A) Single OpExec prompt check across direct ./mytool, env ./mytool, nice ./mytool, nohup ./mytool, timeout ./mytool.
 	for _, cmdSrc := range []string{
@@ -1075,9 +1054,7 @@ func TestJailRedTeam_VerifierFindings(t *testing.T) {
 	// Test runJailedENOEXEC directly on all OSes (and end-to-end ./noshebang.sh on Unix!):
 	noShebang := filepath.Join(allowedDir, "noshebang.sh")
 	outsideBin := filepath.Join(outsideDir, "outside_bin"+ext)
-	if err := os.WriteFile(outsideBin, exeBytes, 0o755); err != nil {
-		t.Fatal(err)
-	}
+	copyExecutableForTest(t, exe, outsideBin)
 	escapeScript := fmt.Sprintf("stat %q >/dev/null 2>&1 && echo ESCAPED_STAT\necho pwn > %q 2>/dev/null && echo ESCAPED_WRITE\nnc 10.0.0.1 80 2>/dev/null && echo ESCAPED_NET\nps >/dev/null 2>&1 && echo ESCAPED_PS\n%q -test.run=^TestNetprocHelperProcess$ -- echo bad 2>/dev/null && echo ESCAPED_EXEC\nglobbed=( %s/* )\necho \"JAILED_SCRIPT_DONE:$1:${#globbed[@]}\"\n",
 		filepath.ToSlash(outsideSecret),
 		filepath.ToSlash(filepath.Join(outsideDir, "pwn.txt")),

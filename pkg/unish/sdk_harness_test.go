@@ -12,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1216,8 +1217,21 @@ func TestJailProcLoopbackTildeAndCustomHook(t *testing.T) {
 	}
 }
 
+func removeExecutableWithRetry(path string) {
+	for range 50 {
+		err := os.Remove(path)
+		if err == nil || os.IsNotExist(err) {
+			return
+		}
+		time.Sleep(40 * time.Millisecond)
+	}
+}
+
 func copyExecutableForTest(t *testing.T, src, dst string) {
 	t.Helper()
+	t.Cleanup(func() {
+		removeExecutableWithRetry(dst)
+	})
 	if err := os.Link(src, dst); err == nil {
 		return
 	}
@@ -1358,6 +1372,8 @@ func TestRedTeam1_WritableRootBinarySpoofing(t *testing.T) {
 	if rExplicit.ExitCode != 0 {
 		t.Fatalf("expected explicit full-path AllowBinaries entry to succeed, got exit=%d stderr=%q", rExplicit.ExitCode, rExplicit.Stderr)
 	}
+	_ = sessFull.Close()
+	_ = sess.Close()
 }
 
 func TestRedTeam2_JailedCLIInteractiveMode(t *testing.T) {
@@ -1599,11 +1615,22 @@ func TestRedTeam4_ConcurrentSubshellCdMSYSAndSelfKillSafety(t *testing.T) {
 		if res.ExitCode != 0 {
 			t.Fatalf("iter %d exit=%d stderr=%q", i, res.ExitCode, res.Stderr)
 		}
-		outNorm := normalizeMatchPath(res.Stdout)
-		if !strings.Contains(outNorm, normalizeMatchPath(realA)) || !strings.Contains(outNorm, normalizeMatchPath(realB)) {
-			t.Fatalf("iter %d missing expected subshell pwd output: got %q (want %q and %q)", i, res.Stdout, realA, realB)
+		var gotLines []string
+		for _, ln := range strings.Split(strings.TrimSpace(res.Stdout), "\n") {
+			ln = strings.TrimSpace(ln)
+			if ln == "" {
+				continue
+			}
+			canonLn, _ := canonicalizeForCheck(ln)
+			gotLines = append(gotLines, normalizeMatchPath(canonLn))
 		}
-		if normalizeMatchPath(sessRace.Cwd()) != normalizeMatchPath(realWS) {
+		wantA := normalizeMatchPath(realA)
+		wantB := normalizeMatchPath(realB)
+		if !slices.Contains(gotLines, wantA) || !slices.Contains(gotLines, wantB) {
+			t.Fatalf("iter %d missing expected subshell pwd output: got %q (%v, want %q and %q)", i, res.Stdout, gotLines, wantA, wantB)
+		}
+		canonSessCwd, _ := canonicalizeForCheck(sessRace.Cwd())
+		if normalizeMatchPath(canonSessCwd) != normalizeMatchPath(realWS) {
 			t.Fatalf("iter %d parent cwd mutated: %q", i, sessRace.Cwd())
 		}
 	}
