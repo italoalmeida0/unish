@@ -1215,3 +1215,809 @@ func TestJailProcLoopbackTildeAndCustomHook(t *testing.T) {
 		t.Fatalf("expected custom CapabilityHook denial recorded in ExecResult.Denials, got %+v", rCustom)
 	}
 }
+
+func copyExecutableForTest(t *testing.T, src, dst string) {
+	t.Helper()
+	if err := os.Link(src, dst); err == nil {
+		return
+	}
+	data, err := os.ReadFile(src)
+	if err != nil {
+		t.Fatalf("read executable %s: %v", src, err)
+	}
+	if err := os.WriteFile(dst, data, 0o755); err != nil {
+		t.Fatalf("write executable %s: %v", dst, err)
+	}
+}
+
+func TestRedTeam1_WritableRootBinarySpoofing(t *testing.T) {
+	selfExe, err := os.Executable()
+	if err != nil {
+		t.Skipf("os.Executable unavailable: %v", err)
+	}
+
+	ws := t.TempDir()
+	roBinDir := t.TempDir()
+	extraWritable := t.TempDir()
+
+	binName := "git"
+	if runtime.GOOS == "windows" {
+		binName = "git.exe"
+	}
+
+	wsFakeGit := filepath.Join(ws, binName)
+	roRealGit := filepath.Join(roBinDir, binName)
+	ruleFakeGit := filepath.Join(extraWritable, binName)
+	copyExecutableForTest(t, selfExe, wsFakeGit)
+	copyExecutableForTest(t, selfExe, roRealGit)
+	copyExecutableForTest(t, selfExe, ruleFakeGit)
+
+	// Also drop a POSIX executable script in ws/bin/git to verify non-.exe script spoofing.
+	wsScriptDir := filepath.Join(ws, "bin")
+	if err := os.MkdirAll(wsScriptDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wsScriptGit := filepath.Join(wsScriptDir, "git")
+	if err := os.WriteFile(wsScriptGit, []byte("#!/bin/sh\necho PWNED\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := DefaultJailConfig(ws)
+	cfg.ReadOnlyRoots = []string{roBinDir}
+	cfg.Rules = []PathRule{
+		{
+			Pattern:  filepath.ToSlash(extraWritable) + "/**",
+			Ops:      []AccessOp{OpRead, OpWrite, OpStat, OpList},
+			Decision: DecisionAllow,
+		},
+	}
+	cfg.Exec = ExecPolicy{
+		ExecDefault:   DecisionDeny,
+		AllowBinaries: []string{"git"},
+	}
+	jail, err := NewJail(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Direct CheckAccess on writable-root binary or script MUST deny bare-basename AllowBinaries!
+	for _, spoof := range []string{wsFakeGit, wsScriptGit, ruleFakeGit} {
+		err := jail.CheckAccess(context.Background(), AccessRequest{
+			Op:      OpExec,
+			Command: "git",
+			Path:    spoof,
+			RawPath: spoof,
+		})
+		if !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected writable-root binary %s denied despite AllowBinaries:[\"git\"], got %v", spoof, err)
+		}
+	}
+
+	// 2. Even a bare-basename GrantSession(OpExec, "git") MUST NOT allow executing binaries inside writable roots!
+	jail.GrantSession(OpExec, "git")
+	if err := jail.CheckAccess(context.Background(), AccessRequest{
+		Op:      OpExec,
+		Command: "git",
+		Path:    wsFakeGit,
+		RawPath: wsFakeGit,
+	}); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("GrantSession(OpExec, \"git\") allowed writable-root binary spoofing: %v", err)
+	}
+
+	// 3. End-to-end Session.Exec: ./git and PATH-prepended ws git fail with 126, while read-only system git succeeds!
+	sess, err := NewSession(WithWorkDir(ws), WithJail(jail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sess.Close()
+
+	rSpoofRel, err := sess.Exec(context.Background(), fmt.Sprintf(`"./%s" -test.run=^TestNothing$`, binName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rSpoofRel.ExitCode != 126 || len(rSpoofRel.Denials) == 0 {
+		t.Fatalf("expected ./%s inside writable root blocked (126), got exit=%d denials=%+v", binName, rSpoofRel.ExitCode, rSpoofRel.Denials)
+	}
+
+	rSpoofPath, err := sess.Exec(context.Background(), fmt.Sprintf(`PATH=%q git -test.run=^TestNothing$`, ws+string(os.PathListSeparator)+roBinDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rSpoofPath.ExitCode != 126 {
+		t.Fatalf("expected PATH-hijacked git in writable root blocked (126), got exit=%d out=%q err=%q", rSpoofPath.ExitCode, rSpoofPath.Stdout, rSpoofPath.Stderr)
+	}
+
+	rTrusted, err := sess.Exec(context.Background(), fmt.Sprintf(`"%s" -test.run=^TestNonExistentNothing$`, filepath.ToSlash(roRealGit)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rTrusted.ExitCode != 0 || len(rTrusted.Denials) != 0 {
+		t.Fatalf("expected read-only root binary allowed by AllowBinaries:[\"git\"], got exit=%d stderr=%q denials=%+v", rTrusted.ExitCode, rTrusted.Stderr, rTrusted.Denials)
+	}
+
+	// 4. Explicit full-path entry in AllowBinaries DOES allow that specific path inside a writable root.
+	cfgFull := DefaultJailConfig(ws)
+	cfgFull.Exec = ExecPolicy{
+		ExecDefault:   DecisionDeny,
+		AllowBinaries: []string{wsFakeGit},
+	}
+	jailFull, err := NewJail(cfgFull)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessFull, err := NewSession(WithWorkDir(ws), WithJail(jailFull))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessFull.Close()
+
+	rExplicit, err := sessFull.Exec(context.Background(), fmt.Sprintf(`"./%s" -test.run=^TestNonExistentNothing$`, binName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rExplicit.ExitCode != 0 {
+		t.Fatalf("expected explicit full-path AllowBinaries entry to succeed, got exit=%d stderr=%q", rExplicit.ExitCode, rExplicit.Stderr)
+	}
+}
+
+func TestRedTeam2_JailedCLIInteractiveMode(t *testing.T) {
+	ws := t.TempDir()
+	outside := t.TempDir()
+	fakeHome := t.TempDir()
+
+	t.Setenv("HOME", fakeHome)
+	t.Setenv("USERPROFILE", fakeHome)
+
+	outsideSecret := filepath.Join(outside, "secret.txt")
+	if err := os.WriteFile(outsideSecret, []byte("HOST_SECRET_DATA\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rcTouch := filepath.Join(outside, "rc_executed.txt")
+	unishrc := filepath.Join(fakeHome, ".unishrc")
+	rcBody := fmt.Sprintf("echo UNISHRC_LEAKED\necho pwn > %q\n", filepath.ToSlash(rcTouch))
+	if err := os.WriteFile(unishrc, []byte(rcBody), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	insideOut := filepath.Join(ws, "interactive_ok.txt")
+	scriptLines := strings.Join([]string{
+		fmt.Sprintf(`cat < "%s"`, filepath.ToSlash(outsideSecret)),
+		fmt.Sprintf(`echo escaped > "%s"`, filepath.ToSlash(filepath.Join(outside, "escaped.txt"))),
+		"if true; then",
+		fmt.Sprintf(`  echo "jailed-repl-ok" > "%s"`, filepath.ToSlash(insideOut)),
+		"fi",
+		"exit 23",
+		"echo AFTER_EXIT_UNREACHABLE",
+	}, "\n") + "\n"
+
+	inFile, err := os.CreateTemp(t.TempDir(), "stdin-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inFile.WriteString(scriptLines); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := inFile.Seek(0, io.SeekStart); err != nil {
+		t.Fatal(err)
+	}
+	defer inFile.Close()
+
+	outFile, err := os.CreateTemp(t.TempDir(), "stdout-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer outFile.Close()
+
+	errFile, err := os.CreateTemp(t.TempDir(), "stderr-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer errFile.Close()
+
+	origIn, origOut, origErr := os.Stdin, os.Stdout, os.Stderr
+	os.Stdin, os.Stdout, os.Stderr = inFile, outFile, errFile
+	rc := RunCLI("test", []string{"unish", "-i", "--jail", ws})
+	os.Stdin, os.Stdout, os.Stderr = origIn, origOut, origErr
+
+	if rc != 23 {
+		t.Fatalf("expected jailed interactive RunCLI exit code 23, got %d", rc)
+	}
+
+	outBytes, _ := os.ReadFile(outFile.Name())
+	outStr := string(outBytes)
+	if strings.Contains(outStr, "UNISHRC_LEAKED") || strings.Contains(outStr, "HOST_SECRET_DATA") || strings.Contains(outStr, "AFTER_EXIT_UNREACHABLE") {
+		t.Fatalf("jailed interactive mode leaked host rc/secret or ignored exit: stdout=%q", outStr)
+	}
+	if _, err := os.Stat(rcTouch); err == nil {
+		t.Fatal("jailed interactive mode executed ~/.unishrc outside jail!")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "escaped.txt")); err == nil {
+		t.Fatal("jailed interactive mode allowed write outside jail!")
+	}
+	if _, err := os.Stat(filepath.Join(fakeHome, ".unish_history")); err == nil {
+		t.Fatal("jailed interactive mode wrote ~/.unish_history outside jail!")
+	}
+	gotInside, err := os.ReadFile(insideOut)
+	if err != nil || strings.TrimSpace(string(gotInside)) != "jailed-repl-ok" {
+		t.Fatalf("expected inside write in jailed interactive mode, err=%v got=%q", err, string(gotInside))
+	}
+
+	// Verify EXIT trap executes on clean EOF in runJailedInteractive.
+	jailEOF, err := NewJail(DefaultJailConfig(ws))
+	if err != nil {
+		t.Fatal(err)
+	}
+	trapOut := filepath.Join(ws, "eof_trap.txt")
+	eofIn := strings.NewReader(fmt.Sprintf("trap 'echo trap_fired > \"%s\"' EXIT\n(exit 7)\n", filepath.ToSlash(trapOut)))
+	var eofStdout, eofStderr bytes.Buffer
+	rcEOF := runJailedInteractive(jailEOF, eofIn, &eofStdout, &eofStderr, false)
+	if rcEOF != 7 {
+		t.Fatalf("expected EOF exit status 7, got %d (stderr=%q)", rcEOF, eofStderr.String())
+	}
+	trapBytes, err := os.ReadFile(trapOut)
+	if err != nil || strings.TrimSpace(string(trapBytes)) != "trap_fired" {
+		t.Fatalf("expected EXIT trap to fire on EOF, err=%v got=%q", err, string(trapBytes))
+	}
+}
+
+func TestRedTeam3_SessionScrubEnvAndNoInheritLeakDefense(t *testing.T) {
+	ws := t.TempDir()
+	hostBinDir := t.TempDir()
+
+	leakCmdName := "rt_host_secret_path_cmd"
+	leakCmdFile := leakCmdName
+	if runtime.GOOS == "windows" {
+		leakCmdFile += ".exe"
+	}
+	if err := os.WriteFile(filepath.Join(hostBinDir, leakCmdFile), []byte("stub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Setenv("RT_SCRUB_API_KEY", "sk-top-secret-key-val")
+	t.Setenv("RT_SCRUB_DB_SECRET", "db-ultra-secret-val")
+	t.Setenv("RT_PUBLIC_HOST_VAR", "public-host-ok")
+	t.Setenv("PATH", hostBinDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	// Case A: WithInheritEnv(true) + WithScrubEnv("*_KEY", "*_SECRET")
+	sessScrub, err := NewSession(
+		WithWorkDir(ws),
+		WithInheritEnv(true),
+		WithScrubEnv("*_KEY", "*_SECRET"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessScrub.Close()
+
+	for _, cmd := range []string{
+		"printenv RT_SCRUB_API_KEY",
+		"printenv RT_SCRUB_DB_SECRET",
+		"env printenv RT_SCRUB_API_KEY",
+		"nice printenv RT_SCRUB_DB_SECRET",
+	} {
+		res, err := sessScrub.Exec(context.Background(), cmd)
+		if err != nil {
+			t.Fatalf("%s error: %v", cmd, err)
+		}
+		if res.ExitCode == 0 || strings.Contains(res.Stdout, "secret") {
+			t.Fatalf("%s leaked scrubbed host var! exit=%d stdout=%q", cmd, res.ExitCode, res.Stdout)
+		}
+	}
+
+	for _, dumpCmd := range []string{"printenv", "env", "env EXTRA_TMP=1 env", "nice env"} {
+		res, err := sessScrub.Exec(context.Background(), dumpCmd)
+		if err != nil {
+			t.Fatalf("%s error: %v", dumpCmd, err)
+		}
+		if strings.Contains(res.Stdout, "RT_SCRUB_API_KEY") ||
+			strings.Contains(res.Stdout, "sk-top-secret-key-val") ||
+			strings.Contains(res.Stdout, "RT_SCRUB_DB_SECRET") ||
+			strings.Contains(res.Stdout, "db-ultra-secret-val") {
+			t.Fatalf("%s leaked scrubbed secret! stdout=%q", dumpCmd, res.Stdout)
+		}
+		if !strings.Contains(res.Stdout, "RT_PUBLIC_HOST_VAR=public-host-ok") {
+			t.Fatalf("%s missing non-scrubbed var RT_PUBLIC_HOST_VAR", dumpCmd)
+		}
+	}
+
+	// Completion on scrubbed session must NOT suggest scrubbed host variable names!
+	_, varCands := completeWord("echo $RT_SCRUB_", len("echo $RT_SCRUB_"), sessScrub.runner, nil)
+	if len(varCands) != 0 {
+		t.Fatalf("completeWord leaked scrubbed host variable names: %v", varCands)
+	}
+	repPub, pubCands := completeWord("echo $RT_PUBLIC_HOST_", len("echo $RT_PUBLIC_HOST_"), sessScrub.runner, nil)
+	if repPub != "$RT_PUBLIC_HOST_VAR" && len(pubCands) == 0 {
+		t.Fatalf("expected non-scrubbed session var to complete, got rep=%q cands=%v", repPub, pubCands)
+	}
+
+	// Case B: WithInheritEnv(false) without PATH
+	sessIsolated, err := NewSession(
+		WithWorkDir(ws),
+		WithInheritEnv(false),
+		WithEnv([]string{"ONLY_EXPLICIT=present"}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessIsolated.Close()
+
+	rIsoPrint, err := sessIsolated.Exec(context.Background(), "printenv RT_PUBLIC_HOST_VAR")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rIsoPrint.ExitCode == 0 || rIsoPrint.Stdout != "" {
+		t.Fatalf("WithInheritEnv(false) printenv leaked host var: exit=%d stdout=%q", rIsoPrint.ExitCode, rIsoPrint.Stdout)
+	}
+
+	rIsoEnv, err := sessIsolated.Exec(context.Background(), "env")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rIsoEnv.Stdout, "RT_PUBLIC_HOST_VAR") || !strings.Contains(rIsoEnv.Stdout, "ONLY_EXPLICIT=present") {
+		t.Fatalf("WithInheritEnv(false) env mismatch: %q", rIsoEnv.Stdout)
+	}
+
+	// Command completion with empty session PATH must NOT fall back to os.Getenv("PATH")!
+	repCmd, cmdCands := completeWord("rt_host_secret_", len("rt_host_secret_"), sessIsolated.runner, nil)
+	if repCmd != "" || len(cmdCands) != 0 {
+		t.Fatalf("WithInheritEnv(false) completeWord leaked host PATH binary: rep=%q cands=%v", repCmd, cmdCands)
+	}
+}
+
+func TestRedTeam4_ConcurrentSubshellCdMSYSAndSelfKillSafety(t *testing.T) {
+	ws := t.TempDir()
+	extA := t.TempDir()
+	extB := t.TempDir()
+	deniedDir := t.TempDir()
+
+	realA, _ := canonicalizeForCheck(extA)
+	realB, _ := canonicalizeForCheck(extB)
+	realWS, _ := canonicalizeForCheck(ws)
+
+	// 4a. Concurrent subshell `cd` with per-request Approver (DecisionAllow, NOT cached) — zero race!
+	cfgAsk := DefaultJailConfig(ws)
+	cfgAsk.OutsideAction = DecisionAsk
+	cfgAsk.Approver = func(ctx context.Context, req AccessRequest) (Decision, error) {
+		return DecisionAllow, nil
+	}
+	jailAsk, err := NewJail(cfgAsk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessRace, err := NewSession(WithWorkDir(ws), WithJail(jailAsk))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessRace.Close()
+
+	subshellScript := fmt.Sprintf(`(cd "%s" && pwd) & (cd "%s" && pwd) & wait`, filepath.ToSlash(extA), filepath.ToSlash(extB))
+	for i := range 20 {
+		res, err := sessRace.Exec(context.Background(), subshellScript)
+		if err != nil {
+			t.Fatalf("iter %d err: %v", i, err)
+		}
+		if res.ExitCode != 0 {
+			t.Fatalf("iter %d exit=%d stderr=%q", i, res.ExitCode, res.Stderr)
+		}
+		outNorm := normalizeMatchPath(res.Stdout)
+		if !strings.Contains(outNorm, normalizeMatchPath(realA)) || !strings.Contains(outNorm, normalizeMatchPath(realB)) {
+			t.Fatalf("iter %d missing expected subshell pwd output: got %q (want %q and %q)", i, res.Stdout, realA, realB)
+		}
+		if normalizeMatchPath(sessRace.Cwd()) != normalizeMatchPath(realWS) {
+			t.Fatalf("iter %d parent cwd mutated: %q", i, sessRace.Cwd())
+		}
+	}
+
+	// Verify `builtin cd` and `command cd` are also gated by OpChdir, and `builtin umask` stays virtualized.
+	jailStrict, err := NewJail(DefaultJailConfig(ws))
+	if err != nil {
+		t.Fatal(err)
+	}
+	sessStrict, err := NewSession(WithWorkDir(ws), WithJail(jailStrict))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sessStrict.Close()
+
+	for _, cdVariant := range []string{
+		fmt.Sprintf(`builtin cd "%s"`, filepath.ToSlash(deniedDir)),
+		fmt.Sprintf(`command cd "%s"`, filepath.ToSlash(deniedDir)),
+	} {
+		res, err := sessStrict.Exec(context.Background(), cdVariant)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.ExitCode == 0 || len(res.Denials) == 0 || res.Denials[0].Op != OpChdir {
+			t.Fatalf("expected %q blocked with OpChdir, got exit=%d denials=%+v", cdVariant, res.ExitCode, res.Denials)
+		}
+	}
+
+	rUmask, err := sessStrict.Exec(context.Background(), "builtin umask 0077 && command umask")
+	if err != nil || rUmask.ExitCode != 0 || strings.TrimSpace(rUmask.Stdout) != "0077" || sessStrict.Umask() != 0o077 {
+		t.Fatalf("builtin/command umask virtualization failed: err=%v res=%+v umask=%04o", err, rUmask, sessStrict.Umask())
+	}
+
+	// Verify ulimit setting, history -r outside, pushd -n ../.. -> popd, and PATH=/outside oracles are blocked!
+	outsideBin := filepath.Join(deniedDir, "secret_probe_bin")
+	if runtime.GOOS == "windows" {
+		outsideBin += ".exe"
+	}
+	_ = os.WriteFile(outsideBin, []byte("stub"), 0o755)
+	for _, guardCmd := range []string{
+		"ulimit -n 8",
+		fmt.Sprintf(`history -r "%s"`, filepath.ToSlash(outsideBin)),
+		fmt.Sprintf(`PATH=%q command -v secret_probe_bin`, deniedDir),
+		fmt.Sprintf(`PATH=%q type -P secret_probe_bin`, deniedDir),
+		fmt.Sprintf(`PATH=%q hash secret_probe_bin`, deniedDir),
+		fmt.Sprintf(`PATH=%q source secret_probe_bin`, deniedDir),
+		`mkdir -p sub1/sub2 && cd sub1/sub2 && pushd -n ../.. >/dev/null && cd ../.. && popd >/dev/null && cd ..`,
+	} {
+		rG, err := sessStrict.Exec(context.Background(), guardCmd)
+		if err != nil {
+			t.Fatalf("guard %q error: %v", guardCmd, err)
+		}
+		if rG.ExitCode == 0 {
+			t.Fatalf("expected guard %q to fail in jailed session, got exit=0 stdout=%q", guardCmd, rG.Stdout)
+		}
+	}
+	_ = sessStrict.SetCwd(ws)
+
+	// 4b. Windows MSYS path normalization (`cd /c/...`) in Session.
+	if runtime.GOOS == "windows" && len(realWS) >= 3 && realWS[1] == ':' {
+		msysSub := filepath.Join(realWS, "msys_child")
+		if err := os.MkdirAll(msysSub, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		drive := strings.ToLower(string(realWS[0]))
+		msysTarget := "/" + drive + filepath.ToSlash(msysSub[2:])
+		rMSYS, err := sessStrict.Exec(context.Background(), fmt.Sprintf(`cd "%s" && pwd`, msysTarget))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if rMSYS.ExitCode != 0 || normalizeMatchPath(sessStrict.Cwd()) != normalizeMatchPath(msysSub) {
+			t.Fatalf("Windows MSYS cd %q failed: exit=%d stderr=%q cwd=%q", msysTarget, rMSYS.ExitCode, rMSYS.Stderr, sessStrict.Cwd())
+		}
+	}
+
+	// 4c. Self-PID and broadcast `kill` safety in BOTH unjailed and ProcDefault:Allow jailed Sessions!
+	cfgProcAllow := DefaultJailConfig(ws)
+	cfgProcAllow.Proc.ProcDefault = DecisionAllow
+	jailProcAllow, err := NewJail(cfgProcAllow)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	unjailedSess, err := NewSession(WithWorkDir(ws))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unjailedSess.Close()
+
+	jailedProcSess, err := NewSession(WithWorkDir(ws), WithJail(jailProcAllow))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer jailedProcSess.Close()
+
+	for name, sess := range map[string]*Session{
+		"unjailed":   unjailedSess,
+		"proc_allow": jailedProcSess,
+		"proc_deny":  sessStrict,
+	} {
+		// Subshell self-SIGKILL in canonical and non-canonical numeric forms + `command kill` + `env kill`:
+		// MUST NEVER kill the Go test process, and MUST exit subshell with 137!
+		rSub, err := sess.Exec(context.Background(), `(kill -9 $$); a=$?; (kill -9 0$$); b=$?; (kill -9 +$$); c=$?; (command kill -9 $$); d=$?; (env kill -9 $$); e=$?; printf "%d,%d,%d,%d,%d" "$a" "$b" "$c" "$d" "$e"`)
+		if err != nil {
+			t.Fatalf("[%s] subshell self-kill err: %v", name, err)
+		}
+		if rSub.Stdout != "137,137,137,137,137" {
+			t.Fatalf("[%s] expected subshell self-kills 137,137,137,137,137, got %q (stderr=%q)", name, rSub.Stdout, rSub.Stderr)
+		}
+
+		// Broadcast / group kills (0, -1, -- -1) must NEVER signal host process group!
+		for _, bcast := range []string{"kill -9 0", "kill -9 -1", "kill -9 -- -1"} {
+			rB, err := sess.Exec(context.Background(), bcast)
+			if err != nil {
+				t.Fatalf("[%s] %s err: %v", name, bcast, err)
+			}
+			if rB.ExitCode == 0 {
+				t.Fatalf("[%s] expected %q to fail safely with non-zero exit", name, bcast)
+			}
+			if name == "proc_deny" && (len(rB.Denials) == 0 || rB.Denials[0].Op != OpProc) {
+				t.Fatalf("[%s] expected %q to record OpProc denial, got %+v", name, bcast, rB.Denials)
+			}
+		}
+
+		// Trapped self-signal runs trap handler in-process without exiting!
+		rTrap, err := sess.Exec(context.Background(), `trap 'printf "TRAP_OK:"' TERM; kill -TERM $$; printf "AFTER_OK"`)
+		if err != nil {
+			t.Fatalf("[%s] trapped self-kill err: %v", name, err)
+		}
+		if rTrap.ExitCode != 0 || rTrap.Stdout != "TRAP_OK:AFTER_OK" {
+			t.Fatalf("[%s] expected TRAP_OK:AFTER_OK, got exit=%d stdout=%q stderr=%q", name, rTrap.ExitCode, rTrap.Stdout, rTrap.Stderr)
+		}
+		_, _ = sess.Exec(context.Background(), `trap - TERM`)
+
+		// Top-level `kill -9 $$` halts current Exec with 137, AND leaves Session alive for subsequent Execs!
+		rTop, err := sess.Exec(context.Background(), `kill -9 $$; echo UNREACHABLE`)
+		if err != nil {
+			t.Fatalf("[%s] top-level self-kill err: %v", name, err)
+		}
+		if rTop.ExitCode != 137 || strings.Contains(rTop.Stdout, "UNREACHABLE") {
+			t.Fatalf("[%s] expected top-level kill -9 $$ exit=137, got exit=%d stdout=%q", name, rTop.ExitCode, rTop.Stdout)
+		}
+
+		rRecover, err := sess.Exec(context.Background(), `echo RECOVERED`)
+		if err != nil || rRecover.ExitCode != 0 || strings.TrimSpace(rRecover.Stdout) != "RECOVERED" {
+			t.Fatalf("[%s] session did not recover after top-level kill -9 $$: err=%v res=%+v", name, err, rRecover)
+		}
+	}
+}
+
+func TestRedTeam5_HarnessCancelQueuedAndStaleTargetIsolation(t *testing.T) {
+	ws := t.TempDir()
+	clientInR, clientInW := io.Pipe()
+	serverOutR, serverOutW := io.Pipe()
+
+	srv, err := NewHarnessServer(clientInR, serverOutW, WithWorkDir(ws))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srvDone := make(chan error, 1)
+	go func() {
+		err := srv.Serve(context.Background())
+		_ = serverOutW.Close()
+		srvDone <- err
+	}()
+	defer func() {
+		_ = clientInW.Close()
+		<-srvDone
+		_ = srv.Session().Close()
+	}()
+
+	send := func(msg map[string]any) {
+		t.Helper()
+		b, err := json.Marshal(msg)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b = append(b, '\n')
+		if _, err := clientInW.Write(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	eventsCh := make(chan HarnessEvent, 64)
+	go func() {
+		sc := bufio.NewScanner(serverOutR)
+		for sc.Scan() {
+			var ev HarnessEvent
+			if err := json.Unmarshal(sc.Bytes(), &ev); err == nil {
+				eventsCh <- ev
+			}
+		}
+		close(eventsCh)
+	}()
+
+	nextEvent := func(timeout time.Duration) HarnessEvent {
+		t.Helper()
+		select {
+		case ev, ok := <-eventsCh:
+			if !ok {
+				t.Fatal("harness stream closed unexpectedly")
+			}
+			return ev
+		case <-time.After(timeout):
+			t.Fatalf("timed out after %v waiting for event", timeout)
+			return HarnessEvent{}
+		}
+	}
+
+	// Enqueue e1 (slow) and e2 (queued behind e1) back-to-back.
+	send(map[string]any{
+		"id":     "e1",
+		"type":   "exec",
+		"script": `echo "e1_running"; sleep 0.35; echo "e1_completed"`,
+	})
+	send(map[string]any{
+		"id":     "e2",
+		"type":   "exec",
+		"script": `echo "e2_should_never_execute"`,
+	})
+
+	// Wait until e1 has started running so e2 is guaranteed queued.
+	for {
+		ev := nextEvent(5 * time.Second)
+		if ev.Type == "stdout" && ev.ID == "e1" && strings.Contains(ev.Data, "e1_running") {
+			break
+		}
+	}
+
+	// Cancel queued e2 AND send a bogus req_id cancel — neither may cancel active e1!
+	send(map[string]any{"type": "cancel", "req_id": "e2"})
+	send(map[string]any{"type": "cancel", "req_id": "unrelated-id"})
+
+	var gotE1Result, gotE2Result *HarnessEvent
+	for gotE1Result == nil || gotE2Result == nil {
+		ev := nextEvent(5 * time.Second)
+		if ev.Type == "stdout" && strings.Contains(ev.Data, "e2_should_never_execute") {
+			t.Fatalf("queued cancelled e2 actually executed! ev=%+v", ev)
+		}
+		if ev.Type == "result" {
+			evCopy := ev
+			switch ev.ID {
+			case "e1":
+				gotE1Result = &evCopy
+			case "e2":
+				gotE2Result = &evCopy
+			}
+		}
+	}
+
+	if !gotE2Result.Cancelled || gotE2Result.ExitCode == nil || *gotE2Result.ExitCode != 130 {
+		t.Fatalf("expected queued e2 cancelled result (130), got %+v", gotE2Result)
+	}
+	if gotE1Result.Cancelled || gotE1Result.ExitCode == nil || *gotE1Result.ExitCode != 0 || gotE1Result.Stdout == nil || !strings.Contains(*gotE1Result.Stdout, "e1_completed") {
+		t.Fatalf("cancelling queued e2 erroneously disturbed active e1: %+v", gotE1Result)
+	}
+
+	// Now start e3 and send a late cancel referencing already-finished e1 — e3 must NOT be cancelled!
+	send(map[string]any{
+		"id":     "e3",
+		"type":   "exec",
+		"script": `echo "e3_running"; sleep 0.25; echo "e3_completed"`,
+	})
+	for {
+		ev := nextEvent(5 * time.Second)
+		if ev.Type == "stdout" && ev.ID == "e3" && strings.Contains(ev.Data, "e3_running") {
+			break
+		}
+	}
+	send(map[string]any{"type": "cancel", "req_id": "e1"})
+
+	for {
+		ev := nextEvent(5 * time.Second)
+		if ev.Type == "result" && ev.ID == "e3" {
+			if ev.Cancelled || ev.ExitCode == nil || *ev.ExitCode != 0 || ev.Stdout == nil || !strings.Contains(*ev.Stdout, "e3_completed") {
+				t.Fatalf("late cancel for e1 cancelled subsequent e3! %+v", ev)
+			}
+			break
+		}
+	}
+}
+
+func TestRedTeam6_NetPolicyUnspecifiedLoopbackCGNATAndListenRebinding(t *testing.T) {
+	ws := t.TempDir()
+	noopDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		c1, c2 := net.Pipe()
+		_ = c2.Close()
+		return c1, nil
+	}
+
+	// 6a. `--net loopback` (AllowLoopback: true, Default: DecisionDeny):
+	// MUST block 0.0.0.0, 0.1.2.3, and :: on BOTH DialContext and Listen!
+	cfgLoop := DefaultJailConfig(ws)
+	cfgLoop.Net = NetPolicy{
+		Default:         DecisionDeny,
+		AllowLoopback:   true,
+		BlockPrivateLAN: true,
+		TransportDialer: noopDial,
+	}
+	jailLoop, err := NewJail(cfgLoop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, badAddr := range []string{"0.0.0.0:8080", "0.1.2.3:8080", "[::]:8080"} {
+		if _, err := jailLoop.DialContext(context.Background(), "nc", "tcp", badAddr); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected DialContext(%s) denied in loopback mode, got %v", badAddr, err)
+		}
+		if _, err := jailLoop.Listen(context.Background(), "nc", "tcp", badAddr); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected Listen(%s) denied in loopback mode, got %v", badAddr, err)
+		}
+	}
+	cLoop, err := jailLoop.DialContext(context.Background(), "nc", "tcp", "127.0.0.1:8080")
+	if err != nil {
+		t.Fatalf("expected 127.0.0.1:8080 allowed in loopback mode, got %v", err)
+	}
+	_ = cLoop.Close()
+
+	// 6b. BlockPrivateLAN: true blocks CGNAT 100.64.0.0/10 and NAT64 64:ff9b::/96!
+	cfgLAN := DefaultJailConfig(ws)
+	cfgLAN.Net = NetPolicy{
+		Default:         DecisionAllow,
+		AllowLoopback:   false,
+		BlockPrivateLAN: true,
+		TransportDialer: noopDial,
+	}
+	jailLAN, err := NewJail(cfgLAN)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, blocked := range []string{
+		"100.64.0.1:443",
+		"100.100.100.200:80",
+		"100.127.255.254:443",
+		"[64:ff9b::a00:1]:443",
+		"[64:ff9b::c0a8:101]:80",
+		"0.0.0.0:80",
+		"[::]:80",
+	} {
+		if _, err := jailLAN.DialContext(context.Background(), "curl", "tcp", blocked); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected BlockPrivateLAN to deny %s, got %v", blocked, err)
+		}
+	}
+	// Public IP just outside 100.64.0.0/10 (100.63.255.254) succeeds.
+	cPub, err := jailLAN.DialContext(context.Background(), "curl", "tcp", "100.63.255.254:443")
+	if err != nil {
+		t.Fatalf("expected public IP 100.63.255.254:443 allowed, got %v", err)
+	}
+	_ = cPub.Close()
+
+	// 6c. AllowLoopback: false with BlockPrivateLAN: false STILL blocks loopback (direct & DNS-rebound)!
+	cfgNoLoop := DefaultJailConfig(ws)
+	cfgNoLoop.Net = NetPolicy{
+		Default:         DecisionAllow,
+		AllowLoopback:   false,
+		BlockPrivateLAN: false,
+		TransportDialer: noopDial,
+	}
+	jailNoLoop, err := NewJail(cfgNoLoop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	jailNoLoop.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	for _, loopTarget := range []string{"127.0.0.1:8080", "[::1]:8080", "rebind.attacker.example:8080"} {
+		if _, err := jailNoLoop.DialContext(context.Background(), "curl", "tcp", loopTarget); !errors.Is(err, os.ErrPermission) {
+			t.Fatalf("expected AllowLoopback=false (BlockPrivateLAN=false) to deny %s, got %v", loopTarget, err)
+		}
+	}
+
+	// 6d. Jail.Listen / ListenPacket hostname resolution & DNS-rebinding defense!
+	cfgListen := DefaultJailConfig(ws)
+	cfgListen.Net = NetPolicy{
+		Default:         DecisionDeny,
+		AllowLoopback:   true,
+		BlockPrivateLAN: true,
+		AllowListen:     DecisionDeny,
+		Rules: []NetRule{
+			{
+				HostPattern: "bind.svc.local",
+				Ops:         []AccessOp{OpNetListen},
+				Decision:    DecisionAllow,
+			},
+		},
+	}
+	jailListen, err := NewJail(cfgListen)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Hostname resolving to 0.0.0.0 wildcard MUST be rejected before net.Listen!
+	jailListen.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		return []net.IPAddr{{IP: net.ParseIP("0.0.0.0")}}, nil
+	}
+	if _, err := jailListen.Listen(context.Background(), "nc", "tcp", "bind.svc.local:0"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected Listen rebinding to 0.0.0.0 denied, got %v", err)
+	}
+	if _, err := jailListen.ListenPacket(context.Background(), "nc", "udp", "bind.svc.local:0"); !errors.Is(err, os.ErrPermission) {
+		t.Fatalf("expected ListenPacket rebinding to 0.0.0.0 denied, got %v", err)
+	}
+
+	// Hostname resolving to 127.0.0.1 succeeds AND binds pinned 127.0.0.1:port directly!
+	var listenLookups atomic.Int32
+	jailListen.lookupIPAddr = func(ctx context.Context, host string) ([]net.IPAddr, error) {
+		listenLookups.Add(1)
+		return []net.IPAddr{{IP: net.ParseIP("127.0.0.1")}}, nil
+	}
+	ln, err := jailListen.Listen(context.Background(), "nc", "tcp", "bind.svc.local:0")
+	if err != nil {
+		t.Fatalf("expected Listen on bind.svc.local -> 127.0.0.1 allowed, got %v", err)
+	}
+	defer ln.Close()
+	if listenLookups.Load() != 1 || !strings.HasPrefix(ln.Addr().String(), "127.0.0.1:") {
+		t.Fatalf("expected 1 lookup and pinned 127.0.0.1 listener, got lookups=%d addr=%s", listenLookups.Load(), ln.Addr().String())
+	}
+}

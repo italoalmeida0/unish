@@ -32,6 +32,49 @@ var ErrSessionClosed = errors.New("unish: session closed")
 
 const internalRestoreExitCmd = "__unish_internal_restore_exit__"
 
+type sessionCtxKey struct{}
+
+func withSessionInContext(ctx context.Context, s *Session) context.Context {
+	return context.WithValue(ctx, sessionCtxKey{}, s)
+}
+
+func sessionFromContext(ctx context.Context) *Session {
+	if ctx == nil {
+		return nil
+	}
+	s, _ := ctx.Value(sessionCtxKey{}).(*Session)
+	return s
+}
+
+var (
+	sessionExtrasOnce sync.Once
+	origKillExtraMain func(ctx context.Context, hc interp.HandlerContext, args []string) error
+)
+
+func ensureSessionExtrasRegistered() {
+	sessionExtrasOnce.Do(func() {
+		registerExtra("printenv", cmdSessionAwarePrintenv)
+		if prev := lookupExtra("kill"); prev != nil {
+			orig := prev.main
+			origKillExtraMain = orig
+			registerExtra("kill", func(ctx context.Context, hc interp.HandlerContext, args []string) error {
+				if sess := sessionFromContext(ctx); sess != nil {
+					code, _ := sess.runSessionKill(ctx, hc, args)
+					if code != 0 {
+						return exitError{code}
+					}
+					return nil
+				}
+				return orig(ctx, hc, args)
+			})
+		}
+	})
+}
+
+func init() {
+	registerExtra("printenv", cmdSessionAwarePrintenv)
+}
+
 // SessionConfig configures a persistent embedded unish Session.
 type SessionConfig struct {
 	WorkDir    string
@@ -225,13 +268,13 @@ type Session struct {
 	lastExit atomic.Int32
 
 	// Internal fields accessed only while holding execMu.
-	inInternalOp      bool
-	savedExit         int
-	approvedChdirPath string
+	inInternalOp bool
+	savedExit    int
 }
 
 // NewSession creates a new persistent unish Session configured with opts.
 func NewSession(opts ...SessionOption) (*Session, error) {
+	ensureSessionExtrasRegistered()
 	cfg := SessionConfig{
 		InheritEnv: true,
 	}
@@ -322,6 +365,7 @@ func NewSession(opts ...SessionOption) (*Session, error) {
 	}
 	s.runner = r
 	registerRunnerCompletionHook(r, s.hook)
+	registerRunnerEnvIsolated(r, !s.inheritEnv || len(s.scrubPatterns) > 0)
 	return s, nil
 }
 
@@ -735,6 +779,7 @@ func (s *Session) Close() error {
 	}
 	s.execMu.Lock()
 	unregisterRunnerCompletionHook(s.runner)
+	unregisterRunnerEnvIsolated(s.runner)
 	s.stdinProxy.setReader(nil)
 	s.stdoutProxy.reset(nil)
 	s.stderrProxy.reset(nil)
@@ -771,6 +816,11 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 	if s.hook != nil {
 		execCtx = WithCapabilityHook(execCtx, s.hook)
 	}
+	execCtx = withSessionInContext(execCtx, s)
+	execCtx = withChdirApprovalStore(execCtx)
+	if !s.inheritEnv || len(s.scrubPatterns) > 0 {
+		execCtx = withSessionEnvIsolated(execCtx)
+	}
 	execCtx, dc := withDenialCollector(execCtx)
 
 	var timeoutCancel context.CancelFunc
@@ -798,7 +848,6 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 		s.cancelledByUs = nil
 		s.cancelMu.Unlock()
 		cancel()
-		s.approvedChdirPath = ""
 		s.stdinProxy.setReader(nil)
 		s.stdoutProxy.reset(nil)
 		s.stderrProxy.reset(nil)
@@ -949,6 +998,147 @@ func (s *Session) readDirHandler(ctx context.Context, path string) ([]fs.DirEntr
 	return fsReadDir(ctx, hc.Dir, "glob", path)
 }
 
+type chdirApprovalStoreKey struct{}
+
+type chdirTicket struct {
+	statRem   int
+	accessRem int
+}
+
+type chdirApprovalStore struct {
+	mu      sync.Mutex
+	tickets map[string]*chdirTicket
+}
+
+func withChdirApprovalStore(ctx context.Context) context.Context {
+	return context.WithValue(ctx, chdirApprovalStoreKey{}, &chdirApprovalStore{})
+}
+
+func grantChdirApprovalTicket(ctx context.Context, normPath string) {
+	if ctx == nil || normPath == "" {
+		return
+	}
+	st, ok := ctx.Value(chdirApprovalStoreKey{}).(*chdirApprovalStore)
+	if !ok || st == nil {
+		return
+	}
+	st.mu.Lock()
+	if st.tickets == nil {
+		st.tickets = make(map[string]*chdirTicket)
+	}
+	tk := st.tickets[normPath]
+	if tk == nil {
+		tk = &chdirTicket{}
+		st.tickets[normPath] = tk
+	}
+	tk.statRem++
+	tk.accessRem++
+	st.mu.Unlock()
+}
+
+func consumeChdirStatApproval(ctx context.Context, normPath string) bool {
+	if ctx == nil || normPath == "" {
+		return false
+	}
+	st, ok := ctx.Value(chdirApprovalStoreKey{}).(*chdirApprovalStore)
+	if !ok || st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	tk := st.tickets[normPath]
+	if tk == nil || tk.statRem <= 0 {
+		return false
+	}
+	tk.statRem--
+	if tk.statRem <= 0 && tk.accessRem <= 0 {
+		delete(st.tickets, normPath)
+	}
+	return true
+}
+
+func consumeChdirAccessApproval(ctx context.Context, normPath string) bool {
+	if ctx == nil || normPath == "" {
+		return false
+	}
+	st, ok := ctx.Value(chdirApprovalStoreKey{}).(*chdirApprovalStore)
+	if !ok || st == nil {
+		return false
+	}
+	st.mu.Lock()
+	defer st.mu.Unlock()
+	tk := st.tickets[normPath]
+	if tk == nil || tk.accessRem <= 0 {
+		return false
+	}
+	tk.accessRem--
+	if tk.statRem <= 0 && tk.accessRem <= 0 {
+		delete(st.tickets, normPath)
+	}
+	return true
+}
+
+type sessionEnvIsolatedKey struct{}
+
+func withSessionEnvIsolated(ctx context.Context) context.Context {
+	return context.WithValue(ctx, sessionEnvIsolatedKey{}, true)
+}
+
+func isSessionEnvIsolated(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	v, _ := ctx.Value(sessionEnvIsolatedKey{}).(bool)
+	return v
+}
+
+func cmdSessionAwarePrintenv(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	if isSessionEnvIsolated(ctx) {
+		return runIsolatedPrintenv(hc, args)
+	}
+	return cmdPrintenv(ctx, hc, args)
+}
+
+func runIsolatedPrintenv(hc interp.HandlerContext, args []string) error {
+	sep := "\n"
+	var keys []string
+	endOpts := false
+	for _, a := range args[1:] {
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if a == "-0" || a == "--null" {
+				sep = "\x00"
+				continue
+			}
+		}
+		keys = append(keys, a)
+	}
+	if len(keys) == 0 {
+		hc.Env.Each(func(name string, v expand.Variable) bool {
+			if v.IsSet() && v.Exported {
+				fmt.Fprintf(hc.Stdout, "%s=%s%s", name, v.Str, sep)
+			}
+			return true
+		})
+		return nil
+	}
+	code := 0
+	for _, k := range keys {
+		if v := hc.Env.Get(k); v.IsSet() && v.Exported {
+			fmt.Fprintf(hc.Stdout, "%s%s", v.Str, sep)
+		} else {
+			code = 1
+		}
+	}
+	if code != 0 {
+		return exitError{code}
+	}
+	return nil
+}
+
 func (s *Session) statHandler(ctx context.Context, path string, followSymlinks bool) (fs.FileInfo, error) {
 	hc := interp.HandlerCtx(ctx)
 	if testDevNodes[strings.ToLower(path)] {
@@ -957,14 +1147,12 @@ func (s *Session) statHandler(ctx context.Context, path string, followSymlinks b
 		}
 		return synthDevFileInfo{name: filepath.Base(path)}, nil
 	}
-	if s.approvedChdirPath != "" {
-		realP, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
-		if normalizeMatchPath(realP) == s.approvedChdirPath {
-			if !followSymlinks {
-				return os.Lstat(realP)
-			}
-			return os.Stat(realP)
+	realP, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
+	if consumeChdirStatApproval(ctx, normalizeMatchPath(realP)) {
+		if !followSymlinks {
+			return os.Lstat(realP)
 		}
+		return os.Stat(realP)
 	}
 	if !followSymlinks {
 		return fsLstat(ctx, hc.Dir, "stat", path)
@@ -977,9 +1165,9 @@ func (s *Session) accessHandler(ctx context.Context, path string, mode interp.Ac
 		return interp.DefaultAccessHandler()(ctx, path, mode)
 	}
 	hc := interp.HandlerCtx(ctx)
-	if s.approvedChdirPath != "" && mode == interp.AccessExec {
+	if mode == interp.AccessExec {
 		realP, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
-		if normalizeMatchPath(realP) == s.approvedChdirPath {
+		if consumeChdirAccessApproval(ctx, normalizeMatchPath(realP)) {
 			return interp.DefaultAccessHandler()(ctx, realP, mode)
 		}
 	}
@@ -1026,7 +1214,6 @@ func (s *Session) callHandler(ctx context.Context, args []string) ([]string, err
 	if len(args) == 0 {
 		return args, nil
 	}
-	s.approvedChdirPath = ""
 
 	if s.inInternalOp && len(args) == 1 && args[0] == internalRestoreExitCmd {
 		return nil, interp.CallHandled(uint8(s.savedExit))
@@ -1035,37 +1222,35 @@ func (s *Session) callHandler(ctx context.Context, args []string) ([]string, err
 	hc := interp.HandlerCtx(ctx)
 	switch args[0] {
 	case "umask":
-		if err := s.runSessionUmask(hc, args); err != nil {
-			if errors.Is(err, flag.ErrHelp) {
-				return nil, interp.CallHandled(2)
-			}
-			return nil, interp.CallHandled(1)
-		}
-		return nil, interp.CallHandled(0)
+		return s.handleSessionUmaskCall(hc, args)
+
+	case "ulimit":
+		return s.handleSessionUlimitCall(ctx, hc, args)
+
+	case "history":
+		return s.handleSessionHistoryCall(ctx, hc, args)
 
 	case "cd", "pushd":
-		if CapabilityHookFromContext(ctx) != nil {
-			if target, ok := resolveCdTargetArg(hc, args); ok {
-				checked, err := checkChdir(withApprovalMemo(ctx), hc.Dir, args[0], target)
-				if err != nil {
-					fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], err)
-					return nil, interp.CallHandled(1)
-				}
-				realDir, _ := canonicalizeForCheck(checked)
-				s.approvedChdirPath = normalizeMatchPath(realDir)
-			}
-		}
-		return args, nil
+		return s.handleSessionCdCall(ctx, hc, args, nil)
 
 	case "popd":
 		return args, nil
 
+	case "source", ".":
+		return s.handleSessionSourceCall(ctx, hc, args, nil)
+
 	case "kill":
+		return s.handleSessionKill(ctx, hc, args)
+
+	case "type":
 		if CapabilityHookFromContext(ctx) != nil {
-			if err := s.gateKillCall(ctx, hc, args); err != nil {
-				fmt.Fprintf(hc.Stderr, "kill: %v\n", err)
-				return nil, interp.CallHandled(1)
-			}
+			return s.handleJailedTypeCall(ctx, hc, args)
+		}
+		return callOverride(ctx, args)
+
+	case "hash":
+		if CapabilityHookFromContext(ctx) != nil {
+			return s.handleJailedHashCall(ctx, hc, args)
 		}
 		return callOverride(ctx, args)
 
@@ -1077,9 +1262,513 @@ func (s *Session) callHandler(ctx context.Context, args []string) ([]string, err
 			return args, nil
 		}
 		return callOverride(ctx, args)
+
+	case "builtin":
+		if len(args) >= 2 {
+			switch args[1] {
+			case "umask":
+				return s.handleSessionUmaskCall(hc, args[1:])
+			case "ulimit":
+				return s.handleSessionUlimitCall(ctx, hc, args[1:])
+			case "history":
+				return s.handleSessionHistoryCall(ctx, hc, args[1:])
+			case "cd", "pushd":
+				return s.handleSessionCdCall(ctx, hc, args[1:], args[:1])
+			case "source", ".":
+				return s.handleSessionSourceCall(ctx, hc, args[1:], args[:1])
+			case "kill":
+				return s.handleSessionKill(ctx, hc, args[1:])
+			case "type":
+				if CapabilityHookFromContext(ctx) != nil {
+					return s.handleJailedTypeCall(ctx, hc, args[1:])
+				}
+			case "hash":
+				if CapabilityHookFromContext(ctx) != nil {
+					return s.handleJailedHashCall(ctx, hc, args[1:])
+				}
+			case "test", "[":
+				if CapabilityHookFromContext(ctx) != nil {
+					return args, nil
+				}
+			}
+		}
+
+	case "command":
+		if CapabilityHookFromContext(ctx) != nil {
+			if handled, code := s.handleJailedCommandShow(ctx, hc, args); handled {
+				return nil, interp.CallHandled(code)
+			}
+		}
+		if prefix, sub, ok := splitPlainCommandBuiltin(args); ok {
+			switch sub[0] {
+			case "umask":
+				return s.handleSessionUmaskCall(hc, sub)
+			case "ulimit":
+				return s.handleSessionUlimitCall(ctx, hc, sub)
+			case "history":
+				return s.handleSessionHistoryCall(ctx, hc, sub)
+			case "cd", "pushd":
+				return s.handleSessionCdCall(ctx, hc, sub, prefix)
+			case "source", ".":
+				return s.handleSessionSourceCall(ctx, hc, sub, prefix)
+			case "kill":
+				return s.handleSessionKill(ctx, hc, sub)
+			case "type":
+				if CapabilityHookFromContext(ctx) != nil {
+					return s.handleJailedTypeCall(ctx, hc, sub)
+				}
+			case "hash":
+				if CapabilityHookFromContext(ctx) != nil {
+					return s.handleJailedHashCall(ctx, hc, sub)
+				}
+			case "test", "[":
+				if CapabilityHookFromContext(ctx) != nil {
+					return args, nil
+				}
+			}
+		}
 	}
 
 	return callOverride(ctx, args)
+}
+
+func (s *Session) handleSessionUmaskCall(hc interp.HandlerContext, args []string) ([]string, error) {
+	if err := s.runSessionUmask(hc, args); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return nil, interp.CallHandled(2)
+		}
+		return nil, interp.CallHandled(1)
+	}
+	return nil, interp.CallHandled(0)
+}
+
+func (s *Session) handleSessionUlimitCall(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	endOpts := false
+	hasSetArg := false
+	for _, a := range args[1:] {
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if strings.HasPrefix(a, "-") && len(a) > 1 {
+				continue
+			}
+		}
+		hasSetArg = true
+		break
+	}
+	if hasSetArg {
+		if CapabilityHookFromContext(ctx) != nil {
+			if cerr := checkProc(ctx, "ulimit", os.Getpid(), "RLIMIT"); cerr != nil {
+				fmt.Fprintf(hc.Stderr, "ulimit: %v\n", cerr)
+				return nil, interp.CallHandled(1)
+			}
+		}
+		fmt.Fprintln(hc.Stderr, "ulimit: cannot modify host process limit in embedded session: Operation not permitted")
+		return nil, interp.CallHandled(1)
+	}
+	return callOverride(ctx, args)
+}
+
+func (s *Session) handleSessionHistoryCall(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	// Never read or mutate process-global replHist from an embedded/jailed Session.
+	argv := args[1:]
+	for i := 0; i < len(argv); i++ {
+		a := argv[i]
+		if a == "--" {
+			break
+		}
+		if (a == "-r" || a == "-n") && CapabilityHookFromContext(ctx) != nil {
+			target := hc.Env.Get("HISTFILE").String()
+			if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+				i++
+				target = argv[i]
+			}
+			if target != "" {
+				if _, err := checkFS(ctx, hc.Dir, "history", target, OpRead); err != nil {
+					fmt.Fprintf(hc.Stderr, "history: %v\n", err)
+					return nil, interp.CallHandled(1)
+				}
+			}
+			continue
+		}
+		if (a == "-w" || a == "-a") && CapabilityHookFromContext(ctx) != nil {
+			target := hc.Env.Get("HISTFILE").String()
+			if i+1 < len(argv) && !strings.HasPrefix(argv[i+1], "-") {
+				i++
+				target = argv[i]
+			}
+			if target != "" {
+				if _, err := checkFS(ctx, hc.Dir, "history", target, OpWrite); err != nil {
+					fmt.Fprintf(hc.Stderr, "history: %v\n", err)
+					return nil, interp.CallHandled(1)
+				}
+			}
+			continue
+		}
+		if a == "-d" {
+			if i+1 >= len(argv) {
+				fmt.Fprintln(hc.Stderr, "history: -d: option requires an argument")
+				return nil, interp.CallHandled(2)
+			}
+			i++
+		}
+	}
+	return nil, interp.CallHandled(0)
+}
+
+func (s *Session) handleSessionSourceCall(ctx context.Context, hc interp.HandlerContext, srcArgs []string, prefix []string) ([]string, error) {
+	if CapabilityHookFromContext(ctx) == nil || len(srcArgs) < 2 {
+		if len(prefix) == 0 {
+			return srcArgs, nil
+		}
+		return append(slices.Clone(prefix), srcArgs...), nil
+	}
+	idx := 1
+	if srcArgs[1] == "--" {
+		if len(srcArgs) < 3 {
+			return append(slices.Clone(prefix), srcArgs...), nil
+		}
+		idx = 2
+	}
+	name := srcArgs[idx]
+	if name != "" && !strings.ContainsAny(name, `/\`) && !filepath.IsAbs(name) {
+		resolved := resolveHostPath(hc.Dir, name)
+		if p, ok := s.searchPathFileJailed(ctx, hc, srcArgs[0], name, false); ok {
+			resolved = p
+		}
+		rewritten := slices.Clone(srcArgs)
+		rewritten[idx] = resolved
+		srcArgs = rewritten
+	}
+	if len(prefix) == 0 {
+		return srcArgs, nil
+	}
+	out := make([]string, 0, len(prefix)+len(srcArgs))
+	out = append(out, prefix...)
+	out = append(out, srcArgs...)
+	return out, nil
+}
+
+func (s *Session) handleJailedCommandShow(ctx context.Context, hc interp.HandlerContext, args []string) (bool, uint8) {
+	showMode := byte(0) // 'v' or 'V'
+	endOpts := false
+	var operands []string
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if strings.HasPrefix(a, "-") && len(a) > 1 {
+				for j := 1; j < len(a); j++ {
+					switch a[j] {
+					case 'v':
+						showMode = 'v'
+					case 'V':
+						showMode = 'V'
+					case 'p':
+						// accepted
+					default:
+						return false, 0
+					}
+				}
+				continue
+			}
+		}
+		operands = append(operands, a)
+	}
+	if showMode == 0 {
+		return false, 0
+	}
+	if len(operands) == 0 {
+		return true, 0
+	}
+	var last uint8
+	for _, q := range operands {
+		switch {
+		case !strings.ContainsAny(q, `/\`) && hc.HasFunc(q):
+			if showMode == 'V' {
+				fmt.Fprintf(hc.Stdout, "%s is a function\n", q)
+			} else {
+				fmt.Fprintln(hc.Stdout, q)
+			}
+		case !strings.ContainsAny(q, `/\`) && (interp.IsBuiltin(q) || lookupExtra(q) != nil):
+			if showMode == 'V' {
+				fmt.Fprintf(hc.Stdout, "%s is a shell builtin\n", q)
+			} else {
+				fmt.Fprintln(hc.Stdout, q)
+			}
+		default:
+			if p, err := s.lookPathJailed(ctx, hc, "command", q); err == nil {
+				if showMode == 'V' {
+					fmt.Fprintf(hc.Stdout, "%s is %s\n", q, p)
+				} else {
+					fmt.Fprintln(hc.Stdout, p)
+				}
+			} else {
+				if showMode == 'V' {
+					fmt.Fprintf(hc.Stderr, "command: %s: not found\n", q)
+				}
+				last = 1
+			}
+		}
+	}
+	return true, last
+}
+
+func (s *Session) handleJailedTypeCall(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	mode := ""
+	all := false
+	noFuncs := false
+	var names []string
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			names = append(names, args[i+1:]...)
+			break
+		}
+		if len(a) > 1 && a[0] == '-' {
+			for j := 1; j < len(a); j++ {
+				switch a[j] {
+				case 't':
+					mode = "-t"
+				case 'p':
+					mode = "-p"
+				case 'P':
+					mode = "-P"
+				case 'a':
+					all = true
+				case 'f':
+					noFuncs = true
+				default:
+					fmt.Fprintf(hc.Stderr, "type: -%c: invalid option\n", a[j])
+					return nil, interp.CallHandled(2)
+				}
+			}
+			continue
+		}
+		names = append(names, a)
+	}
+	if len(names) == 0 {
+		return nil, interp.CallHandled(0)
+	}
+	code := uint8(0)
+	for _, n := range names {
+		matched := false
+		if mode != "-P" {
+			if !noFuncs && !strings.ContainsAny(n, `/\`) && hc.HasFunc(n) {
+				matched = true
+				switch mode {
+				case "-t":
+					fmt.Fprintln(hc.Stdout, "function")
+				case "-p":
+				default:
+					fmt.Fprintf(hc.Stdout, "%s is a function\n", n)
+				}
+				if !all {
+					continue
+				}
+			}
+			if !strings.ContainsAny(n, `/\`) && interp.IsBuiltin(n) {
+				matched = true
+				switch mode {
+				case "-t":
+					fmt.Fprintln(hc.Stdout, "builtin")
+				case "-p":
+				default:
+					fmt.Fprintf(hc.Stdout, "%s is a shell builtin\n", n)
+				}
+				if !all {
+					continue
+				}
+			}
+			if !strings.ContainsAny(n, `/\`) && lookupExtra(n) != nil {
+				matched = true
+				switch mode {
+				case "-t":
+					fmt.Fprintln(hc.Stdout, "file")
+				case "-p":
+					fmt.Fprintf(hc.Stdout, "/usr/bin/%s\n", n)
+				default:
+					fmt.Fprintf(hc.Stdout, "%s is /usr/bin/%s\n", n, n)
+				}
+				if !all {
+					continue
+				}
+			}
+		}
+		if p, err := s.lookPathJailed(ctx, hc, "type", n); err == nil {
+			matched = true
+			switch mode {
+			case "-t":
+				fmt.Fprintln(hc.Stdout, "file")
+			case "-p", "-P":
+				fmt.Fprintln(hc.Stdout, p)
+			default:
+				fmt.Fprintf(hc.Stdout, "%s is %s\n", n, p)
+			}
+		}
+		if !matched {
+			if mode == "" {
+				fmt.Fprintf(hc.Stderr, "type: %s: not found\n", n)
+			}
+			code = 1
+		}
+	}
+	return nil, interp.CallHandled(code)
+}
+
+func (s *Session) handleJailedHashCall(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	var names []string
+	forget := false
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		switch a {
+		case "-r":
+		case "-d", "-rd", "-dr":
+			forget = true
+		case "--":
+			names = append(names, args[i+1:]...)
+			i = len(args)
+		default:
+			if strings.HasPrefix(a, "-") && a != "-" {
+				fmt.Fprintf(hc.Stderr, "hash: invalid option -- '%s'\n", strings.TrimPrefix(a, "-"))
+				return nil, interp.CallHandled(2)
+			}
+			names = append(names, a)
+		}
+	}
+	if forget && len(names) == 0 {
+		fmt.Fprintln(hc.Stderr, "hash: -d: option requires an argument")
+		return nil, interp.CallHandled(2)
+	}
+	if forget {
+		return nil, interp.CallHandled(0)
+	}
+	if len(names) == 0 {
+		fmt.Fprintln(hc.Stdout, "hash: hash table empty")
+		return nil, interp.CallHandled(0)
+	}
+	for _, n := range names {
+		if interp.IsBuiltin(n) {
+			continue
+		}
+		if lookupExtra(n) != nil {
+			fmt.Fprintf(hc.Stderr, "hash: %s: not found\n", n)
+			return nil, interp.CallHandled(1)
+		}
+		if _, err := s.lookPathJailed(ctx, hc, "hash", n); err != nil {
+			fmt.Fprintf(hc.Stderr, "hash: %s: not found\n", n)
+			return nil, interp.CallHandled(1)
+		}
+	}
+	return nil, interp.CallHandled(0)
+}
+
+func (s *Session) handleSessionCdCall(ctx context.Context, hc interp.HandlerContext, cdArgs []string, prefix []string) ([]string, error) {
+	if runtime.GOOS == "windows" {
+		cdArgs = rewriteWindowsMSYSCdArgs(cdArgs)
+	}
+	if CapabilityHookFromContext(ctx) != nil {
+		if target, ok := resolveCdTargetArg(hc, cdArgs); ok {
+			checked, err := checkChdir(withApprovalMemo(ctx), hc.Dir, cdArgs[0], target)
+			if err != nil {
+				fmt.Fprintf(hc.Stderr, "%s: %v\n", cdArgs[0], err)
+				return nil, interp.CallHandled(1)
+			}
+			realDir, _ := canonicalizeForCheck(checked)
+			if fi, serr := os.Stat(realDir); serr == nil && fi.IsDir() {
+				grantChdirApprovalTicket(ctx, normalizeMatchPath(realDir))
+			}
+			if cdArgs[0] == "pushd" {
+				cdArgs = rewriteFirstDirOperand(cdArgs, resolveHostPath(hc.Dir, target))
+			}
+		}
+	}
+	if len(prefix) == 0 {
+		return cdArgs, nil
+	}
+	out := make([]string, 0, len(prefix)+len(cdArgs))
+	out = append(out, prefix...)
+	out = append(out, cdArgs...)
+	return out, nil
+}
+
+func rewriteFirstDirOperand(args []string, replacement string) []string {
+	endOpts := false
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if strings.HasPrefix(a, "-") && a != "-" {
+				continue
+			}
+		}
+		copied := slices.Clone(args)
+		copied[i] = replacement
+		return copied
+	}
+	return args
+}
+
+func splitPlainCommandBuiltin(args []string) (prefix []string, sub []string, ok bool) {
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if a == "--" {
+			if i+1 >= len(args) {
+				return nil, nil, false
+			}
+			return args[:i+1], args[i+1:], true
+		}
+		if strings.HasPrefix(a, "-") && len(a) > 1 {
+			for _, ch := range a[1:] {
+				if ch == 'v' || ch == 'V' {
+					return nil, nil, false
+				}
+			}
+			continue
+		}
+		return args[:i], args[i:], true
+	}
+	return nil, nil, false
+}
+
+func rewriteWindowsMSYSCdArgs(args []string) []string {
+	var copied []string
+	endOpts := false
+	rewrote := false
+	for i := 1; i < len(args); i++ {
+		a := args[i]
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if strings.HasPrefix(a, "-") && a != "-" {
+				continue
+			}
+		}
+		if !rewrote && a != "" && a != "-" && (a[0] == '/' || a[0] == '\\') {
+			if w, ok := msysPath(a); ok {
+				if copied == nil {
+					copied = slices.Clone(args)
+				}
+				copied[i] = w
+				rewrote = true
+			}
+		}
+		rewrote = true
+	}
+	if copied != nil {
+		return copied
+	}
+	return args
 }
 
 func resolveCdTargetArg(hc interp.HandlerContext, args []string) (string, bool) {
@@ -1121,42 +1810,275 @@ func resolveCdTargetArg(hc interp.HandlerContext, args []string) (string, bool) 
 	return target, true
 }
 
-func (s *Session) gateKillCall(ctx context.Context, hc interp.HandlerContext, args []string) error {
+func (s *Session) handleSessionKill(ctx context.Context, hc interp.HandlerContext, args []string) ([]string, error) {
+	code, exitShell := s.runSessionKill(ctx, hc, args)
+	if exitShell {
+		return nil, interp.Exit(code)
+	}
+	return nil, interp.CallHandled(uint8(code))
+}
+
+func (s *Session) runSessionKill(ctx context.Context, hc interp.HandlerContext, args []string) (int, bool) {
+	kargs := splitAttached("kill", args)
+	if len(kargs) > 1 && (kargs[1] == "-l" || kargs[1] == "-L" || kargs[1] == "--list") {
+		if origKillExtraMain != nil {
+			hc.PushActive()
+			err := origKillExtraMain(interp.WithHandlerContext(ctx, hc), hc, kargs)
+			hc.PopActive()
+			if err != nil {
+				return 1, false
+			}
+			return 0, false
+		}
+		fmt.Fprintln(hc.Stdout, "HUP INT QUIT ILL TRAP ABRT BUS FPE KILL USR1 SEGV USR2 PIPE ALRM TERM")
+		return 0, false
+	}
+
 	sig := "TERM"
+	sawSigFlag := false
 	endOpts := false
-	for i := 1; i < len(args); i++ {
-		a := args[i]
+	var operands []string
+
+	for i := 1; i < len(kargs); i++ {
+		a := kargs[i]
 		if !endOpts {
 			if a == "--" {
 				endOpts = true
 				continue
 			}
-			if a == "-l" || a == "-L" {
-				return nil
-			}
-			if (a == "-s" || a == "-n") && i+1 < len(args) {
-				sig = args[i+1]
+			if a == "-s" || a == "-n" {
+				if i+1 >= len(kargs) {
+					fmt.Fprintf(hc.Stderr, "kill: %s: option requires an argument\n", a)
+					return 1, false
+				}
 				i++
+				raw := kargs[i]
+				name := strings.TrimPrefix(strings.ToUpper(raw), "SIG")
+				if a == "-n" && !isValidSessionKillSigNum(name) {
+					fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", raw)
+					return 1, false
+				}
+				if a == "-s" && !isValidSessionKillSig(name) {
+					fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", raw)
+					return 1, false
+				}
+				sig = name
+				sawSigFlag = true
 				continue
 			}
 			if strings.HasPrefix(a, "-") && len(a) > 1 {
-				sig = strings.TrimPrefix(a, "-")
-				continue
+				body := strings.TrimPrefix(a, "-")
+				name := strings.TrimPrefix(strings.ToUpper(body), "SIG")
+				if allASCIIUint(name) {
+					if !sawSigFlag {
+						if isValidSessionKillSigNum(name) {
+							sig = name
+							sawSigFlag = true
+							continue
+						}
+						fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", body)
+						return 1, false
+					}
+					// Once a signal flag was already given (e.g. `kill -9 -1`),
+					// a negative integer is a process-group/broadcast PID operand.
+				} else if a[1] < '0' || a[1] > '9' {
+					if !isValidSessionKillSig(name) {
+						fmt.Fprintf(hc.Stderr, "kill: %s: invalid signal specification\n", body)
+						return 1, false
+					}
+					sig = name
+					sawSigFlag = true
+					continue
+				}
 			}
 		}
-		// Allow signaling jobs owned by this shell Runner or tracked in globalJobs.
-		if hc.HasBgProc(a) || globalJobs.resolveJobSpec(a) != nil {
+		operands = append(operands, a)
+	}
+
+	if len(operands) == 0 {
+		fmt.Fprintln(hc.Stderr, "kill: missing operand")
+		return 1, false
+	}
+
+	hook := CapabilityHookFromContext(ctx)
+	code := 0
+	myPID := os.Getpid()
+
+	for _, rawOp := range operands {
+		op := strings.TrimSpace(rawOp)
+		if pid, err := strconv.Atoi(op); err == nil {
+			// 1. Self-PID (including non-canonical forms like 0$$ or +$$):
+			// NEVER call os.FindProcess / killProc / os.Exit on the host Go process!
+			if pid == myPID {
+				if sig == "0" {
+					continue
+				}
+				if sig == "9" || sig == "KILL" {
+					return 137, true
+				}
+				if sig == "STOP" {
+					return 128 + 19, true
+				}
+				hc.PushActive()
+				handled := queueSelfSignal(sig)
+				hc.PopActive()
+				if handled {
+					continue
+				}
+				if ec := sessionFatalSelfExitCode(sig); ec > 0 {
+					return ec, true
+				}
+				continue
+			}
+
+			// 2. Broadcast / process-group PIDs (0, -1, -pgid): never broadcast OS
+			// signals to the embedding host process group.
+			if pid <= 0 {
+				if hook != nil {
+					if cerr := checkProc(ctx, "kill", pid, sig); cerr != nil {
+						fmt.Fprintf(hc.Stderr, "kill: %v\n", cerr)
+						code = 1
+						continue
+					}
+				}
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - Operation not permitted\n", pid)
+				code = 1
+				continue
+			}
+
+			// 3. Positive PID: exempt live tracked child jobs; dead/reaped jobs fall
+			// through to checkProc so OS-reused PIDs cannot bypass OpProc.
+			if j := globalJobs.byPID(pid); j != nil && j.alive() && j.proc != nil {
+				if err := killProc(j.proc, sig); err != nil {
+					fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", pid, err)
+					code = 1
+				}
+				continue
+			}
+
+			// External host PID: gate with OpProc when hooked (single prompt), then
+			// signal directly via os.FindProcess + killProc.
+			if hook != nil {
+				if cerr := checkProc(ctx, "kill", pid, sig); cerr != nil {
+					fmt.Fprintf(hc.Stderr, "kill: %v\n", cerr)
+					code = 1
+					continue
+				}
+			}
+			proc, ferr := os.FindProcess(pid)
+			if ferr != nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - No such process\n", pid)
+				code = 1
+				continue
+			}
+			if kerr := killProc(proc, sig); kerr != nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", pid, kerr)
+				code = 1
+			}
 			continue
 		}
-		pid, err := strconv.Atoi(a)
-		if err != nil {
+
+		// 4. Jobspec (%1, %%, %+) or fake background ID (g1): require live job!
+		if j := globalJobs.resolveJobSpec(op); j != nil {
+			if !j.alive() || j.proc == nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%s) - No such process\n", op)
+				code = 1
+				continue
+			}
+			if err := killProc(j.proc, sig); err != nil {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", j.pid, err)
+				code = 1
+			}
 			continue
 		}
-		if err := checkProc(ctx, "kill", pid, sig); err != nil {
-			return err
+		if strings.HasPrefix(op, "%") {
+			fmt.Fprintf(hc.Stderr, "kill: %s: no such job\n", op)
+			code = 1
+			continue
+		}
+		fmt.Fprintf(hc.Stderr, "kill: %s: arguments must be process or job IDs\n", op)
+		code = 1
+	}
+
+	if code != 0 {
+		return 1, false
+	}
+	return 0, false
+}
+
+func isValidSessionKillSigNum(s string) bool {
+	if !allASCIIUint(s) {
+		return false
+	}
+	n, err := strconv.Atoi(s)
+	return err == nil && n >= 0 && n <= 64
+}
+
+func isValidSessionKillSig(s string) bool {
+	if isValidSessionKillSigNum(s) {
+		return true
+	}
+	if isSignalName(s) {
+		return true
+	}
+	switch s {
+	case "IOT", "CLD", "POLL":
+		return true
+	}
+	return false
+}
+
+func sessionFatalSelfExitCode(sig string) int {
+	switch sig {
+	case "0", "CHLD", "CLD", "CONT", "URG", "WINCH", "IO", "POLL":
+		return 0
+	case "HUP":
+		return 128 + 1
+	case "INT":
+		return 128 + 2
+	case "QUIT":
+		return 128 + 3
+	case "ILL":
+		return 128 + 4
+	case "TRAP":
+		return 128 + 5
+	case "ABRT", "IOT":
+		return 128 + 6
+	case "BUS":
+		return 128 + 7
+	case "FPE":
+		return 128 + 8
+	case "KILL":
+		return 128 + 9
+	case "USR1":
+		return 128 + 10
+	case "SEGV":
+		return 128 + 11
+	case "USR2":
+		return 128 + 12
+	case "PIPE":
+		return 128 + 13
+	case "ALRM":
+		return 128 + 14
+	case "TERM":
+		return 128 + 15
+	case "XCPU":
+		return 128 + 24
+	case "XFSZ":
+		return 128 + 25
+	case "VTALRM":
+		return 128 + 26
+	case "PROF":
+		return 128 + 27
+	case "SYS":
+		return 128 + 31
+	}
+	if allASCIIUint(sig) {
+		if n, err := strconv.Atoi(sig); err == nil && n > 0 && n <= 64 {
+			return 128 + n
 		}
 	}
-	return nil
+	return 128 + 15
 }
 
 func (s *Session) runSessionUmask(hc interp.HandlerContext, args []string) error {
@@ -1211,53 +2133,108 @@ func (s *Session) execMiddleware(next interp.ExecHandlerFunc) interp.ExecHandler
 			return next(ctx, args)
 		}
 		hc := interp.HandlerCtx(ctx)
-		if interp.IsBuiltin(args[0]) || hc.HasFunc(args[0]) || lookupExtra(args[0]) != nil {
+		if interp.IsBuiltin(args[0]) || hc.HasFunc(args[0]) {
+			return next(ctx, args)
+		}
+
+		needsEnvIsolation := !s.inheritEnv || len(s.scrubPatterns) > 0
+		if lookupExtra(args[0]) != nil {
+			if args[0] == "kill" && !hasVersionFlag(args) {
+				if hc.InBackground() {
+					hc.ReportBgStart(0)
+				}
+				_, kerr := s.handleSessionKill(ctx, hc, args)
+				return kerr
+			}
+			if needsEnvIsolation {
+				if args[0] == "printenv" && !hasVersionFlag(args) {
+					if hc.InBackground() {
+						hc.ReportBgStart(0)
+					}
+					if err := runIsolatedPrintenv(hc, splitAttached("printenv", args)); err != nil {
+						if ee, ok := err.(exitError); ok {
+							return interp.NewExitStatus(uint8(ee.code))
+						}
+						return err
+					}
+					return nil
+				}
+				if _, alreadyExplicit := hc.Env.(explicitEnviron); !alreadyExplicit {
+					hc.Env = explicitEnviron{
+						Environ: hc.Env,
+						pairs:   s.execChildEnv(hc),
+						cleared: true,
+					}
+					ctx = interp.WithHandlerContext(ctx, hc)
+				}
+			}
 			return next(ctx, args)
 		}
 
 		hook := CapabilityHookFromContext(ctx)
-		needsEnvIsolation := !s.inheritEnv || len(s.scrubPatterns) > 0
 		if hook == nil && !needsEnvIsolation {
 			return next(ctx, args)
 		}
 
-		resolvedPath, lookErr := interp.LookPathDir(hc.Dir, hc.Env, args[0])
-		if lookErr != nil {
-			// If args[0] is an explicit path (e.g. /usr/bin/foo or ./foo), still
-			// gate OpExec so existence of host binaries outside the jail cannot
-			// be probed via 126 vs 127 exit codes.
-			if hook != nil && (strings.ContainsAny(args[0], `/\`) || filepath.IsAbs(args[0])) {
-				if _, cerr := checkExec(withApprovalMemo(ctx), args[0], args[0], args, hc.Dir); cerr != nil {
+		var execTarget string
+		if hook != nil {
+			if strings.ContainsAny(args[0], `/\`) || filepath.IsAbs(args[0]) {
+				hostCandidate := resolveHostPath(hc.Dir, args[0])
+				checked, cerr := checkExec(withApprovalMemo(ctx), args[0], hostCandidate, args, hc.Dir)
+				if cerr != nil {
 					if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
 						return cerr
 					}
 					fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
 					return interp.ExitStatus(126)
 				}
-			}
-			fmt.Fprintf(hc.Stderr, "%s: command not found\n", args[0])
-			return interp.ExitStatus(127)
-		}
-
-		execTarget := resolvedPath
-		if hook != nil {
-			// Pass args[0] when it contains a path separator so workspace symlink
-			// spoofing (e.g. ./git -> /usr/bin/curl) is inspected via RawPath, and
-			// pass resolvedPath otherwise so OS PATH symlinks (/bin/sh -> dash)
-			// outside writable roots are resolved cleanly.
-			rawCandidate := resolvedPath
-			if strings.ContainsAny(args[0], `/\`) {
-				rawCandidate = args[0]
-			}
-			checked, cerr := checkExec(withApprovalMemo(ctx), args[0], rawCandidate, args, hc.Dir)
-			if cerr != nil {
-				if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
-					return cerr
+				fi, serr := os.Stat(checked)
+				if serr != nil && runtime.GOOS == "windows" && errors.Is(serr, os.ErrNotExist) {
+					for _, cand := range sessionWindowsExecCandidates(hc, checked) {
+						if cfi, cerr2 := os.Stat(cand); cerr2 == nil && !cfi.IsDir() {
+							checked = cand
+							fi = cfi
+							serr = nil
+							break
+						}
+					}
 				}
-				fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
-				return interp.ExitStatus(126)
+				if serr != nil {
+					if errors.Is(serr, os.ErrNotExist) {
+						fmt.Fprintf(hc.Stderr, "%s: No such file or directory\n", args[0])
+						return interp.ExitStatus(127)
+					}
+					fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], serr)
+					return interp.ExitStatus(126)
+				}
+				if fi.IsDir() || (runtime.GOOS != "windows" && fi.Mode()&0o111 == 0) {
+					fmt.Fprintf(hc.Stderr, "%s: Permission denied\n", args[0])
+					return interp.ExitStatus(126)
+				}
+				execTarget = checked
+			} else {
+				resolvedPath, lookErr := s.lookPathJailed(ctx, hc, args[0], args[0])
+				if lookErr != nil {
+					fmt.Fprintf(hc.Stderr, "%s: command not found\n", args[0])
+					return interp.ExitStatus(127)
+				}
+				checked, cerr := checkExec(withApprovalMemo(ctx), args[0], resolvedPath, args, hc.Dir)
+				if cerr != nil {
+					if errors.Is(cerr, context.Canceled) || errors.Is(cerr, context.DeadlineExceeded) {
+						return cerr
+					}
+					fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
+					return interp.ExitStatus(126)
+				}
+				execTarget = checked
 			}
-			execTarget = checked
+		} else {
+			resolvedPath, lookErr := interp.LookPathDir(hc.Dir, hc.Env, args[0])
+			if lookErr != nil {
+				fmt.Fprintf(hc.Stderr, "%s: command not found\n", args[0])
+				return interp.ExitStatus(127)
+			}
+			execTarget = resolvedPath
 		}
 
 		for _, a := range args[1:] {
@@ -1265,6 +2242,90 @@ func (s *Session) execMiddleware(next interp.ExecHandlerFunc) interp.ExecHandler
 		}
 		return s.runIsolatedExternal(ctx, hc, execTarget, args)
 	}
+}
+
+func (s *Session) lookPathJailed(ctx context.Context, hc interp.HandlerContext, cmdName, file string) (string, error) {
+	if file == "" {
+		return "", os.ErrNotExist
+	}
+	if strings.ContainsAny(file, `/\`) || filepath.IsAbs(file) {
+		for _, cand := range sessionWindowsExecCandidates(hc, resolveHostPath(hc.Dir, file)) {
+			fi, err := fsStat(ctx, hc.Dir, cmdName, cand)
+			if err != nil || fi.IsDir() {
+				continue
+			}
+			if runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
+				continue
+			}
+			return cand, nil
+		}
+		return "", os.ErrNotExist
+	}
+	if p, ok := s.searchPathFileJailed(ctx, hc, cmdName, file, true); ok {
+		return p, nil
+	}
+	return "", os.ErrNotExist
+}
+
+func (s *Session) searchPathFileJailed(ctx context.Context, hc interp.HandlerContext, cmdName, file string, requireExec bool) (string, bool) {
+	pathVal := hc.Env.Get("PATH").String()
+	if pathVal == "" {
+		return "", false
+	}
+	for _, dir := range filepath.SplitList(pathVal) {
+		if dir == "" {
+			dir = "."
+		}
+		base := filepath.Join(resolveHostPath(hc.Dir, dir), file)
+		cands := []string{base}
+		if requireExec {
+			cands = sessionWindowsExecCandidates(hc, base)
+		}
+		for _, cand := range cands {
+			fi, err := fsStat(ctx, hc.Dir, cmdName, cand)
+			if err != nil || fi.IsDir() {
+				continue
+			}
+			if requireExec && runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
+				continue
+			}
+			return cand, true
+		}
+	}
+	return "", false
+}
+
+func sessionWindowsExecCandidates(hc interp.HandlerContext, base string) []string {
+	if runtime.GOOS != "windows" {
+		return []string{base}
+	}
+	pathext := hc.Env.Get("PATHEXT").String()
+	if pathext == "" {
+		pathext = ".COM;.EXE;.BAT;.CMD"
+	}
+	var exts []string
+	for _, e := range strings.Split(strings.ToLower(pathext), ";") {
+		e = strings.TrimSpace(e)
+		if e == "" {
+			continue
+		}
+		if e[0] != '.' {
+			e = "." + e
+		}
+		exts = append(exts, e)
+	}
+	lowerBase := strings.ToLower(base)
+	for _, e := range exts {
+		if strings.HasSuffix(lowerBase, e) {
+			return []string{base}
+		}
+	}
+	cands := make([]string, 0, 1+len(exts))
+	cands = append(cands, base)
+	for _, e := range exts {
+		cands = append(cands, base+e)
+	}
+	return cands
 }
 
 func (s *Session) runIsolatedExternal(ctx context.Context, hc interp.HandlerContext, binPath string, args []string) error {
@@ -1287,7 +2348,9 @@ func (s *Session) runIsolatedExternal(ctx context.Context, hc interp.HandlerCont
 	defer afterWait()
 	hc.ReportBgStart(cmd.Process.Pid)
 	j := globalJobs.track(cmd, args)
-	hashRecord(args[0], binPath)
+	if CapabilityHookFromContext(ctx) == nil {
+		hashRecord(args[0], binPath)
+	}
 	<-j.done
 	if j.err != nil {
 		if isPipeClosed(j.err) {

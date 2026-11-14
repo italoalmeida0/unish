@@ -117,6 +117,7 @@ type HarnessServer struct {
 
 	activeMu     sync.Mutex
 	activeExecID string
+	activeCancel context.CancelFunc
 
 	pendingMu  sync.Mutex
 	pendingSeq atomic.Uint64
@@ -190,7 +191,13 @@ func (s *HarnessServer) Serve(ctx context.Context) error {
 	go func() {
 		select {
 		case <-ctx.Done():
-			s.sess.CancelCurrent()
+			s.activeMu.Lock()
+			if s.activeCancel != nil {
+				s.activeCancel()
+			} else {
+				s.sess.CancelCurrent()
+			}
+			s.activeMu.Unlock()
 			s.closeQueue()
 		case <-stopCancelWatch:
 		}
@@ -279,35 +286,53 @@ func (s *HarnessServer) closeQueue() {
 	s.queueMu.Unlock()
 }
 
-func (s *HarnessServer) dequeue() (HarnessRequest, bool) {
+func (s *HarnessServer) dequeue(ctx context.Context) (HarnessRequest, context.Context, context.CancelFunc, bool) {
 	s.queueMu.Lock()
 	defer s.queueMu.Unlock()
 	for len(s.queue) == 0 && !s.queueClosed {
 		s.queueCond.Wait()
 	}
 	if len(s.queue) == 0 {
-		return HarnessRequest{}, false
+		return HarnessRequest{}, nil, nil, false
 	}
 	req := s.queue[0]
 	s.queue = s.queue[1:]
 	if len(s.queue) == 0 {
 		s.queue = nil
 	}
-	return req, true
+	if strings.EqualFold(strings.TrimSpace(req.Type), "exec") {
+		execCtx, execCancel := context.WithCancel(ctx)
+		s.activeMu.Lock()
+		s.activeExecID = req.ID
+		s.activeCancel = func() {
+			execCancel()
+			s.sess.CancelCurrent()
+		}
+		s.activeMu.Unlock()
+		return req, execCtx, execCancel, true
+	}
+	return req, nil, nil, true
 }
 
 func (s *HarnessServer) workerLoop(ctx context.Context) {
 	for {
-		req, ok := s.dequeue()
+		req, execCtx, execCancel, ok := s.dequeue(ctx)
 		if !ok {
 			return
 		}
 		if ctx.Err() != nil {
+			if execCancel != nil {
+				s.activeMu.Lock()
+				s.activeExecID = ""
+				s.activeCancel = nil
+				s.activeMu.Unlock()
+				execCancel()
+			}
 			return
 		}
 		switch strings.ToLower(strings.TrimSpace(req.Type)) {
 		case "exec":
-			s.runExec(ctx, req)
+			s.runExec(execCtx, execCancel, req)
 		case "set_cwd":
 			s.runSetCwd(req)
 		case "get_state":
@@ -321,7 +346,17 @@ func (s *HarnessServer) workerLoop(ctx context.Context) {
 	}
 }
 
-func (s *HarnessServer) runExec(ctx context.Context, req HarnessRequest) {
+func (s *HarnessServer) runExec(execCtx context.Context, execCancel context.CancelFunc, req HarnessRequest) {
+	defer func() {
+		s.activeMu.Lock()
+		s.activeExecID = ""
+		s.activeCancel = nil
+		s.activeMu.Unlock()
+		if execCancel != nil {
+			execCancel()
+		}
+	}()
+
 	script := req.Script
 	if script == "" && req.Command != "" {
 		script = req.Command
@@ -330,15 +365,6 @@ func (s *HarnessServer) runExec(ctx context.Context, req HarnessRequest) {
 	if workDir == "" && req.Dir != "" {
 		workDir = req.Dir
 	}
-
-	s.activeMu.Lock()
-	s.activeExecID = req.ID
-	s.activeMu.Unlock()
-	defer func() {
-		s.activeMu.Lock()
-		s.activeExecID = ""
-		s.activeMu.Unlock()
-	}()
 
 	var execOpts ExecOptions
 	if req.Stdin != "" {
@@ -356,7 +382,7 @@ func (s *HarnessServer) runExec(ctx context.Context, req HarnessRequest) {
 	execOpts.Stdout = &harnessChunkWriter{srv: s, id: req.ID, streamType: "stdout"}
 	execOpts.Stderr = &harnessChunkWriter{srv: s, id: req.ID, streamType: "stderr"}
 
-	res, err := s.sess.ExecWith(ctx, script, execOpts)
+	res, err := s.sess.ExecWith(execCtx, script, execOpts)
 	if res == nil {
 		errMsg := "execution failed"
 		if err != nil {
@@ -370,7 +396,7 @@ func (s *HarnessServer) runExec(ctx context.Context, req HarnessRequest) {
 		return
 	}
 
-	cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+	cancelled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || execCtx.Err() != nil
 	var denials []HarnessAccessRequest
 	if len(res.Denials) > 0 {
 		denials = make([]HarnessAccessRequest, len(res.Denials))
@@ -426,41 +452,63 @@ func (s *HarnessServer) runGetState(req HarnessRequest) {
 
 func (s *HarnessServer) handleCancel(req HarnessRequest) {
 	target := strings.TrimSpace(req.ReqID)
-	if target != "" {
+	if target == "" {
 		s.activeMu.Lock()
-		active := s.activeExecID
+		if s.activeCancel != nil {
+			s.activeCancel()
+		} else {
+			s.sess.CancelCurrent()
+		}
 		s.activeMu.Unlock()
-		if active != "" && active != target {
-			return
-		}
+		return
 	}
-	// Remove any queued-but-not-yet-started exec matching target or ID.
-	if target != "" {
-		s.queueMu.Lock()
-		filtered := s.queue[:0]
-		for _, q := range s.queue {
-			if q.Type == "exec" && q.ID == target {
-				exitCode := 130
-				empty := ""
-				zero := int64(0)
-				_ = s.sendEvent(HarnessEvent{
-					ID:         q.ID,
-					Type:       "result",
-					ExitCode:   &exitCode,
-					Stdout:     &empty,
-					Stderr:     &empty,
-					Cwd:        s.sess.Cwd(),
-					DurationMs: &zero,
-					Cancelled:  true,
-				})
-				continue
-			}
-			filtered = append(filtered, q)
+
+	// 1. Remove any queued-but-not-yet-started exec matching target without
+	//    disturbing the currently running command.
+	var cancelledQueued []HarnessRequest
+	s.queueMu.Lock()
+	filtered := s.queue[:0]
+	for _, q := range s.queue {
+		if strings.EqualFold(strings.TrimSpace(q.Type), "exec") && q.ID == target {
+			cancelledQueued = append(cancelledQueued, q)
+			continue
 		}
+		filtered = append(filtered, q)
+	}
+	if len(filtered) == 0 {
+		s.queue = nil
+	} else {
 		s.queue = filtered
-		s.queueMu.Unlock()
 	}
-	s.sess.CancelCurrent()
+	s.queueMu.Unlock()
+
+	for _, q := range cancelledQueued {
+		exitCode := 130
+		empty := ""
+		zero := int64(0)
+		_ = s.sendEvent(HarnessEvent{
+			ID:         q.ID,
+			Type:       "result",
+			ExitCode:   &exitCode,
+			Stdout:     &empty,
+			Stderr:     &empty,
+			Cwd:        s.sess.Cwd(),
+			DurationMs: &zero,
+			Cancelled:  true,
+		})
+	}
+	if len(cancelledQueued) > 0 {
+		return
+	}
+
+	// 2. Only cancel the active execution if its ID still matches target while
+	//    holding activeMu, preventing a late cancel for an already-completed
+	//    command from cancelling the next command.
+	s.activeMu.Lock()
+	if s.activeExecID == target && s.activeCancel != nil {
+		s.activeCancel()
+	}
+	s.activeMu.Unlock()
 }
 
 func (s *HarnessServer) promptPermission(ctx context.Context, accessReq AccessRequest) (Decision, error) {

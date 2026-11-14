@@ -19,7 +19,10 @@ import (
 	"mvdan.cc/sh/v3/syntax"
 )
 
-var runnerCompletionHooks sync.Map // map[*interp.Runner]CapabilityHook
+var (
+	runnerCompletionHooks sync.Map // map[*interp.Runner]CapabilityHook
+	runnerEnvIsolated     sync.Map // map[*interp.Runner]bool
+)
 
 func registerRunnerCompletionHook(r *interp.Runner, h CapabilityHook) {
 	if r == nil {
@@ -36,6 +39,35 @@ func unregisterRunnerCompletionHook(r *interp.Runner) {
 	if r != nil {
 		runnerCompletionHooks.Delete(r)
 	}
+}
+
+func registerRunnerEnvIsolated(r *interp.Runner, isolated bool) {
+	if r == nil {
+		return
+	}
+	if !isolated {
+		runnerEnvIsolated.Delete(r)
+		return
+	}
+	runnerEnvIsolated.Store(r, true)
+}
+
+func unregisterRunnerEnvIsolated(r *interp.Runner) {
+	if r != nil {
+		runnerEnvIsolated.Delete(r)
+	}
+}
+
+func isRunnerEnvIsolated(r *interp.Runner) bool {
+	if r == nil {
+		return false
+	}
+	v, ok := runnerEnvIsolated.Load(r)
+	if !ok {
+		return false
+	}
+	b, _ := v.(bool)
+	return b
 }
 
 func completionContextForRunner(ctx context.Context, r *interp.Runner) context.Context {
@@ -292,13 +324,15 @@ func shellVarNames(r *interp.Runner) []string {
 			out = append(out, n)
 		}
 	}
-	for _, e := range os.Environ() {
-		if i := strings.IndexByte(e, '='); i > 0 {
-			name := e[:i]
-			if v, exists := r.Vars[name]; exists && !v.IsSet() {
-				continue
+	if !isRunnerEnvIsolated(r) {
+		for _, e := range os.Environ() {
+			if i := strings.IndexByte(e, '='); i > 0 {
+				name := e[:i]
+				if v, exists := r.Vars[name]; exists && !v.IsSet() {
+					continue
+				}
+				out = append(out, name)
 			}
-			out = append(out, name)
 		}
 	}
 	return out
@@ -320,7 +354,7 @@ func pathCommandsCtx(ctx context.Context, prefix string, r *interp.Runner) []str
 			}
 		}
 	}
-	if path == "" {
+	if path == "" && !isRunnerEnvIsolated(r) {
 		path = os.Getenv("PATH")
 	}
 	if path == "" {

@@ -327,7 +327,10 @@ func RunCLI(version string, args []string) int {
 
 	var src, name string
 	var params []string
-	if *interactiveFlag {
+	if *interactiveFlag && !hasCommandFlag && len(fs.Args()) == 0 {
+		if jail != nil {
+			return runJailedInteractive(jail, os.Stdin, os.Stdout, os.Stderr, termIsTTY(os.Stdout))
+		}
 		return runInteractive()
 	}
 
@@ -376,6 +379,9 @@ func RunCLI(version string, args []string) int {
 			// No args and stdin is a real terminal TTY: start the interactive
 			// shell (like bash with no args). Non-TTY char devices such as
 			// /dev/null or NUL must NOT enter the interactive REPL.
+			if jail != nil {
+				return runJailedInteractive(jail, os.Stdin, os.Stdout, os.Stderr, termIsTTY(os.Stdout))
+			}
 			return runInteractive()
 		} else {
 			if fi, err := os.Stdin.Stat(); err == nil && (fi.Mode()&os.ModeCharDevice) != 0 {
@@ -409,6 +415,7 @@ func RunCLI(version string, args []string) int {
 	defer cancel()
 	if jail != nil {
 		ctx = WithCapabilityHook(ctx, jail)
+		ctx = withChdirApprovalStore(ctx)
 	}
 
 	var runnerOpts []interp.RunnerOption
@@ -424,11 +431,13 @@ func RunCLI(version string, args []string) int {
 			interp.ProcSubstHandler(procSubstHandler),
 		}
 	} else {
+		ensureSessionExtrasRegistered()
 		cliSess := &Session{
 			jail:       jail,
 			hook:       jail,
 			inheritEnv: true,
 		}
+		ctx = withSessionInContext(ctx, cliSess)
 		cliSess.umask.Store(shellUmask.Load())
 		if startDir != "" {
 			cliSess.storeCwd(startDir)
@@ -507,4 +516,88 @@ func RunCLI(version string, args []string) int {
 		return 1
 	}
 	return 0
+}
+
+// runJailedInteractive runs an interactive statement loop inside a jailed
+// Session without reading or writing host ~/.unishrc or ~/.unish_history.
+func runJailedInteractive(jail *Jail, in io.Reader, out, errOut io.Writer, showPrompt bool) int {
+	sess, err := NewSession(
+		WithJail(jail),
+		WithStdin(in),
+		WithStdout(out),
+		WithStderr(errOut),
+	)
+	if err != nil {
+		fmt.Fprintln(errOut, "bash:", err)
+		return 1
+	}
+	defer sess.Close()
+
+	setActiveRunner(sess.runner)
+	defer setActiveRunner(nil)
+
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, trapSignals()...)
+	sigDone := make(chan struct{})
+	defer func() {
+		signal.Stop(sigCh)
+		close(sigDone)
+	}()
+	go func() {
+		for {
+			select {
+			case <-sigDone:
+				return
+			case sig := <-sigCh:
+				if sess.runner != nil && sess.runner.QueueSignal(sig) {
+					continue
+				}
+				if sig == os.Interrupt {
+					sess.CancelCurrent()
+				}
+			}
+		}
+	}()
+
+	exitedExplicitly := false
+	for {
+		if showPrompt {
+			p := "$ "
+			if sess.LastExitCode() != 0 {
+				p = "# "
+			}
+			fmt.Fprint(out, p)
+		}
+		line, ok := readPlainLine(in)
+		if !ok {
+			if showPrompt {
+				fmt.Fprintln(out)
+			}
+			break
+		}
+		full := line
+		for incomplete(full) {
+			if showPrompt {
+				fmt.Fprint(out, "> ")
+			}
+			cont, ok2 := readPlainLine(in)
+			if !ok2 {
+				break
+			}
+			full += "\n" + cont
+		}
+		if strings.TrimSpace(full) == "" {
+			continue
+		}
+		_, _ = sess.Exec(context.Background(), full)
+		if sess.runner.Exited() {
+			exitedExplicitly = true
+			break
+		}
+	}
+
+	if !exitedExplicitly {
+		_, _ = sess.Exec(context.Background(), fmt.Sprintf("builtin exit %d", sess.LastExitCode()&0xff))
+	}
+	return sess.LastExitCode()
 }

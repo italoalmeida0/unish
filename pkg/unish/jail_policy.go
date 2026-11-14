@@ -619,7 +619,7 @@ func contextMemoKey(req AccessRequest) string {
 }
 
 func (j *Jail) isGrantedInSession(req AccessRequest) bool {
-	keys := sessionLookupKeysForRequest(req)
+	keys := j.sessionLookupKeysForRequest(req)
 	if len(keys) == 0 {
 		return false
 	}
@@ -705,7 +705,7 @@ func sessionGrantKeysForRequest(req AccessRequest) []string {
 	}
 }
 
-func sessionLookupKeysForRequest(req AccessRequest) []string {
+func (j *Jail) sessionLookupKeysForRequest(req AccessRequest) []string {
 	keys := sessionGrantKeysForRequest(req)
 	switch req.Op {
 	case OpNetConnect, OpNetListen:
@@ -722,7 +722,11 @@ func sessionLookupKeysForRequest(req AccessRequest) []string {
 			bin = req.Path
 		}
 		if bin != "" {
-			keys = append(keys, "exec|base:"+normalizeBinBase(filepath.Base(bin)))
+			realBin, _ := canonicalizeForCheck(resolveHostPath("", bin))
+			np := normalizeMatchPath(realBin)
+			if np != "" && !j.isInsideWritableRoot(np) {
+				keys = append(keys, "exec|base:"+normalizeBinBase(filepath.Base(realBin)))
+			}
 		}
 	case OpProc:
 		keys = append(keys, "proc|*")
@@ -948,20 +952,35 @@ func (j *Jail) evaluateNet(req AccessRequest) (Decision, string) {
 		}
 	}
 
-	// 2. Enforce BlockPrivateLAN & DNS-rebinding loopback protection on the
-	//    resolved IP unless an explicit IP/CIDR NetRule targeted that IP.
+	// 2. Enforce BlockPrivateLAN, unspecified-IP blocking, & DNS-rebinding
+	//    loopback protection on the resolved IP unless an explicit IP/CIDR
+	//    NetRule targeted that IP.
+	isRemoteHostname := host != "" && host != "localhost" && !isIPLiteralPattern(host)
 	if hasAddr && !matchedIPRule {
-		if isLoopbackOrUnspecifiedAddr(addr) {
+		if isUnspecifiedOrThisNetAddr(addr) {
 			if req.Op == OpNetConnect {
-				if j.allowLoopback && addr.IsLoopback() {
+				if j.netDefault == DecisionAllow && !j.blockPrivateLAN && j.allowLoopback && !matchedHostRule {
 					return DecisionAllow, ""
 				}
-				if matchedHostRule && host != "localhost" && !isIPLiteralPattern(host) {
-					return DecisionDeny, fmt.Sprintf("DNS rebinding to loopback/unspecified IP %s blocked", addr.String())
+				return DecisionDeny, fmt.Sprintf("unspecified/local-network IP %s blocked by network policy", addr.String())
+			}
+			// OpNetListen: hostname rules must never rebind to wildcard 0.0.0.0 / ::.
+			if matchedHostRule && host != "" && !isIPLiteralPattern(host) {
+				return DecisionDeny, fmt.Sprintf("DNS rebinding to unspecified IP %s blocked", addr.String())
+			}
+		} else if isLoopbackAddr(addr) {
+			if !j.allowLoopback {
+				if isRemoteHostname || matchedHostRule {
+					return DecisionDeny, fmt.Sprintf("DNS rebinding to loopback IP %s blocked", addr.String())
 				}
-				if j.blockPrivateLAN && !j.allowLoopback {
-					return DecisionDeny, fmt.Sprintf("loopback/unspecified IP %s blocked by network policy", addr.String())
+				if j.blockPrivateLAN || (req.Op == OpNetConnect && j.netDefault == DecisionAllow) || (req.Op == OpNetListen && j.allowListen == DecisionAllow) {
+					return DecisionDeny, fmt.Sprintf("loopback IP %s blocked by network policy", addr.String())
 				}
+			} else if req.Op == OpNetConnect {
+				if matchedHostRule && isRemoteHostname {
+					return DecisionDeny, fmt.Sprintf("DNS rebinding to loopback IP %s blocked", addr.String())
+				}
+				return DecisionAllow, ""
 			}
 		} else if j.blockPrivateLAN && isPrivateOrLinkLocalLAN(addr) {
 			return DecisionDeny, fmt.Sprintf("private or link-local IP %s blocked by BlockPrivateLAN", addr.String())
@@ -972,8 +991,8 @@ func (j *Jail) evaluateNet(req AccessRequest) (Decision, string) {
 		return ruleDec, ruleReason
 	}
 
-	// 3. Built-in AllowLoopback check when IP is verified loopback.
-	if j.allowLoopback && hasAddr && addr.IsLoopback() {
+	// 3. Built-in AllowLoopback check when IP is verified loopback (never 0.0.0.0 / ::).
+	if j.allowLoopback && hasAddr && isLoopbackAddr(addr) {
 		if req.Op == OpNetConnect {
 			return DecisionAllow, ""
 		}
@@ -1157,10 +1176,13 @@ func (j *Jail) isHardIPBlock(req AccessRequest) bool {
 	if !ok {
 		return false
 	}
+	if isUnspecifiedOrThisNetAddr(addr) {
+		return true
+	}
 	if j.blockPrivateLAN && isPrivateOrLinkLocalLAN(addr) {
 		return true
 	}
-	if !j.allowLoopback && isLoopbackOrUnspecifiedAddr(addr) {
+	if !j.allowLoopback && isLoopbackAddr(addr) {
 		return true
 	}
 	for i := range j.netRules {
@@ -1204,25 +1226,48 @@ func (j *Jail) rawDial(ctx context.Context, network, addr string) (net.Conn, err
 	return d.DialContext(ctx, network, addr)
 }
 
-// Listen enforces OpNetListen policy before binding a stream listener.
+// Listen enforces OpNetListen policy (resolving non-IP hostnames upfront and
+// binding the verified IP:port directly) before binding a stream listener.
 func (j *Jail) Listen(ctx context.Context, cmdName, network, address string) (net.Listener, error) {
-	if err := j.checkListenAddress(ctx, cmdName, network, address); err != nil {
+	targets, err := j.resolveAndCheckListenTargets(ctx, cmdName, network, address)
+	if err != nil {
 		return nil, err
 	}
 	var lc net.ListenConfig
-	return lc.Listen(ctx, network, address)
+	var lastErr error
+	for _, t := range targets {
+		ln, lerr := lc.Listen(ctx, network, t)
+		if lerr == nil {
+			return ln, nil
+		}
+		lastErr = lerr
+	}
+	return nil, lastErr
 }
 
-// ListenPacket enforces OpNetListen policy before binding a packet listener.
+// ListenPacket enforces OpNetListen policy (resolving non-IP hostnames upfront
+// and binding the verified IP:port directly) before binding a packet listener.
 func (j *Jail) ListenPacket(ctx context.Context, cmdName, network, address string) (net.PacketConn, error) {
-	if err := j.checkListenAddress(ctx, cmdName, network, address); err != nil {
+	targets, err := j.resolveAndCheckListenTargets(ctx, cmdName, network, address)
+	if err != nil {
 		return nil, err
 	}
 	var lc net.ListenConfig
-	return lc.ListenPacket(ctx, network, address)
+	var lastErr error
+	for _, t := range targets {
+		pc, lerr := lc.ListenPacket(ctx, network, t)
+		if lerr == nil {
+			return pc, nil
+		}
+		lastErr = lerr
+	}
+	return nil, lastErr
 }
 
-func (j *Jail) checkListenAddress(ctx context.Context, cmdName, network, address string) error {
+func (j *Jail) resolveAndCheckListenTargets(ctx context.Context, cmdName, network, address string) ([]string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	baseProto := normalizeNetProto(network)
 	if strings.HasPrefix(baseProto, "unix") {
 		if err := j.CheckAccess(ctx, AccessRequest{
@@ -1231,46 +1276,149 @@ func (j *Jail) checkListenAddress(ctx context.Context, cmdName, network, address
 			Path:    address,
 			RawPath: address,
 		}); err != nil {
-			return err
+			return nil, err
 		}
-		return j.CheckAccess(ctx, AccessRequest{
+		if err := j.CheckAccess(ctx, AccessRequest{
 			Op:      OpNetListen,
 			Command: cmdName,
 			Proto:   baseProto,
 			Host:    address,
-		})
+		}); err != nil {
+			return nil, err
+		}
+		return []string{address}, nil
 	}
+
+	ctx = withApprovalMemo(ctx)
 
 	host := ""
 	port := 0
 	if address != "" {
 		h, portStr, err := net.SplitHostPort(address)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		host = h
 		if portStr != "" {
 			p, err := resolvePortNumber(ctx, baseProto, portStr)
 			if err != nil {
-				return err
+				return nil, err
 			}
 			port = p
 		}
 	}
-	var resolvedIP string
-	if addr, ok := parseNormalizedIP(host); ok {
-		resolvedIP = addr.String()
-	} else if strings.EqualFold(host, "localhost") {
-		resolvedIP = "127.0.0.1"
+
+	// Wildcard listen (e.g. ":8080" or "").
+	if host == "" {
+		if err := j.CheckAccess(ctx, AccessRequest{
+			Op:      OpNetListen,
+			Command: cmdName,
+			Proto:   baseProto,
+			Host:    "",
+			Port:    port,
+		}); err != nil {
+			return nil, err
+		}
+		if address == "" {
+			return []string{""}, nil
+		}
+		return []string{net.JoinHostPort("", strconv.Itoa(port))}, nil
 	}
-	return j.CheckAccess(ctx, AccessRequest{
-		Op:         OpNetListen,
-		Command:    cmdName,
-		Proto:      baseProto,
-		Host:       host,
-		Port:       port,
-		ResolvedIP: resolvedIP,
-	})
+
+	// Literal IP address (e.g. "127.0.0.1:8080" or "0.0.0.0:8080").
+	if addr, ok := parseNormalizedIP(host); ok {
+		if err := j.CheckAccess(ctx, AccessRequest{
+			Op:         OpNetListen,
+			Command:    cmdName,
+			Proto:      baseProto,
+			Host:       host,
+			Port:       port,
+			ResolvedIP: addr.String(),
+		}); err != nil {
+			return nil, err
+		}
+		return []string{net.JoinHostPort(host, strconv.Itoa(port))}, nil
+	}
+
+	// Hostname: resolve upfront so DNS cannot rebind to 0.0.0.0/:: or an
+	// unpermitted interface between policy check and socket bind.
+	lookup := j.lookupIPAddr
+	if lookup == nil {
+		lookup = net.DefaultResolver.LookupIPAddr
+	}
+	ipAddrs, lookupErr := lookup(ctx, host)
+	if lookupErr != nil || len(ipAddrs) == 0 {
+		if err := j.CheckAccess(ctx, AccessRequest{
+			Op:      OpNetListen,
+			Command: cmdName,
+			Proto:   baseProto,
+			Host:    host,
+			Port:    port,
+		}); err != nil {
+			return nil, err
+		}
+		if lookupErr != nil {
+			return nil, lookupErr
+		}
+		return nil, &net.DNSError{Err: "no such host", Name: host}
+	}
+
+	filtered := filterIPAddrsByNetwork(network, ipAddrs)
+	if len(filtered) == 0 {
+		filtered = ipAddrs
+	}
+
+	var approvedTargets []string
+	var firstAccessErr error
+	for _, ipa := range filtered {
+		ipStr := ipa.IP.String()
+		if norm, ok := parseNormalizedIP(ipStr); ok {
+			ipStr = norm.String()
+		}
+		req := AccessRequest{
+			Op:         OpNetListen,
+			Command:    cmdName,
+			Proto:      baseProto,
+			Host:       host,
+			Port:       port,
+			ResolvedIP: ipStr,
+		}
+		staticDec, _ := j.evaluateNet(req)
+		if staticDec == DecisionDeny && j.isHardIPBlock(req) {
+			_ = j.CheckAccess(ctx, req)
+			return nil, &AccessDenialError{
+				Op:     OpNetListen,
+				Target: net.JoinHostPort(host, strconv.Itoa(port)),
+				Reason: fmt.Sprintf("resolved IP %s blocked by network policy", ipStr),
+			}
+		}
+		if err := j.CheckAccess(ctx, req); err != nil {
+			if firstAccessErr == nil {
+				firstAccessErr = err
+			}
+			continue
+		}
+		bindHost := ipa.IP.String()
+		if ipa.Zone != "" {
+			bindHost += "%" + ipa.Zone
+		}
+		target := net.JoinHostPort(bindHost, strconv.Itoa(port))
+		if !slices.Contains(approvedTargets, target) {
+			approvedTargets = append(approvedTargets, target)
+		}
+	}
+
+	if len(approvedTargets) == 0 {
+		if firstAccessErr != nil {
+			return nil, firstAccessErr
+		}
+		return nil, &AccessDenialError{
+			Op:     OpNetListen,
+			Target: address,
+			Reason: "no permitted listen IP addresses for host",
+		}
+	}
+	return approvedTargets, nil
 }
 
 // --- Exec & Process Policy Evaluation ---
@@ -1284,7 +1432,24 @@ func (j *Jail) evaluateExec(req AccessRequest) (Decision, string) {
 
 	var pathCands []string
 	var baseCands []string
-	addBinCand := func(p string, allowBase bool) {
+	var denyPathCands []string
+	var denyBaseCands []string
+
+	addDenyCand := func(p string) {
+		if p == "" {
+			return
+		}
+		np := normalizeMatchPath(p)
+		if np != "" && !slices.Contains(denyPathCands, np) {
+			denyPathCands = append(denyPathCands, np)
+		}
+		nb := normalizeBinBase(filepath.Base(p))
+		if nb != "" && !slices.Contains(denyBaseCands, nb) {
+			denyBaseCands = append(denyBaseCands, nb)
+		}
+	}
+
+	addAllowCand := func(p string, allowBase bool) {
 		if p == "" {
 			return
 		}
@@ -1292,7 +1457,11 @@ func (j *Jail) evaluateExec(req AccessRequest) (Decision, string) {
 		if np != "" && !slices.Contains(pathCands, np) {
 			pathCands = append(pathCands, np)
 		}
-		if allowBase {
+		// Never credit bare basenames for executables located inside writable
+		// jail roots/rules: otherwise writing +x /ws/git inside --jail /ws
+		// would spoof AllowBinaries: ["git"]. Explicit full-path AllowBinaries
+		// entries (bp.isPath == true) still match pathCands.
+		if allowBase && np != "" && !j.isInsideWritableRoot(np) {
 			nb := normalizeBinBase(filepath.Base(p))
 			if nb != "" && !slices.Contains(baseCands, nb) {
 				baseCands = append(baseCands, nb)
@@ -1300,40 +1469,30 @@ func (j *Jail) evaluateExec(req AccessRequest) (Decision, string) {
 		}
 	}
 
-	addBinCand(realCanon, true)
+	addDenyCand(realCanon)
+	addAllowCand(realCanon, true)
 	if req.Path != "" {
 		pCanon, pLex := canonicalizeForCheck(resolveHostPath("", req.Path))
-		addBinCand(pCanon, true)
-		addBinCand(pLex, false)
+		addDenyCand(pCanon)
+		addDenyCand(pLex)
+		addAllowCand(pCanon, true)
+		if npLex := normalizeMatchPath(pLex); npLex != "" && !j.isInsideWritableRoot(npLex) {
+			addAllowCand(pLex, false)
+		}
 	}
 
 	// DenyBinaries always check RawPath too so symlinking or invoking a denied
 	// alias name is caught immediately.
-	var denyBaseCands []string
-	denyBaseCands = append(denyBaseCands, baseCands...)
-	var denyPathCands []string
-	denyPathCands = append(denyPathCands, pathCands...)
 	if req.RawPath != "" {
 		rawParentCanon, _ := canonicalizeParentForCheck(resolveHostPath(req.WorkDir, req.RawPath))
+		addDenyCand(rawParentCanon)
 		np := normalizeMatchPath(rawParentCanon)
-		if np != "" && !slices.Contains(denyPathCands, np) {
-			denyPathCands = append(denyPathCands, np)
-		}
-		nb := normalizeBinBase(filepath.Base(rawParentCanon))
-		if nb != "" && !slices.Contains(denyBaseCands, nb) {
-			denyBaseCands = append(denyBaseCands, nb)
-		}
 		// Only credit RawPath basename for AllowBinaries when the symlink itself
 		// lives OUTSIDE writable jail Roots (e.g. OS /bin/sh -> dash or
 		// /usr/bin/python3 -> python3.12), preventing an attacker from creating
 		// `ln -s /usr/bin/curl /workspace/git` inside a writable jail root!
 		if np != "" && !j.isInsideWritableRoot(np) {
-			if !slices.Contains(pathCands, np) {
-				pathCands = append(pathCands, np)
-			}
-			if nb != "" && !slices.Contains(baseCands, nb) {
-				baseCands = append(baseCands, nb)
-			}
+			addAllowCand(rawParentCanon, true)
 		}
 	}
 
@@ -1351,8 +1510,19 @@ func (j *Jail) evaluateExec(req AccessRequest) (Decision, string) {
 }
 
 func (j *Jail) isInsideWritableRoot(normPath string) bool {
+	if normPath == "" {
+		return false
+	}
 	for _, r := range j.roots {
 		if isWithinNormalizedRoot(normPath, r) {
+			return true
+		}
+	}
+	for i := range j.rules {
+		r := &j.rules[i]
+		if (r.raw.Decision == DecisionAllow || r.raw.Decision == DecisionAllowSession) &&
+			(len(r.ops) == 0 || r.ops[OpWrite]) &&
+			r.matches(normPath) {
 			return true
 		}
 	}
@@ -1803,28 +1973,57 @@ func matchHostPattern(pat, host string, addr netip.Addr, hasAddr bool) bool {
 }
 
 var (
-	prefixRFC1918_10   = netip.MustParsePrefix("10.0.0.0/8")
-	prefixRFC1918_172  = netip.MustParsePrefix("172.16.0.0/12")
-	prefixRFC1918_192  = netip.MustParsePrefix("192.168.0.0/16")
-	prefixLinkLocalV4  = netip.MustParsePrefix("169.254.0.0/16")
-	prefixIPv6ULA      = netip.MustParsePrefix("fc00::/7")
-	prefixIPv6LinkLoc  = netip.MustParsePrefix("fe80::/10")
+	prefixThisNetV4   = netip.MustParsePrefix("0.0.0.0/8")
+	prefixRFC1918_10  = netip.MustParsePrefix("10.0.0.0/8")
+	prefixCGNAT       = netip.MustParsePrefix("100.64.0.0/10")
+	prefixRFC1918_172 = netip.MustParsePrefix("172.16.0.0/12")
+	prefixRFC1918_192 = netip.MustParsePrefix("192.168.0.0/16")
+	prefixLinkLocalV4 = netip.MustParsePrefix("169.254.0.0/16")
+	prefixIPv6ULA     = netip.MustParsePrefix("fc00::/7")
+	prefixIPv6LinkLoc = netip.MustParsePrefix("fe80::/10")
+	prefixNAT64       = netip.MustParsePrefix("64:ff9b::/96")
 )
 
 func isPrivateOrLinkLocalLAN(addr netip.Addr) bool {
-	addr = addr.Unmap()
-	if addr.Is4() {
-		return prefixRFC1918_10.Contains(addr) ||
-			prefixRFC1918_172.Contains(addr) ||
-			prefixRFC1918_192.Contains(addr) ||
-			prefixLinkLocalV4.Contains(addr)
+	if !addr.IsValid() {
+		return false
 	}
-	return prefixIPv6ULA.Contains(addr) || prefixIPv6LinkLoc.Contains(addr)
+	if addr.Is6() && prefixNAT64.Contains(addr) {
+		return true
+	}
+	u := addr.Unmap()
+	if u.Is4() {
+		return prefixRFC1918_10.Contains(u) ||
+			prefixCGNAT.Contains(u) ||
+			prefixRFC1918_172.Contains(u) ||
+			prefixRFC1918_192.Contains(u) ||
+			prefixLinkLocalV4.Contains(u)
+	}
+	return prefixIPv6ULA.Contains(u) ||
+		prefixIPv6LinkLoc.Contains(u) ||
+		prefixNAT64.Contains(u)
+}
+
+func isLoopbackAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	return addr.Unmap().IsLoopback()
+}
+
+func isUnspecifiedOrThisNetAddr(addr netip.Addr) bool {
+	if !addr.IsValid() {
+		return false
+	}
+	u := addr.Unmap()
+	if u.IsUnspecified() {
+		return true
+	}
+	return u.Is4() && prefixThisNetV4.Contains(u)
 }
 
 func isLoopbackOrUnspecifiedAddr(addr netip.Addr) bool {
-	addr = addr.Unmap()
-	return addr.IsLoopback() || addr.IsUnspecified()
+	return isLoopbackAddr(addr) || isUnspecifiedOrThisNetAddr(addr)
 }
 
 func resolvePortNumber(ctx context.Context, proto, portStr string) (int, error) {
