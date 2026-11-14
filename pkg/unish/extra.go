@@ -254,28 +254,57 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 			return next(ctx, args)
 		}
 		hc := interp.HandlerCtx(ctx)
+		runCtx := ctx
+		var bgJob *trackedJob
+		finishBg := func(int, error) {}
 		if hc.InBackground() {
+			var bgCancel context.CancelFunc
+			runCtx, bgCancel = context.WithCancel(ctx)
+			var finish func(int, error)
+			bgJob, finish = jobsFromContext(ctx).trackInProcess(args, bgCancel)
+			finishBg = func(code int, e error) {
+				bgCancel()
+				finish(code, e)
+			}
 			hc.ReportBgStart(0)
 		}
-		err := invokeExtra(ctx, hc, cmd, args)
-		if isPipeClosed(err) || isPipeClosed(ctx.Err()) {
+		err := invokeExtra(runCtx, hc, cmd, args)
+		if isPipeClosed(err) || isPipeClosed(runCtx.Err()) {
 			// SIGPIPE semantics: downstream closed the pipe early
 			// (e.g. `seq 1 5 | head -n 0`). GNU tools exit 0 silently;
 			// never surface "write |1: The pipe is being closed".
+			finishBg(0, nil)
 			return nil
 		}
 		if err != nil {
 			switch {
-			case ctx.Err() == context.DeadlineExceeded:
-				return interp.NewExitStatus(124)
-			case ctx.Err() == context.Canceled:
-				return interp.NewExitStatus(130)
+			case runCtx.Err() == context.DeadlineExceeded:
+				st := interp.NewExitStatus(124)
+				finishBg(124, st)
+				return st
+			case runCtx.Err() == context.Canceled:
+				code := 130
+				if ctx.Err() == nil {
+					code = 143
+					if bgJob != nil {
+						if kx := bgJob.killExit.Load(); kx > 0 {
+							code = int(kx)
+						}
+					}
+				}
+				st := interp.NewExitStatus(uint8(code))
+				finishBg(code, st)
+				return st
 			}
 			if ee, ok := err.(exitError); ok {
-				return interp.NewExitStatus(uint8(ee.code))
+				st := interp.NewExitStatus(uint8(ee.code))
+				finishBg(ee.code, st)
+				return st
 			}
 			if err == flag.ErrHelp {
-				return interp.NewExitStatus(2)
+				st := interp.NewExitStatus(2)
+				finishBg(2, st)
+				return st
 			}
 			// Go flag parse failures already printed "flag provided..." +
 			// "Try 'X --help'..." to stderr: exit 2 like GNU, without an
@@ -284,10 +313,14 @@ func extraHandler(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 				strings.HasPrefix(msg, "flag needs an argument") ||
 				strings.HasPrefix(msg, "invalid boolean") ||
 				strings.HasPrefix(msg, "invalid value") {
-				return interp.NewExitStatus(2)
+				st := interp.NewExitStatus(2)
+				finishBg(2, st)
+				return st
 			}
+			finishBg(1, err)
 			return err
 		}
+		finishBg(0, nil)
 		return nil
 	}
 }
@@ -318,6 +351,16 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 				return interp.NewExitStatus(126), true
 			}
 			fi, serr := os.Stat(checkedBin)
+			if serr != nil && runtime.GOOS == "windows" && os.IsNotExist(serr) {
+				for _, cand := range sessionWindowsExecCandidates(hc, checkedBin) {
+					if cfi, cerr2 := os.Stat(cand); cerr2 == nil && !cfi.IsDir() {
+						checkedBin = cand
+						fi = cfi
+						serr = nil
+						break
+					}
+				}
+			}
 			if serr != nil {
 				hc.ReportBgStart(0)
 				fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], serr)
@@ -412,7 +455,7 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 	// on $! work). Must happen before any blocking work, per the mvdan
 	// contract for reportBgStart.
 	hc.ReportBgStart(cmd.Process.Pid)
-	j := globalJobs.track(cmd, args)
+	j := jobsFromContext(ctx).track(cmd, args)
 	if !jailed {
 		hashRecord(args[0], path)
 	}
@@ -424,6 +467,9 @@ func runExternalTracked(ctx context.Context, args []string) (error, bool) {
 			return nil, true
 		}
 		if ee, ok := j.err.(*exec.ExitError); ok {
+			if code := signalExitCode(ee); code >= 0 {
+				return interp.NewExitStatus(uint8(code)), true
+			}
 			return interp.NewExitStatus(uint8(ee.ExitCode())), true
 		}
 		return j.err, true
@@ -753,12 +799,14 @@ func isOverriddenCall(name string) bool {
 		return name == "hash" || name == "history"
 	case 'j':
 		return name == "jobs"
+	case 'f':
+		return name == "fg"
 	case 'w':
 		return name == "wait"
 	case 'c':
-		return hasActiveCapabilityHooks.Load() && (name == "cd" || name == "command" || name == "compgen")
+		return name == "command" || (hasActiveCapabilityHooks.Load() && (name == "cd" || name == "compgen"))
 	case 'b':
-		return hasActiveCapabilityHooks.Load() && name == "builtin"
+		return name == "bg" || name == "builtin"
 	case 's':
 		return hasActiveCapabilityHooks.Load() && name == "source"
 	case '.':
@@ -903,11 +951,16 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		return resolveJailedSourceArgs(ctx, hc, args)
 	case "builtin":
-		if CapabilityHookFromContext(ctx) == nil || len(args) < 2 {
+		if len(args) < 2 || !interp.IsBuiltin(args[1]) {
 			return args, nil
 		}
-		if !interp.IsBuiltin(args[1]) {
-			return args, nil
+		if CapabilityHookFromContext(ctx) == nil {
+			switch args[1] {
+			case "kill", "jobs", "fg", "bg", "wait":
+				return fastCallOverride(ctx, hc, args[1:])
+			default:
+				return args, nil
+			}
 		}
 		sub := args[1:]
 		if isOverriddenCall(sub[0]) {
@@ -921,7 +974,16 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		return args, nil
 	case "command":
-		if CapabilityHookFromContext(ctx) == nil || len(args) < 2 {
+		if len(args) < 2 {
+			return args, nil
+		}
+		if CapabilityHookFromContext(ctx) == nil {
+			if len(args[1]) > 0 && args[1][0] != '-' {
+				switch args[1] {
+				case "kill", "jobs", "fg", "bg", "wait":
+					return fastCallOverride(ctx, hc, args[1:])
+				}
+			}
 			return args, nil
 		}
 		showMode := byte(0) // 'v' or 'V'
@@ -977,13 +1039,18 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		return nil, interp.CallHandled(0)
 	case "kill":
-		hc.PushActive()
-		err := cmdKill(interp.WithHandlerContext(ctx, hc), hc, splitAttached("kill", args))
-		hc.PopActive()
-		if err != nil {
-			return nil, interp.CallHandled(1)
+		err := cmdKillNetproc(interp.WithHandlerContext(ctx, hc), hc, splitAttached("kill", args))
+		if err == nil {
+			return nil, interp.CallHandled(0)
 		}
-		return nil, interp.CallHandled(0)
+		if ee, ok := err.(exitError); ok {
+			return nil, interp.CallHandled(uint8(ee.code))
+		}
+		var exitSt *interp.ExitError
+		if errors.As(err, &exitSt) {
+			return nil, err
+		}
+		return nil, interp.CallHandled(1)
 	case "umask":
 		if CapabilityHookFromContext(ctx) != nil {
 			if err := cmdUmaskJailed(ctx, hc, args); err != nil {
@@ -1041,7 +1108,26 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		return nil, interp.CallHandled(0)
 	case "jobs":
-		if err := cmdJobs(hc, args); err != nil {
+		if err := cmdJobsCtx(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "fg":
+		if err := cmdFgCtx(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "bg":
+		if err := cmdBgCtx(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
 			return nil, interp.CallHandled(1)
 		}
 		return nil, interp.CallHandled(0)
@@ -1064,7 +1150,7 @@ func fastCallOverride(ctx context.Context, hc interp.HandlerContext, args []stri
 		}
 		if code, handled := cmdWaitTracked(wctx, args); handled {
 			if code != 0 {
-				return nil, interp.CallHandled(1)
+				return nil, interp.CallHandled(uint8(code))
 			}
 			return nil, interp.CallHandled(0)
 		}
@@ -1342,6 +1428,15 @@ func shellOpenHandlerFn(ctx context.Context, path string, flag int, perm os.File
 		return sharedDevNull, nil
 	}
 	mc := interp.HandlerCtx(ctx)
+	if rwc, ok, err := tryOpenActiveProcSubst(ctx, resolveHostPath(mc.Dir, path), flag); ok {
+		if err != nil {
+			if _, ok2 := err.(*os.PathError); !ok2 {
+				return nil, &os.PathError{Op: "open", Path: path, Err: err}
+			}
+			return nil, err
+		}
+		return rwc, nil
+	}
 	f, err := fsOpenFile(ctx, mc.Dir, "redirect", path, flag, perm)
 	if err != nil {
 		if _, ok := err.(*os.PathError); !ok {
@@ -1878,12 +1973,12 @@ func parseUint(s string) (uint64, error) {
 }
 
 // fsOpenInput opens a builtin input file resolved against dir with OpRead
-// capability enforcement, while preserving Windows `<(cmd)` process
-// substitution synchronization on registered in-process temp files.
+// capability enforcement, while preserving `<(cmd)` process substitution
+// synchronization and per-CapabilityHook isolation across Windows and POSIX.
 func fsOpenInput(ctx context.Context, dir, cmdName, rawPath string) (io.ReadCloser, error) {
 	hostPath := resolveHostPath(dir, rawPath)
-	if st := winProcSubstLookup(hostPath); st != nil && st.op == syntax.CmdIn {
-		return openShellFile(hostPath)
+	if rwc, ok, err := tryOpenActiveProcSubst(ctx, hostPath, os.O_RDONLY); ok {
+		return rwc, err
 	}
 	if CapabilityHookFromContext(ctx) == nil {
 		return openShellFile(hostPath)
@@ -1902,7 +1997,7 @@ func fsReadInputFile(ctx context.Context, dir, cmdName, rawPath string) ([]byte,
 
 func fsOpenOutput(ctx context.Context, dir, cmdName, rawPath string, flag int, perm os.FileMode) (io.WriteCloser, error) {
 	hostPath := resolveHostPath(dir, rawPath)
-	if st := winProcSubstLookup(hostPath); st != nil && st.op == syntax.CmdOut {
+	if st := winProcSubstLookupCtx(ctx, hostPath); st != nil && st.op == syntax.CmdOut {
 		w, err := openFileRetry(hostPath, flag, perm)
 		if err != nil {
 			st.finishConsumer()
@@ -1910,6 +2005,9 @@ func fsOpenOutput(ctx context.Context, dir, cmdName, rawPath string, flag int, p
 		}
 		st.consumerOpen()
 		return &countedFile{File: w, onClose: st.consumerWriterClose}, nil
+	}
+	if w, ok, err := openProcSubstOut(ctx, hostPath); ok {
+		return w, err
 	}
 	return fsOpenFile(ctx, dir, cmdName, rawPath, flag, perm)
 }
@@ -3757,13 +3855,16 @@ func runSelfTracked(ctx context.Context, args []string) (error, bool) {
 	afterStart()
 	defer afterWait()
 	hc.ReportBgStart(cmd.Process.Pid)
-	j := globalJobs.track(cmd, args)
+	j := jobsFromContext(ctx).track(cmd, args)
 	<-j.done
 	if j.err != nil {
 		if isPipeClosed(j.err) {
 			return nil, true
 		}
 		if ee, ok := j.err.(*exec.ExitError); ok {
+			if code := signalExitCode(ee); code >= 0 {
+				return interp.NewExitStatus(uint8(code)), true
+			}
 			return interp.NewExitStatus(uint8(ee.ExitCode())), true
 		}
 		return j.err, true

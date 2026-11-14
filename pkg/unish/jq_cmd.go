@@ -617,7 +617,7 @@ func newJqInputStream(ctx context.Context, hc interp.HandlerContext, files []str
 			continue
 		}
 		hostPath := resolveHostPath(hc.Dir, fp)
-		if st := winProcSubstLookup(hostPath); st != nil {
+		if isActiveProcSubstPath(ctx, hostPath) {
 			continue
 		}
 		fi, err := fsStat(ctx, hc.Dir, "jq", fp)

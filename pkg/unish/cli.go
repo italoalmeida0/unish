@@ -44,6 +44,7 @@ type cliJailFlags struct {
 	allowRead  repeatableFlag
 	allowWrite repeatableFlag
 	denyPaths  repeatableFlag
+	askPaths   repeatableFlag
 	outside    string
 	netMode    string
 	allowNet   repeatableFlag
@@ -56,6 +57,7 @@ func (f *cliJailFlags) anySet() bool {
 		len(f.allowRead) > 0 ||
 		len(f.allowWrite) > 0 ||
 		len(f.denyPaths) > 0 ||
+		len(f.askPaths) > 0 ||
 		f.outside != "" ||
 		f.netMode != "" ||
 		len(f.allowNet) > 0 ||
@@ -105,6 +107,13 @@ func buildCLIJail(jf cliJailFlags, harnessMode bool) (*Jail, error) {
 		cfg.Rules = append(cfg.Rules, PathRule{
 			Pattern:  p,
 			Decision: DecisionDeny,
+		})
+	}
+
+	for _, p := range jf.askPaths {
+		cfg.Rules = append(cfg.Rules, PathRule{
+			Pattern:  p,
+			Decision: DecisionAsk,
 		})
 	}
 
@@ -158,14 +167,14 @@ func buildCLIJail(jf cliJailFlags, harnessMode bool) (*Jail, error) {
 
 	if jf.execMode != "" {
 		switch strings.ToLower(strings.TrimSpace(jf.execMode)) {
-		case "builtins", "deny":
+		case "builtins", "deny", "allowlist":
 			cfg.Exec.ExecDefault = DecisionDeny
 		case "ask":
 			cfg.Exec.ExecDefault = DecisionAsk
 		case "allow":
 			cfg.Exec.ExecDefault = DecisionAllow
 		default:
-			return nil, fmt.Errorf("invalid --exec-mode %q (expected builtins, ask, or allow)", jf.execMode)
+			return nil, fmt.Errorf("invalid --exec-mode %q (expected builtins, allowlist, ask, or allow)", jf.execMode)
 		}
 	}
 
@@ -266,13 +275,16 @@ func RunCLI(version string, args []string) int {
 
 	var jf cliJailFlags
 	fs.Var(&jf.jailRoots, "jail", "add allowed read/write jail root directory (repeatable)")
+	fs.Var(&jf.allowRead, "jail-ro", "add allowed read-only jail root directory or glob (repeatable)")
 	fs.Var(&jf.allowRead, "allow-read", "add allowed read-only path or glob (repeatable)")
 	fs.Var(&jf.allowWrite, "allow-write", "add allowed writable path or glob (repeatable)")
 	fs.Var(&jf.denyPaths, "deny-path", "deny access to matching path or glob (repeatable)")
+	fs.Var(&jf.askPaths, "ask-path", "prompt for interactive approval on matching path or glob (repeatable)")
 	fs.StringVar(&jf.outside, "outside", "", "policy for paths outside jail roots: deny, ask, or allow")
+	fs.StringVar(&jf.outside, "outside-action", "", "policy for paths outside jail roots: deny, ask, or allow")
 	fs.StringVar(&jf.netMode, "net", "", "network policy: deny, loopback, ask, or allow")
 	fs.Var(&jf.allowNet, "allow-net", "allow network access to host[:port] or CIDR (repeatable)")
-	fs.StringVar(&jf.execMode, "exec-mode", "", "external binary policy: builtins, ask, or allow")
+	fs.StringVar(&jf.execMode, "exec-mode", "", "external binary policy: builtins, allowlist, ask, or allow")
 	fs.Var(&jf.allowExec, "allow-exec", "allow executing named or absolute external binary (repeatable)")
 
 	showVersion := false
@@ -424,6 +436,9 @@ func RunCLI(version string, args []string) int {
 			interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
 			interp.CallHandler(callOverride),
 			interp.OpenHandler(shellOpenHandler()),
+			interp.ReadDirHandler2(shellReadDirHandler()),
+			interp.StatHandler(shellStatHandler()),
+			interp.AccessHandler(shellAccessHandler()),
 			interp.ExecHandlers(
 				trackExec,
 				extraHandler,
@@ -432,11 +447,16 @@ func RunCLI(version string, args []string) int {
 		}
 	} else {
 		ensureSessionExtrasRegistered()
+		cliJobs := NewJobTable()
+		defer cliJobs.terminateAll()
 		cliSess := &Session{
+			sessCtx:    ctx,
 			jail:       jail,
 			hook:       jail,
+			jobTable:   cliJobs,
 			inheritEnv: true,
 		}
+		ctx = WithJobTable(ctx, cliJobs)
 		ctx = withSessionInContext(ctx, cliSess)
 		cliSess.umask.Store(shellUmask.Load())
 		if startDir != "" {

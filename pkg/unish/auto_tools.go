@@ -554,6 +554,16 @@ func flockOpenHandler() interp.OpenHandlerFunc {
 			return sharedDevNull, nil
 		}
 		mc := interp.HandlerCtx(ctx)
+		if rwc, ok, err := tryOpenActiveProcSubst(ctx, resolveHostPath(mc.Dir, path), flag); ok {
+			if err != nil {
+				var pe *os.PathError
+				if !errors.As(err, &pe) {
+					return nil, &os.PathError{Op: "open", Path: path, Err: err}
+				}
+				return nil, err
+			}
+			return rwc, nil
+		}
 		f, err := fsOpenFile(ctx, mc.Dir, "open", path, flag, perm)
 		if err != nil {
 			var pe *os.PathError
@@ -634,6 +644,14 @@ func runFlockShellCommand(ctx context.Context, hc interp.HandlerContext, src str
 		_, _ = fmt.Fprintln(hc.Stderr, err)
 		return exitError{2}
 	}
+	execHandlers := []func(interp.ExecHandlerFunc) interp.ExecHandlerFunc{trackExec, extraHandler}
+	if ee, ok := hc.Env.(explicitEnviron); ok {
+		execHandlers = []func(interp.ExecHandlerFunc) interp.ExecHandlerFunc{
+			wrapExplicitEnvMiddleware(ee.cleared),
+			trackExec,
+			extraHandler,
+		}
+	}
 	r, err := interp.New(
 		interp.Dir(hc.Dir),
 		interp.Env(hc.Env),
@@ -643,7 +661,7 @@ func runFlockShellCommand(ctx context.Context, hc interp.HandlerContext, src str
 		interp.ReadDirHandler2(flockReadDirHandler()),
 		interp.StatHandler(flockStatHandler()),
 		interp.AccessHandler(flockAccessHandler()),
-		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ExecHandlers(execHandlers...),
 		interp.ProcSubstHandler(procSubstHandler),
 	)
 	if err != nil {

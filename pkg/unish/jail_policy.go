@@ -59,18 +59,54 @@ type NetPolicy struct {
 	LookupIPAddr func(ctx context.Context, host string) ([]net.IPAddr, error)
 }
 
+// ExecMode specifies a preset external-binary execution policy mode.
+type ExecMode int
+
+const (
+	// ExecModeUnset defers to ExecPolicy.ExecDefault.
+	ExecModeUnset ExecMode = iota
+	// ExecBuiltinsOnly denies external OS binaries (in-process builtins only,
+	// unless explicitly matched in AllowBinaries).
+	ExecBuiltinsOnly
+	// ExecAllowlist allows only binaries listed in AllowBinaries and denies all others.
+	ExecAllowlist
+	// ExecAsk invokes Approver for binaries unmatched by DenyBinaries/AllowBinaries.
+	ExecAsk
+	// ExecAllowAll allows external binaries unless matched by DenyBinaries.
+	ExecAllowAll
+)
+
 // ExecPolicy configures external OS process execution within a Jail.
 type ExecPolicy struct {
-	// ExecDefault governs external binary execution when unmatched by
-	// DenyBinaries or AllowBinaries. When Approver is nil, DecisionAsk fails
-	// closed as DecisionDeny (pure builtins-only jail).
+	// Mode optionally selects a preset execution mode (takes precedence when non-zero).
+	Mode ExecMode
+	// ExecDefault governs external binary execution when Mode is ExecModeUnset
+	// and the binary is unmatched by DenyBinaries or AllowBinaries. When Approver
+	// is nil, DecisionAsk fails closed as DecisionDeny (pure builtins-only jail).
 	ExecDefault   Decision
 	AllowBinaries []string // matches basename (e.g. "git") or canonical full path
 	DenyBinaries  []string // matches basename or canonical full path; wins over AllowBinaries
 }
 
+// ProcMode specifies a preset process-signaling and host-inspection mode.
+type ProcMode int
+
+const (
+	// ProcModeUnset defers to ProcPolicy.ProcDefault.
+	ProcModeUnset ProcMode = iota
+	// ProcOwnSessionOnly allows signaling live child jobs in the Session's own
+	// JobTable while denying host PIDs and other sessions' PIDs.
+	ProcOwnSessionOnly
+	// ProcAsk invokes Approver for host/external PID operations.
+	ProcAsk
+	// ProcAllowAll allows host process inspection and signaling (still protecting $$).
+	ProcAllowAll
+)
+
 // ProcPolicy configures host process inspection and signaling within a Jail.
 type ProcPolicy struct {
+	// Mode optionally selects a preset process mode (takes precedence when non-zero).
+	Mode        ProcMode
 	ProcDefault Decision
 }
 
@@ -261,6 +297,26 @@ var _ CapabilityHook = (*Jail)(nil)
 // NewJail validates cfg, canonicalizes configured roots and rules, and returns
 // a thread-safe *Jail implementing CapabilityHook.
 func NewJail(cfg JailConfig) (*Jail, error) {
+	execDefault := cfg.Exec.ExecDefault
+	switch cfg.Exec.Mode {
+	case ExecBuiltinsOnly, ExecAllowlist:
+		execDefault = DecisionDeny
+	case ExecAsk:
+		execDefault = DecisionAsk
+	case ExecAllowAll:
+		execDefault = DecisionAllow
+	}
+
+	procDefault := cfg.Proc.ProcDefault
+	switch cfg.Proc.Mode {
+	case ProcOwnSessionOnly:
+		procDefault = DecisionDeny
+	case ProcAsk:
+		procDefault = DecisionAsk
+	case ProcAllowAll:
+		procDefault = DecisionAllow
+	}
+
 	j := &Jail{
 		outsideAction:       cfg.OutsideAction,
 		readOnlyWriteAction: cfg.ReadOnlyWriteAction,
@@ -271,8 +327,8 @@ func NewJail(cfg JailConfig) (*Jail, error) {
 		allowListen:         cfg.Net.AllowListen,
 		transportDialer:     cfg.Net.TransportDialer,
 		lookupIPAddr:        cfg.Net.LookupIPAddr,
-		execDefault:         cfg.Exec.ExecDefault,
-		procDefault:         cfg.Proc.ProcDefault,
+		execDefault:         execDefault,
+		procDefault:         procDefault,
 		approver:            cfg.Approver,
 		onAudit:             cfg.OnAudit,
 		sessionGrants:       make(map[string]bool),

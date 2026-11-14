@@ -359,6 +359,9 @@ func (rp *repl) expandPromptVars(s string) string {
 		interp.StdIO(nil, &out, io.Discard),
 		interp.CallHandler(rp.callHandler),
 		interp.OpenHandler(shellOpenHandler()),
+		interp.ReadDirHandler2(shellReadDirHandler()),
+		interp.StatHandler(shellStatHandler()),
+		interp.AccessHandler(shellAccessHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)

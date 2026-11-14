@@ -45,6 +45,9 @@ func runInteractive() int {
 		interp.StdIO(os.Stdin, os.Stdout, os.Stderr),
 		interp.CallHandler(rp.callHandler),
 		interp.OpenHandler(shellOpenHandler()),
+		interp.ReadDirHandler2(shellReadDirHandler()),
+		interp.StatHandler(shellStatHandler()),
+		interp.AccessHandler(shellAccessHandler()),
 		interp.ExecHandlers(trackExec, extraHandler),
 		interp.ProcSubstHandler(procSubstHandler),
 	)

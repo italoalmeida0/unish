@@ -616,6 +616,60 @@ func fsReadShellFile(ctx context.Context, dir, cmdName, rawPath string) ([]byte,
 	return io.ReadAll(f)
 }
 
+type writeOnlyRWC struct {
+	io.WriteCloser
+}
+
+func (writeOnlyRWC) Read([]byte) (int, error) {
+	return 0, os.ErrInvalid
+}
+
+// tryOpenActiveProcSubst opens rawPath as an active process-substitution consumer
+// (`<(cmd)` or `>(cmd)`) when rawPath belongs to ctx's CapabilityHook.
+// Returns (nil, false, nil) for ordinary non-procsubst paths.
+func tryOpenActiveProcSubst(ctx context.Context, rawPath string, flag int) (io.ReadWriteCloser, bool, error) {
+	if rawPath == "" {
+		return nil, false, nil
+	}
+	accMode := flag & (os.O_RDONLY | os.O_WRONLY | os.O_RDWR)
+	wantsWrite := accMode == os.O_WRONLY || accMode == os.O_RDWR || flag&(os.O_CREATE|os.O_TRUNC|os.O_APPEND) != 0
+	if !wantsWrite {
+		if st := winProcSubstLookupCtx(ctx, rawPath); st != nil && st.op == syntax.CmdIn {
+			select {
+			case <-st.producerDone:
+			case <-ctx.Done():
+				return nil, true, ctx.Err()
+			case <-time.After(30 * time.Second):
+			}
+			f, err := openRetry(rawPath)
+			if err != nil {
+				return nil, true, err
+			}
+			st.consumerOpen()
+			return &refcountedFileShim{File: f, st: st}, true, nil
+		}
+		if st, ok := unixProcSubstLookup(ctx, rawPath); ok && st.op == syntax.CmdIn {
+			if st.openConsumer != nil {
+				rwc, err := st.openConsumer(ctx, os.O_RDONLY)
+				return rwc, true, err
+			}
+			f, err := os.Open(rawPath)
+			return f, true, err
+		}
+		return nil, false, nil
+	}
+	if w, ok, err := openProcSubstOut(ctx, rawPath); ok {
+		if err != nil {
+			return nil, true, err
+		}
+		if rwc, ok2 := w.(io.ReadWriteCloser); ok2 {
+			return rwc, true, nil
+		}
+		return writeOnlyRWC{WriteCloser: w}, true, nil
+	}
+	return nil, false, nil
+}
+
 // openProcSubstOut opens a `>(cmd)` process-substitution output sink when
 // rawPath is an active CmdOut IPC path synthesized by procSubstHandler for ctx's hook.
 func openProcSubstOut(ctx context.Context, rawPath string) (io.WriteCloser, bool, error) {

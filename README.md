@@ -33,6 +33,124 @@ unish -i < script.sh     run with history + `!` expansion
 Timeout and cancellation are the caller's job (`exec` context /
 Ctrl-C).
 
+## Go Library SDK (`pkg/unish`)
+
+Embed `unish` directly inside any Go application or AI agent runtime without
+spawning a shell process per turn or mutating host globals (`os.Chdir`,
+`syscall.Umask`, `os.Environ`):
+
+```go
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/italoalmeida0/unish/pkg/unish"
+)
+
+func main() {
+	cfg := unish.DefaultJailConfig("/path/to/workspace")
+	cfg.ReadOnlyRoots = []string{"/path/to/shared-docs"}
+	cfg.OutsideAction = unish.DecisionAsk
+	cfg.Rules = []unish.PathRule{
+		{Pattern: "**/.env*", Decision: unish.DecisionDeny, Reason: "protect secrets"},
+	}
+	cfg.Net = unish.NetPolicy{
+		Default:         unish.DecisionDeny,
+		AllowLoopback:   true,
+		BlockPrivateLAN: true, // blocks DNS rebinding to RFC1918 / link-local
+		Rules: []unish.NetRule{
+			{HostPattern: "api.example.com", Ports: []int{443}, Decision: unish.DecisionAllow},
+		},
+	}
+	cfg.Exec = unish.ExecPolicy{
+		Mode:          unish.ExecAllowlist, // or unish.ExecBuiltinsOnly
+		AllowBinaries: []string{"git"},      // writable-root ./git spoofing is blocked
+	}
+	cfg.Proc = unish.ProcPolicy{Mode: unish.ProcOwnSessionOnly}
+	cfg.Approver = func(ctx context.Context, req unish.AccessRequest) (unish.Decision, error) {
+		// Return DecisionAllow (once), DecisionAllowSession (cached), or DecisionDeny.
+		return unish.DecisionDeny, nil
+	}
+
+	jail, err := unish.NewJail(cfg)
+	if err != nil {
+		panic(err)
+	}
+
+	sess, err := unish.NewSession(
+		unish.WithWorkDir("/path/to/workspace"),
+		unish.WithJail(jail),
+		unish.WithScrubEnv("*_SECRET*", "*_TOKEN", "AWS_*"),
+	)
+	if err != nil {
+		panic(err)
+	}
+	defer sess.Close()
+
+	_, _ = sess.Exec(context.Background(), "cd src && export MODE=prod")
+	res, _ := sess.Exec(context.Background(), `rg -n "TODO" . | head -20`)
+	fmt.Printf("exit=%d cwd=%s\n%s", res.ExitCode, res.WorkDir, res.Stdout)
+}
+```
+
+Each `*unish.Session` maintains isolated working directory, shell & exported
+variables, functions, aliases, `umask`, `$?`, `<(cmd)` / `>(cmd)` process
+substitutions, and per-session background jobs (`&`, `jobs`, `fg`, `bg`,
+`wait`, `kill %1`), so dozens of multi-tenant sessions can run concurrently in
+one Go process.
+
+## JSONL Stdio Harness Mode (`unish --harness`)
+
+For non-Go runtimes (Python, TypeScript, Rust), `unish --harness` runs a
+persistent, non-blocking JSONL RPC session over stdin/stdout (combinable with
+any `--jail*` flags):
+
+```
+unish --harness --jail ./workspace --deny-path "**/.env*" --outside-action ask
+```
+
+| Direction | `type` | Key fields & behavior |
+|---|---|---|
+| `->` stdin | `exec` | `id`, `script`, optional `stdin`, `cwd`, `env`, `timeout_ms` — runs in persistent session |
+| `<-` stdout | `stdout` / `stderr` | `id`, `data` — live output chunks streamed while `exec` is running |
+| `<-` stdout | `ask_permission` | `id`, `req_id`, `op`, `path`/`host`/`binary`, `request` — emitted when policy yields `DecisionAsk` |
+| `->` stdin | `permission_reply` | `req_id`, `decision` (`"allow"`, `"allow_session"`, or `"deny"`) — unblocks paused command |
+| `<-` stdout | `result` | `id`, `exit_code`, `stdout`, `stderr`, `cwd`, `duration_ms`, `cancelled`, `denials` — command completion (`exec_done`) |
+| `->` stdin | `cancel` | optional `req_id` — interrupts in-flight or queued `exec` (`exit_code: 130`) without losing session state |
+| `->` stdin | `set_env` | `id`, `env` (`{"KEY":"VAL"}`), optional `unset` (`["KEY"]`) — updates session env and replies with `state` |
+| `->` stdin | `set_cwd` / `get_state` / `revoke_grants` | Updates directory, inspects `cwd`/`env`/`umask`/`last_exit_code`, or clears cached session grants |
+| `->` / `<-` | `ping` / `pong` | `id` — liveness probe (processed immediately even while `exec` awaits `permission_reply`) |
+
+## CLI Sandbox & Jail Flags
+
+Any one-shot (`-c`, script), interactive (`-i`), or `--harness` invocation can
+be sandboxed directly from the CLI:
+
+```
+unish --jail ./workspace \
+      --jail-ro ./docs \
+      --deny-path "**/.env*" \
+      --ask-path "./workspace/deploy/**" \
+      --outside-action deny \
+      --net loopback \
+      --exec-mode builtins \
+      -c "jq -r .name package.json && rg -l main ."
+```
+
+| Flag | Description |
+|---|---|
+| `--jail <dir>` | Add allowed read/write workspace root directory (repeatable; `--allow-write` also accepts globs) |
+| `--jail-ro <path>` | Add allowed read-only root directory or glob (repeatable; alias `--allow-read`) |
+| `--deny-path <glob>` | Explicitly deny matching path or `**` glob, even inside `--jail` roots (repeatable) |
+| `--ask-path <glob>` | Prompt interactively (TTY or `--harness` `ask_permission`) on matching path/glob (repeatable) |
+| `--outside-action <mode>` | Policy for paths outside allowed roots: `deny`, `ask`, or `allow` (alias `--outside`) |
+| `--net <mode>` | Network policy: `deny`, `loopback`, `ask`, or `allow` |
+| `--allow-net <spec>` | Allow outbound `nc` connections to `host[:port[-end]]` or `CIDR` (repeatable) |
+| `--exec-mode <mode>` | External OS binary policy: `builtins` (`deny`), `allowlist`, `ask`, or `allow` |
+| `--allow-exec <bin>` | Allow executing named (`git`) or canonical absolute external binary (repeatable) |
+
 ## Why
 
 - **Zero install**: one static binary (~7 MB), no glibc/msvcrt/cygwin
@@ -89,7 +207,7 @@ read the results.
 | files | `ls` (-a with `.`/`..`, -l, -R, -S, -t, -m, -C, -x, -i, -F, -Q, -d, …), `find` (-name/-iname, -path, -type, -maxdepth/-mindepth, -size, -mtime/-mmin, -newer, -empty, -perm, -not, -prune, -exec, -delete, -print0), `mktemp`, `cp` (-r, -v, -n, -p), `mv` (-v `renamed …`, -n), `rm` (never removes `.`/`..`, --preserve-root), `mkdir`, `touch` (-d, -r/--reference, -c), `chmod` (symbolic), `xargs` (-0, -n, -I, -r), `base64` (-d, -w, -i), `tar` (-cf/-xf/-tf/-czf, --exclude, slip defense), `gzip`/`gunzip`/`gzcat`, `dirname`, `basename`, `realpath`, `readlink`, `ln` (-s, -f), `du` (-s, -h, -b) |
 | system | `sleep`, `timeout` (-s, -k, --preserve-status), `kill` (-s/-n, `%jobspec`, `-0` existence check), `pwd`, `true`, `false`, `yes`, `which`, `printenv`, `whoami`, `nproc`, `clear`, `echo`, `date` (+strftime, -r, -d), `uname` (-s/-n/-r/-v/-m/-p/-i/-a, real kernel + machine), `hostname`, `md5sum`, `sha1sum`, `sha256sum`, `shasum` (-a, -c, -q/-s) |
 | sysinfo | `df` (-h, -k, -P), `ps` (aux/-ef/-o columns), `free` (-h/-m/-g), `uptime`, `env` (-i), `stat` (full + -c), `ss` (-t/-u/-l/-a/-n/-p), `id`, `arch`, `tty`, `logname`, `sync`, `nohup`, `nice` |
-| shell | `umask`, `ulimit` (-n/-a, -Sn/-Hn), `hash` (real table), `type`, `jobs` (real PIDs), `wait`, `history` (interactive), `compgen` |
+| shell | `umask`, `ulimit` (-n/-a, -Sn/-Hn), `hash` (real table), `type`, `jobs` (real PIDs), `fg`, `bg`, `wait`, `history` (interactive), `compgen` |
 | network | `nc`/`netcat` (-l, -u, -z, -w, -p, -v), `pgrep` (-f/-x/-i/-l/-c), `pkill` (-f/-x/-i/-e/-s/-l/-n/-a/-g) |
 
 ## Interactive shell

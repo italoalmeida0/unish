@@ -1,5 +1,53 @@
 # Changelog
 
+## 1.2.0 — 2026-11-14
+
+### Added
+
+- **Embeddable Go Library SDK (`pkg/unish`).** Exported a clean, thread-safe
+  in-process shell SDK (`NewSession`, `Exec`, `ExecWith`, `CancelCurrent`,
+  `Close`, `SetCwd`, `SetVar`, `UnsetVar`, `GetVar`, `Env`) preserving working
+  directory, shell & exported variables, functions, aliases, shell options,
+  `umask`, `$?`, `<(cmd)` / `>(cmd)` process substitutions, and isolated
+  per-session job tables (`&`, `jobs`, `fg`, `bg`, `wait`, `kill %n`) across
+  calls without mutating host process globals (`os.Chdir`, `syscall.Umask`,
+  `os.Environ`). Added `WithInheritEnv(false)` and `WithScrubEnv(patterns...)`
+  end-to-end environment isolation across shell expansion, `printenv`, `env`,
+  `awk` (`ENVIRON`), `jq` (`env` / `$ENV`), `flock -c`, and child processes.
+- **Declarative + Interactive Capability Sandbox (`Jail` & `CapabilityHook`).**
+  Added defense-in-depth filesystem, network, external binary execution, and
+  process signaling enforcement across shell redirections, globbing,
+  conditionals (`[` / `[[`), `cd`/`pushd`/`popd`, `source`, and all 100+
+  embedded coreutils, text, archive, search, and automation builtins (`cp`,
+  `mv`, `rm`, `ln`, `find`, `tar`, `xargs`, `grep`, `rg`, `sed -i`, `awk`,
+  `jq`, `patch`, `sponge`, `flock`, `nc`, `ps`, `pgrep`, `pkill`, `ss`,
+  `kill`):
+  - **Filesystem policy**: canonical + lexical path resolution preventing
+    symlink and dangling-symlink workspace escapes, `Roots` (read/write),
+    `ReadOnlyRoots`, ordered `PathRule` globs (`**/.env*` deny-inside-root),
+    `OutsideAction`, and interactive `Approver` callbacks (`DecisionAllow`,
+    cached `DecisionAllowSession` with `RevokeSessionGrants`, `DecisionDeny`),
+    plus structured `ExecResult.Denials` and `OnAudit` telemetry.
+  - **Network policy (`NetPolicy`)**: default-deny socket gating (`nc` TCP/UDP
+    connect and listen), `AllowLoopback`, `NetRule` host/port-range/CIDR
+    matching, and `BlockPrivateLAN` pre-connect IP verification blocking DNS
+    rebinding to loopback, RFC1918, CGNAT, and link-local addresses.
+  - **Execution & process policy (`ExecPolicy` & `ProcPolicy`)**:
+    `ExecBuiltinsOnly`, `ExecAllowlist` (blocking `./git` and writable-root
+    `PATH` spoofing when allowlisting by basename), `ProcOwnSessionOnly`
+    (allowing signaling a session's own live tracked child jobs while blocking
+    cross-session or host PIDs), and unconditional host-process protection on
+    `kill $$`, `0$$`, `0`, `-1`, and `os.Getpid()`.
+- **JSONL Stdio Agent Harness (`unish --harness`) & CLI Sandbox Flags.**
+  Added a concurrent bidirectional JSONL RPC server (`NewHarnessServer`,
+  `RunHarness`, `unish --harness`) with non-blocking mid-command
+  `ask_permission` <-> `permission_reply`, live `stdout`/`stderr` chunk
+  streaming, `result` completion events, targeted `cancel`, `set_env`,
+  `set_cwd`, `get_state`, `revoke_grants`, and `ping`/`pong`, alongside CLI
+  flags `--jail`, `--jail-ro` (`--allow-read`), `--allow-write`, `--deny-path`,
+  `--ask-path`, `--outside-action` (`--outside`), `--net`, `--allow-net`,
+  `--exec-mode`, and `--allow-exec`.
+
 ## 1.1.0 — 2026-11-14
 
 ### Added

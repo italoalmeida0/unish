@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -24,6 +25,7 @@ type HarnessRequest struct {
 	Cwd       string            `json:"cwd,omitempty"`
 	Dir       string            `json:"dir,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
+	Unset     []string          `json:"unset,omitempty"`
 	TimeoutMs int64             `json:"timeout_ms,omitempty"`
 	ReqID     string            `json:"req_id,omitempty"`
 	Decision  string            `json:"decision,omitempty"`
@@ -256,7 +258,7 @@ func (s *HarnessServer) dispatchLine(raw []byte) {
 	case "cancel":
 		s.handleCancel(req)
 
-	case "exec", "set_cwd", "get_state", "revoke_grants":
+	case "exec", "set_cwd", "set_env", "get_state", "revoke_grants":
 		s.enqueue(req)
 
 	default:
@@ -335,6 +337,8 @@ func (s *HarnessServer) workerLoop(ctx context.Context) {
 			s.runExec(execCtx, execCancel, req)
 		case "set_cwd":
 			s.runSetCwd(req)
+		case "set_env":
+			s.runSetEnv(req)
 		case "get_state":
 			s.runGetState(req)
 		case "revoke_grants":
@@ -434,6 +438,37 @@ func (s *HarnessServer) runSetCwd(req HarnessRequest) {
 			Error: err.Error(),
 		})
 		return
+	}
+	s.runGetState(req)
+}
+
+func (s *HarnessServer) runSetEnv(req HarnessRequest) {
+	if len(req.Env) > 0 {
+		keys := make([]string, 0, len(req.Env))
+		for k := range req.Env {
+			keys = append(keys, k)
+		}
+		slices.Sort(keys)
+		for _, k := range keys {
+			if err := s.sess.SetVar(k, req.Env[k], true); err != nil {
+				_ = s.sendEvent(HarnessEvent{
+					ID:    req.ID,
+					Type:  "error",
+					Error: err.Error(),
+				})
+				return
+			}
+		}
+	}
+	for _, k := range req.Unset {
+		if err := s.sess.UnsetVar(k); err != nil {
+			_ = s.sendEvent(HarnessEvent{
+				ID:    req.ID,
+				Type:  "error",
+				Error: err.Error(),
+			})
+			return
+		}
 	}
 	s.runGetState(req)
 }

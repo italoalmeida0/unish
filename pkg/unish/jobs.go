@@ -62,7 +62,8 @@ func isOverriddenCallNetproc(name string) bool {
 	if len(name) == 0 {
 		return false
 	}
-	if name == "kill" || name == "jobs" {
+	switch name {
+	case "kill", "jobs", "fg", "bg":
 		return true
 	}
 	return isOverriddenCall(name)
@@ -94,21 +95,39 @@ func fastCallOverrideNetproc(ctx context.Context, hc interp.HandlerContext, args
 			return nil, interp.CallHandled(1)
 		}
 		return nil, interp.CallHandled(0)
+	case "fg":
+		if err := cmdFgCtx(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
+	case "bg":
+		if err := cmdBgCtx(ctx, hc, args); err != nil {
+			if ee, ok := err.(exitError); ok {
+				return nil, interp.CallHandled(uint8(ee.code))
+			}
+			return nil, interp.CallHandled(1)
+		}
+		return nil, interp.CallHandled(0)
 	}
 	return fastCallOverride(ctx, hc, args)
 }
 
-// trackedJob is one external process started by this shell.
+// trackedJob is one external child process or in-process background job started by this shell.
 type trackedJob struct {
-	id      int
-	pid     int
-	argv    []string
-	cmd     *exec.Cmd
-	proc    *os.Process
-	done    chan struct{}
-	code    int // exit code once done; -1 while running
-	err     error
-	started time.Time
+	id       int
+	pid      int
+	argv     []string
+	cmd      *exec.Cmd
+	proc     *os.Process
+	cancel   context.CancelFunc
+	killExit atomic.Int32
+	done     chan struct{}
+	code     int // exit code once done; -1 while running
+	err      error
+	started  time.Time
 }
 
 // jobTable is a registry of external children for a shell session or process.
@@ -203,6 +222,40 @@ func (t *jobTable) track(cmd *exec.Cmd, argv []string) *trackedJob {
 	return j
 }
 
+// trackInProcess registers an in-process background builtin/command so `jobs`,
+// `fg`, `bg`, `kill %n`, `wait %n`, and `Session.Close()` work identically in
+// embedded/jailed sessions where re-execing `os.Executable()` is disabled.
+func (t *jobTable) trackInProcess(argv []string, cancel context.CancelFunc) (*trackedJob, func(code int, err error)) {
+	t.sweep(0)
+	j := &trackedJob{
+		argv:    append([]string(nil), argv...),
+		cancel:  cancel,
+		done:    make(chan struct{}),
+		code:    -1,
+		started: time.Now(),
+	}
+	t.mu.Lock()
+	if len(t.jobs) == 0 {
+		j.id = 1
+	} else {
+		j.id = t.jobs[len(t.jobs)-1].id + 1
+	}
+	t.jobs = append(t.jobs, j)
+	t.mu.Unlock()
+	var once sync.Once
+	finish := func(code int, err error) {
+		once.Do(func() {
+			if kx := j.killExit.Load(); kx > 0 && (code == 130 || code == 143) {
+				code = int(kx)
+			}
+			j.code = code
+			j.err = err
+			close(j.done)
+		})
+	}
+	return j, finish
+}
+
 // sweep drops finished jobs, keeping at most keepRecent completions.
 // Waiters hold the *trackedJob pointer, so codes stay readable after
 // the entry leaves the table; with keepRecent=0 every observe/track
@@ -257,8 +310,11 @@ func (t *jobTable) byFakeID(id string) *trackedJob {
 	return t.byIndex(n)
 }
 
-// byPID resolves a real pid string to the newest matching job.
+// byPID resolves a real pid (> 0) to the newest matching job.
 func (t *jobTable) byPID(pid int) *trackedJob {
+	if pid <= 0 {
+		return nil
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	for i := len(t.jobs) - 1; i >= 0; i-- {
@@ -304,7 +360,7 @@ func (t *jobTable) byIndex(n int) *trackedJob {
 	return nil
 }
 
-// alive reports whether the job's process is still running.
+// alive reports whether the job's process or goroutine is still running.
 func (j *trackedJob) alive() bool {
 	if j == nil {
 		return false
@@ -315,6 +371,79 @@ func (j *trackedJob) alive() bool {
 	default:
 		return true
 	}
+}
+
+// canSignal reports whether j can be signaled via OS process or context cancel.
+func (j *trackedJob) canSignal() bool {
+	return j != nil && (j.proc != nil || j.cancel != nil)
+}
+
+// kill delivers sig to an OS child process or cancels an in-process background job.
+func (j *trackedJob) kill(sig string) error {
+	if j == nil || !j.alive() {
+		return os.ErrProcessDone
+	}
+	if j.proc != nil {
+		return killProc(j.proc, sig)
+	}
+	if j.cancel != nil {
+		switch sig {
+		case "0", "CHLD", "CLD", "CONT", "URG", "WINCH", "IO", "POLL":
+			return nil
+		}
+		if ec := portableSelfSignalExitCode(sig); ec > 0 {
+			j.killExit.CompareAndSwap(0, int32(ec))
+		} else {
+			j.killExit.CompareAndSwap(0, 143)
+		}
+		j.cancel()
+		return nil
+	}
+	return os.ErrProcessDone
+}
+
+// hasLive reports whether t currently tracks at least one still-running job.
+func (t *jobTable) hasLive() bool {
+	if t == nil {
+		return false
+	}
+	t.waitForLaunch()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for _, j := range t.jobs {
+		if j.alive() {
+			return true
+		}
+	}
+	return false
+}
+
+// terminateAll terminates all live jobs in t and waits briefly for them to exit.
+func (t *jobTable) terminateAll() {
+	if t == nil {
+		return
+	}
+	t.waitForLaunch()
+	t.mu.Lock()
+	jobs := append([]*trackedJob(nil), t.jobs...)
+	t.mu.Unlock()
+	for _, j := range jobs {
+		if j.alive() {
+			_ = j.kill("KILL")
+		}
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for _, j := range jobs {
+		rem := time.Until(deadline)
+		if rem <= 0 {
+			break
+		}
+		select {
+		case <-j.done:
+		case <-time.After(rem):
+		}
+	}
+	t.sweep(0)
 }
 
 // waitForLaunch waits only while an actual `&` background subshell is in the
@@ -401,19 +530,13 @@ func (t *jobTable) resolveJobSpec(arg string) *trackedJob {
 	return nil
 }
 
-// trackExec is an exec middleware kept for chain completeness and per-session
-// job/capability isolation when a custom JobTable or CapabilityHook is active.
+// trackExec waits on any `<(cmd)` process-substitution producers referenced in
+// args before handing off to the next exec handler (extraHandler / Session.execMiddleware),
+// which performs capability checks and per-session JobTable tracking.
 func trackExec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	return func(ctx context.Context, args []string) error {
 		for _, a := range args[1:] {
 			waitProcSubstProducerCtx(ctx, a)
-		}
-		jt := jobsFromContext(ctx)
-		if (jt != globalJobs || CapabilityHookFromContext(ctx) != nil) &&
-			len(args) > 0 && !interp.IsBuiltin(args[0]) && lookupExtra(args[0]) == nil {
-			if err, handled := runExternalTrackedInTable(ctx, jt, args); handled {
-				return err
-			}
 		}
 		return next(ctx, args)
 	}
@@ -432,6 +555,16 @@ func jailedOpenHandler(ctx context.Context, path string, flag int, perm os.FileM
 		return sharedDevNull, nil
 	}
 	hc := interp.HandlerCtx(ctx)
+	if rwc, ok, err := tryOpenActiveProcSubst(ctx, resolveHostPath(hc.Dir, path), flag); ok {
+		if err != nil {
+			var pe *os.PathError
+			if !errors.As(err, &pe) {
+				return nil, &os.PathError{Op: "open", Path: path, Err: err}
+			}
+			return nil, err
+		}
+		return rwc, nil
+	}
 	f, err := fsOpenFile(ctx, hc.Dir, "open", path, flag, perm)
 	if err != nil {
 		var pe *os.PathError
@@ -510,113 +643,6 @@ func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin 
 		return err
 	}
 	return r.Run(ctx, file)
-}
-
-func runExternalTrackedInTable(ctx context.Context, jt *jobTable, args []string) (error, bool) {
-	hc := interp.HandlerCtx(ctx)
-	var alreadyCheckedCanon string
-	var checkedBin string
-	if isAbsOrRel(args[0]) {
-		cb, cerr := checkExec(ctx, args[0], args[0], args, hc.Dir)
-		if cerr != nil {
-			if hc.InBackground() {
-				hc.ReportBgStart(0)
-			}
-			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
-			return interp.NewExitStatus(126), true
-		}
-		alreadyCheckedCanon, _ = canonicalizeForCheck(resolveHostPath(hc.Dir, args[0]))
-		checkedBin = cb
-	}
-	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
-	if err != nil {
-		if isAbsOrRel(args[0]) {
-			if hc.InBackground() {
-				hc.ReportBgStart(0)
-			}
-			resolved := resolveHostPath(hc.Dir, args[0])
-			if fi, serr := os.Stat(resolved); serr == nil {
-				if fi.IsDir() {
-					fmt.Fprintf(hc.Stderr, "%s: Is a directory\n", args[0])
-				} else {
-					fmt.Fprintf(hc.Stderr, "%s: Permission denied\n", args[0])
-				}
-				return interp.NewExitStatus(126), true
-			}
-			fmt.Fprintf(hc.Stderr, "%s: No such file or directory\n", args[0])
-			return interp.NewExitStatus(127), true
-		}
-		return nil, false
-	}
-	pathCanon, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
-	if alreadyCheckedCanon == "" || !sameCleanPath(pathCanon, alreadyCheckedCanon) {
-		cb, cerr := checkExec(ctx, args[0], path, args, hc.Dir)
-		if cerr != nil {
-			if hc.InBackground() {
-				hc.ReportBgStart(0)
-			}
-			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
-			return interp.NewExitStatus(126), true
-		}
-		checkedBin = cb
-	} else if CapabilityHookFromContext(ctx) == nil {
-		checkedBin = path
-	}
-
-	newCmd := func() (*exec.Cmd, func(), func()) {
-		c := exec.CommandContext(ctx, checkedBin, args[1:]...)
-		c.Dir = hc.Dir
-		c.Stdin = hc.Stdin
-		c.Stdout = hc.Stdout
-		c.Stderr = hc.Stderr
-		c.Env = shellExecEnv(hc)
-		as, aw := interp.PrepareExecStdio(c)
-		return c, as, aw
-	}
-	cmd, afterStart, afterWait := newCmd()
-	err = cmd.Start()
-	for delay := time.Millisecond; err != nil && isExecTextBusy(err) && delay < 300*time.Millisecond; delay *= 2 {
-		afterWait()
-		time.Sleep(delay)
-		cmd, afterStart, afterWait = newCmd()
-		err = cmd.Start()
-	}
-	if err != nil {
-		afterWait()
-		if isExecFormatError(err) {
-			if hc.InBackground() {
-				hc.ReportBgStart(0)
-			}
-			return runJailedENOEXEC(ctx, hc, checkedBin, args), true
-		}
-		if hc.InBackground() {
-			hc.ReportBgStart(0)
-		}
-		fmt.Fprintf(hc.Stderr, "%v\n", err)
-		var execErr *exec.Error
-		if errors.As(err, &execErr) || os.IsNotExist(err) {
-			return interp.NewExitStatus(127), true
-		}
-		return interp.NewExitStatus(126), true
-	}
-	afterStart()
-	defer afterWait()
-	hc.ReportBgStart(cmd.Process.Pid)
-	j := jt.track(cmd, args)
-	<-j.done
-	if j.err != nil {
-		if isPipeClosed(j.err) {
-			return nil, true
-		}
-		if ee, ok := j.err.(*exec.ExitError); ok {
-			if code := signalExitCode(ee); code >= 0 {
-				return interp.NewExitStatus(uint8(code)), true
-			}
-			return interp.NewExitStatus(uint8(ee.ExitCode())), true
-		}
-		return j.err, true
-	}
-	return nil, true
 }
 
 // trackCmd starts an external command with job-table tracking. Used by
@@ -745,4 +771,94 @@ func cmdWaitTracked(ctx context.Context, args []string) (int, bool) {
 		return 0, false
 	}
 	return code, true
+}
+
+func parseFgBgSpec(cmdName string, stderr io.Writer, args []string) (specs []string, ok bool) {
+	endOpts := false
+	for _, a := range args[1:] {
+		if !endOpts {
+			if a == "--" {
+				endOpts = true
+				continue
+			}
+			if strings.HasPrefix(a, "-") && a != "-" {
+				fmt.Fprintf(stderr, "%s: %s: invalid option\n", cmdName, a)
+				return nil, false
+			}
+		}
+		specs = append(specs, a)
+	}
+	return specs, true
+}
+
+// cmdFgCtx implements `fg [jobspec]` against the session's JobTable in ctx.
+func cmdFgCtx(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	specs, ok := parseFgBgSpec("fg", hc.Stderr, args)
+	if !ok {
+		return exitError{2}
+	}
+	jt := jobsFromContext(ctx)
+	spec := "%%"
+	label := "current"
+	if len(specs) > 0 {
+		spec = specs[0]
+		label = spec
+	}
+	j := jt.resolveJobSpec(spec)
+	if j == nil || !j.alive() {
+		fmt.Fprintf(hc.Stderr, "fg: %s: no such job\n", label)
+		return exitError{1}
+	}
+	fmt.Fprintln(hc.Stdout, strings.Join(j.argv, " "))
+	if j.proc != nil && runtime.GOOS != "windows" {
+		_ = killProc(j.proc, "CONT")
+	}
+	select {
+	case <-j.done:
+		code := j.code
+		jt.sweep(0)
+		if code != 0 {
+			if code < 0 {
+				code = 1
+			}
+			return exitError{code}
+		}
+		return nil
+	case <-ctx.Done():
+		_ = j.kill("INT")
+		return exitError{130}
+	}
+}
+
+// cmdBgCtx implements `bg [jobspec...]` against the session's JobTable in ctx.
+func cmdBgCtx(ctx context.Context, hc interp.HandlerContext, args []string) error {
+	specs, ok := parseFgBgSpec("bg", hc.Stderr, args)
+	if !ok {
+		return exitError{2}
+	}
+	jt := jobsFromContext(ctx)
+	if len(specs) == 0 {
+		specs = []string{"%%"}
+	}
+	code := 0
+	for _, spec := range specs {
+		label := spec
+		if spec == "%%" && len(args) == 1 {
+			label = "current"
+		}
+		j := jt.resolveJobSpec(spec)
+		if j == nil || !j.alive() {
+			fmt.Fprintf(hc.Stderr, "bg: %s: no such job\n", label)
+			code = 1
+			continue
+		}
+		if j.proc != nil && runtime.GOOS != "windows" {
+			_ = killProc(j.proc, "CONT")
+		}
+		fmt.Fprintf(hc.Stdout, "[%d]+ %s &\n", j.id, strings.Join(j.argv, " "))
+	}
+	if code != 0 {
+		return exitError{code}
+	}
+	return nil
 }

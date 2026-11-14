@@ -112,9 +112,9 @@ func cmdKillNetproc(ctx context.Context, hc interp.HandlerContext, args []string
 		// and jobspecs (%1, %%/\%+, \%-, \%name, \%?substr).
 		// Only signal or exempt from checkProc while j.alive() is true so a
 		// reaped child's recycled OS PID can never be signaled without OpProc.
-		if j := jt.resolveJobSpec(p); j != nil && j.proc != nil {
+		if j := jt.resolveJobSpec(p); j != nil && j.canSignal() {
 			if j.alive() {
-				if err := killProc(j.proc, sig); err != nil {
+				if err := j.kill(sig); err != nil {
 					fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", j.pid, killErrText(err))
 					code = 1
 				}

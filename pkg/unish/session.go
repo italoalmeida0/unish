@@ -245,10 +245,13 @@ type Session struct {
 	currentCancel context.CancelFunc
 	cancelledByUs *atomic.Bool
 	closed        bool
+	sessCtx       context.Context
+	sessCancel    context.CancelFunc
 
-	runner *interp.Runner
-	jail   *Jail
-	hook   CapabilityHook
+	runner   *interp.Runner
+	jail     *Jail
+	hook     CapabilityHook
+	jobTable *JobTable
 
 	inheritEnv    bool
 	scrubPatterns []string
@@ -314,9 +317,13 @@ func NewSession(opts ...SessionOption) (*Session, error) {
 		envPairs = append(envPairs, k+"="+envMap[k])
 	}
 
+	sessCtx, sessCancel := context.WithCancel(context.Background())
 	s := &Session{
+		sessCtx:       sessCtx,
+		sessCancel:    sessCancel,
 		jail:          jail,
 		hook:          wrapCapabilityHookForDenials(hook),
+		jobTable:      NewJobTable(),
 		inheritEnv:    cfg.InheritEnv,
 		scrubPatterns: scrub,
 		baseEnv:       envMap,
@@ -763,13 +770,15 @@ func (s *Session) CancelCurrent() bool {
 	return true
 }
 
-// Close cancels any in-flight execution, waits for the Runner to quiesce, and
-// marks the Session closed. Close is idempotent.
+// Close cancels any in-flight execution, terminates remaining background jobs
+// owned by the Session, waits for the Runner to quiesce, and marks the Session
+// closed. Close is idempotent.
 func (s *Session) Close() error {
 	s.cancelMu.Lock()
 	s.closed = true
 	cancel := s.currentCancel
 	cancelledFlag := s.cancelledByUs
+	sessCancel := s.sessCancel
 	s.cancelMu.Unlock()
 	if cancelledFlag != nil {
 		cancelledFlag.Store(true)
@@ -777,7 +786,16 @@ func (s *Session) Close() error {
 	if cancel != nil {
 		cancel()
 	}
+	if sessCancel != nil {
+		sessCancel()
+	}
+	if s.jobTable != nil {
+		s.jobTable.terminateAll()
+	}
 	s.execMu.Lock()
+	if s.jobTable != nil {
+		s.jobTable.terminateAll()
+	}
 	unregisterRunnerCompletionHook(s.runner)
 	unregisterRunnerEnvIsolated(s.runner)
 	s.stdinProxy.setReader(nil)
@@ -785,6 +803,31 @@ func (s *Session) Close() error {
 	s.stderrProxy.reset(nil)
 	s.execMu.Unlock()
 	return nil
+}
+
+func (s *Session) sessionJobs(ctx context.Context) *JobTable {
+	if s.jobTable != nil {
+		return s.jobTable
+	}
+	return jobsFromContext(ctx)
+}
+
+func hasBackgroundStmt(prog *syntax.File) bool {
+	if prog == nil {
+		return false
+	}
+	found := false
+	syntax.Walk(prog, func(n syntax.Node) bool {
+		if found || n == nil {
+			return false
+		}
+		if st, ok := n.(*syntax.Stmt); ok && st.Background {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
 }
 
 func (s *Session) isClosed() bool {
@@ -812,9 +855,18 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 	}
 
 	start := time.Now()
-	execCtx := ctx
+	baseCtx := s.sessCtx
+	if baseCtx == nil {
+		baseCtx = context.Background()
+	}
+	execCtx := baseCtx
 	if s.hook != nil {
 		execCtx = WithCapabilityHook(execCtx, s.hook)
+	} else if h := CapabilityHookFromContext(ctx); h != nil {
+		execCtx = WithCapabilityHook(execCtx, h)
+	}
+	if s.jobTable != nil {
+		execCtx = WithJobTable(execCtx, s.jobTable)
 	}
 	execCtx = withSessionInContext(execCtx, s)
 	execCtx = withChdirApprovalStore(execCtx)
@@ -823,18 +875,38 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 	}
 	execCtx, dc := withDenialCollector(execCtx)
 
-	var timeoutCancel context.CancelFunc
-	if opts.Timeout > 0 {
-		execCtx, timeoutCancel = context.WithTimeout(execCtx, opts.Timeout)
-		defer timeoutCancel()
-	}
-
 	execCtx, cancel := context.WithCancel(execCtx)
 	cancelledByUs := &atomic.Bool{}
+	timedOut := &atomic.Bool{}
+
+	stopCallerWatch := context.AfterFunc(ctx, func() {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			timedOut.Store(true)
+		}
+		cancel()
+	})
+	if ctx.Err() != nil {
+		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+			timedOut.Store(true)
+		}
+		cancel()
+	}
+
+	var timeoutTimer *time.Timer
+	if opts.Timeout > 0 {
+		timeoutTimer = time.AfterFunc(opts.Timeout, func() {
+			timedOut.Store(true)
+			cancel()
+		})
+	}
 
 	s.cancelMu.Lock()
 	if s.closed {
 		s.cancelMu.Unlock()
+		if timeoutTimer != nil {
+			timeoutTimer.Stop()
+		}
+		stopCallerWatch()
 		cancel()
 		return nil, ErrSessionClosed
 	}
@@ -842,12 +914,20 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 	s.cancelledByUs = cancelledByUs
 	s.cancelMu.Unlock()
 
+	keepBgAlive := false
 	defer func() {
+		if timeoutTimer != nil {
+			timeoutTimer.Stop()
+		}
+		stopCallerWatch()
 		s.cancelMu.Lock()
 		s.currentCancel = nil
 		s.cancelledByUs = nil
+		closedNow := s.closed
 		s.cancelMu.Unlock()
-		cancel()
+		if closedNow || !keepBgAlive || cancelledByUs.Load() || timedOut.Load() || ctx.Err() != nil {
+			cancel()
+		}
 		s.stdinProxy.setReader(nil)
 		s.stdoutProxy.reset(nil)
 		s.stderrProxy.reset(nil)
@@ -906,6 +986,7 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 		}, parseErr
 	}
 
+	hasBg := hasBackgroundStmt(prog)
 	var runErr error
 	exitCode := 0
 	if len(prog.Stmts) == 0 {
@@ -923,7 +1004,11 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 				break
 			}
 		}
-		exitCode, runErr = classifyStmtOutcome(runErr, execCtx, cancelledByUs.Load())
+		if (hasBg || (s.jobTable != nil && s.jobTable.hasLive())) &&
+			execCtx.Err() == nil && !cancelledByUs.Load() && !timedOut.Load() {
+			keepBgAlive = true
+		}
+		exitCode, runErr = classifyStmtOutcome(runErr, execCtx, cancelledByUs.Load(), timedOut.Load())
 		s.lastExit.Store(int32(exitCode))
 	}
 	s.storeCwd(s.runner.Dir)
@@ -939,9 +1024,12 @@ func (s *Session) ExecWith(ctx context.Context, script string, opts ExecOptions)
 	return res, runErr
 }
 
-func classifyStmtOutcome(err error, execCtx context.Context, cancelledByUs bool) (int, error) {
+func classifyStmtOutcome(err error, execCtx context.Context, cancelledByUs, timedOut bool) (int, error) {
 	if cancelledByUs {
 		return 130, context.Canceled
+	}
+	if timedOut {
+		return 124, context.DeadlineExceeded
 	}
 	if ctxErr := execCtx.Err(); ctxErr != nil {
 		if errors.Is(ctxErr, context.DeadlineExceeded) {
@@ -972,6 +1060,12 @@ func (s *Session) openHandler(ctx context.Context, path string, flag int, perm o
 		return sharedDevNull, nil
 	}
 	mc := interp.HandlerCtx(ctx)
+	if rwc, ok, err := tryOpenActiveProcSubst(ctx, resolveHostPath(mc.Dir, path), flag); ok {
+		if err != nil {
+			return nil, ensurePathError("open", path, err)
+		}
+		return rwc, nil
+	}
 	maskedPerm := perm &^ os.FileMode(s.umask.Load())
 	f, err := fsOpenFile(withApprovalMemo(ctx), mc.Dir, "open", path, flag, maskedPerm)
 	if err != nil {
@@ -1278,6 +1372,12 @@ func (s *Session) callHandler(ctx context.Context, args []string) ([]string, err
 				return s.handleSessionSourceCall(ctx, hc, args[1:], args[:1])
 			case "kill":
 				return s.handleSessionKill(ctx, hc, args[1:])
+			case "jobs", "fg", "bg", "wait":
+				replaced, err := callOverride(ctx, args[1:])
+				if err != nil {
+					return nil, err
+				}
+				return append([]string{"builtin"}, replaced...), nil
 			case "type":
 				if CapabilityHookFromContext(ctx) != nil {
 					return s.handleJailedTypeCall(ctx, hc, args[1:])
@@ -1313,6 +1413,15 @@ func (s *Session) callHandler(ctx context.Context, args []string) ([]string, err
 				return s.handleSessionSourceCall(ctx, hc, sub, prefix)
 			case "kill":
 				return s.handleSessionKill(ctx, hc, sub)
+			case "jobs", "fg", "bg", "wait":
+				replaced, err := callOverride(ctx, sub)
+				if err != nil {
+					return nil, err
+				}
+				out := make([]string, 0, len(prefix)+len(replaced))
+				out = append(out, prefix...)
+				out = append(out, replaced...)
+				return out, nil
 			case "type":
 				if CapabilityHookFromContext(ctx) != nil {
 					return s.handleJailedTypeCall(ctx, hc, sub)
@@ -1946,10 +2055,12 @@ func (s *Session) runSessionKill(ctx context.Context, hc interp.HandlerContext, 
 				continue
 			}
 
-			// 3. Positive PID: exempt live tracked child jobs; dead/reaped jobs fall
-			// through to checkProc so OS-reused PIDs cannot bypass OpProc.
-			if j := globalJobs.byPID(pid); j != nil && j.alive() && j.proc != nil {
-				if err := killProc(j.proc, sig); err != nil {
+			// 3. Positive PID: exempt live tracked child jobs in this Session's JobTable;
+			// dead/reaped jobs and other sessions' PIDs fall through to checkProc so
+			// OS-reused or cross-session PIDs cannot bypass OpProc.
+			jt := s.sessionJobs(ctx)
+			if j := jt.byPID(pid); j != nil && j.alive() && j.canSignal() {
+				if err := j.kill(sig); err != nil {
 					fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", pid, err)
 					code = 1
 				}
@@ -1978,14 +2089,15 @@ func (s *Session) runSessionKill(ctx context.Context, hc interp.HandlerContext, 
 			continue
 		}
 
-		// 4. Jobspec (%1, %%, %+) or fake background ID (g1): require live job!
-		if j := globalJobs.resolveJobSpec(op); j != nil {
-			if !j.alive() || j.proc == nil {
+		// 4. Jobspec (%1, %%, %+) or fake background ID (g1): require live job in this Session!
+		jt := s.sessionJobs(ctx)
+		if j := jt.resolveJobSpec(op); j != nil {
+			if !j.alive() || !j.canSignal() {
 				fmt.Fprintf(hc.Stderr, "kill: (%s) - No such process\n", op)
 				code = 1
 				continue
 			}
-			if err := killProc(j.proc, sig); err != nil {
+			if err := j.kill(sig); err != nil {
 				fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", j.pid, err)
 				code = 1
 			}
@@ -2347,7 +2459,7 @@ func (s *Session) runIsolatedExternal(ctx context.Context, hc interp.HandlerCont
 	afterStart()
 	defer afterWait()
 	hc.ReportBgStart(cmd.Process.Pid)
-	j := globalJobs.track(cmd, args)
+	j := s.sessionJobs(ctx).track(cmd, args)
 	if CapabilityHookFromContext(ctx) == nil {
 		hashRecord(args[0], binPath)
 	}
@@ -2363,6 +2475,9 @@ func (s *Session) runIsolatedExternal(ctx context.Context, hc interp.HandlerCont
 			return interp.ExitStatus(130)
 		}
 		if ee, ok := j.err.(*exec.ExitError); ok {
+			if code := signalExitCode(ee); code >= 0 {
+				return interp.ExitStatus(uint8(code))
+			}
 			return interp.ExitStatus(uint8(ee.ExitCode()))
 		}
 		return j.err
