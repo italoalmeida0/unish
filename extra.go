@@ -137,6 +137,15 @@ func init() {
 
 	interp.RegisterFastCallHandler(callOverride, isOverriddenCall, fastCallOverride)
 	interp.RegisterFastOpenDevNull(shellOpenHandlerFn, sharedDevNull)
+	interp.SetMemPipeDenyFilter(isChildSpawningExtra)
+}
+
+func isChildSpawningExtra(name string) bool {
+	switch name {
+	case "env", "nice", "nohup", "timeout", "find", "xargs", "watch", "flock":
+		return true
+	}
+	return false
 }
 
 func lookupExtra(name string) *extraCmd {
@@ -171,6 +180,11 @@ func invokeExtra(ctx context.Context, hc interp.HandlerContext, cmd *extraCmd, a
 	}
 	if hc.Stdin == nil {
 		hc.Stdin = strings.NewReader("")
+	} else if isChildSpawningExtra(args[0]) {
+		if osIn, cleanup := interp.BridgeStdinPipeToOS(hc.Stdin); osIn != nil {
+			hc.Stdin = osIn
+			defer cleanup()
+		}
 	}
 	if args[0] == "ls" {
 		lsColorMu.Lock()

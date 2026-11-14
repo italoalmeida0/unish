@@ -1396,8 +1396,8 @@ func (r *Runner) acquireCmdSubstSubshell() (*Runner, *overlayEnviron) {
 	return r2, oenv
 }
 
-func releaseCmdSubstSubshell(r2 *Runner, oenv *overlayEnviron) {
-	if len(r2.bgProcs) > 0 {
+func releaseCmdSubstSubshell(r2 *Runner, oenv *overlayEnviron, sharedStdout bool) {
+	if len(r2.bgProcs) > 0 || sharedStdout {
 		return
 	}
 	oenv.parent = nil
@@ -1410,6 +1410,19 @@ func releaseCmdSubstSubshell(r2 *Runner, oenv *overlayEnviron) {
 	cmdSubstRunnerPool.Put(r2)
 }
 
+func markConcurrentWriter(w io.Writer) {
+	for {
+		nw, ok := w.(nopCloseWriter)
+		if !ok {
+			break
+		}
+		w = nw.w
+	}
+	if cb, ok := w.(expand.ConcurrentBufferWriter); ok {
+		cb.MarkConcurrentStdout()
+	}
+}
+
 // subshell is like [Runner.Subshell], but allows skipping some allocations and copies
 // when creating subshells which will not be used concurrently with the parent shell.
 // TODO(v4): rename Subshell to Clone, making its deep copy explicit and
@@ -1419,9 +1432,19 @@ func (r *Runner) subshell(background bool) *Runner {
 	if !r.didReset {
 		r.Reset()
 	}
+	if background {
+		markConcurrentWriter(r.stdout)
+		markConcurrentWriter(r.stderr)
+		for _, fw := range r.extraFds {
+			markConcurrentWriter(fw)
+		}
+	}
 	r2 := &Runner{}
 	oenv := newOverlayEnviron(r.writeEnv, background)
 	r.initSubshellFields(r2, oenv)
+	if background && len(r.Params) > 0 {
+		r2.Params = slices.Clone(r.Params)
+	}
 	return r2
 }
 

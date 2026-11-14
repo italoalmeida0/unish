@@ -6,8 +6,10 @@
 package interp
 
 import (
+	"bytes"
 	"io"
 	"os"
+	"strings"
 	"time"
 
 	"golang.org/x/term"
@@ -48,16 +50,27 @@ func newOSPipe() (stdinFile, io.WriteCloser, error) {
 }
 
 // newStdinFile converts a reader into the runner's stdin. [*os.File] and
-// [StdinPipe] values are preserved directly so subprocesses inherit real OS
-// files without copying when redirected from disk.
+// [StdinPipe] values are preserved directly, and finite in-memory readers avoid
+// OS pipe allocation; arbitrary streaming readers use an OS pipe so external
+// subprocesses inherit a real OS fd without blocking cmd.Wait().
 func newStdinFile(r io.Reader) (stdinFile, error) {
 	switch r := r.(type) {
 	case nil:
 		return nil, nil
 	case stdinFile:
 		return r, nil
-	default:
+	case *strings.Reader, *bytes.Reader, *bytes.Buffer:
 		return readerStdin{r}, nil
+	default:
+		pr, pw, err := os.Pipe()
+		if err != nil {
+			return nil, err
+		}
+		go func() {
+			_, _ = io.Copy(pw, r)
+			_ = pw.Close()
+		}()
+		return pr, nil
 	}
 }
 

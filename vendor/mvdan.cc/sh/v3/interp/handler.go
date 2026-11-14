@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -411,7 +412,7 @@ func runScriptENOEXEC(ctx context.Context, hc HandlerContext, killTimeout time.D
 	if err != nil {
 		return err
 	}
-	r.Params = args[1:]
+	r.Params = slices.Clone(args[1:])
 	return r.Run(ctx, file)
 }
 

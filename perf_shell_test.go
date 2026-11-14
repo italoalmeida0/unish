@@ -7,12 +7,14 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
 	"mvdan.cc/sh/v3/syntax"
 )
@@ -516,6 +518,228 @@ func TestPerfShellPrintfAndExpansionFastPaths(t *testing.T) {
 	out, stderr, code = perfTestRunScript(t, `printf '%d\n' 12 nope`)
 	if code != 1 || out != "12\n0\n" || stderr == "" {
 		t.Fatalf("printf invalid int => code=%d out=%q stderr=%q", code, out, stderr)
+	}
+}
+
+type syncTestBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (s *syncTestBuffer) Write(p []byte) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.Write(p)
+}
+
+func (s *syncTestBuffer) String() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.buf.String()
+}
+
+func TestPerfShellBgParamsNoAlias(t *testing.T) {
+	tmp := t.TempDir()
+	srcFile := filepath.ToSlash(filepath.Join(tmp, "sourced_bg.sh"))
+	if err := os.WriteFile(srcFile, []byte("( sleep 0.06; echo \"src_bg=$1:$2\" ) &\n"), 0o644); err != nil {
+		t.Fatalf("write sourced script: %v", err)
+	}
+
+	var outBuf, errBuf syncTestBuffer
+	r := perfTestNewRunner(t, &outBuf, &errBuf)
+	script := `
+		f() { ( sleep 0.06; echo "bg=$1:$2:$*" ) & }
+		f HELLO WORLD
+		: overwrite1 overwrite2 overwrite3
+		wait
+		. "` + srcFile + `" SOURCED_ARG SECOND_ARG
+		: clear_buf1 clear_buf2 clear_buf3
+		wait
+	`
+	prog, err := syntax.NewParser().Parse(strings.NewReader(script), "bg_params")
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := r.Run(ctx, prog); err != nil {
+		t.Fatalf("run: %v (stderr=%q)", err, errBuf.String())
+	}
+	want := "bg=HELLO:WORLD:HELLO WORLD\nsrc_bg=SOURCED_ARG:SECOND_ARG\n"
+	if got := outBuf.String(); got != want {
+		t.Fatalf("bg params output = %q, want %q", got, want)
+	}
+}
+
+func TestPerfShellCmdSubstBgNoLeakOrRace(t *testing.T) {
+	out, stderr, code := perfTestRunScript(t, `
+		x=$( (sleep 0.04; printf LEAKED_) & printf ok )
+		y=$( sleep 0.08; printf clean )
+		a=$( ( (sleep 0.03; printf NESTED_LEAK) & ); printf first )
+		b=$( exec 3>&1; (sleep 0.03; printf FD3_LEAK >&3) & printf second )
+		c=$( sleep 0.07; printf pure )
+		wait
+		printf 'x=[%s] y=[%s] a=[%s] b=[%s] c=[%s]\n' "$x" "$y" "$a" "$b" "$c"
+	`)
+	want := "x=[ok] y=[clean] a=[first] b=[second] c=[pure]\n"
+	if code != 0 || out != want || stderr != "" {
+		t.Fatalf("cmdSubst bg leak check => code=%d out=%q want=%q stderr=%q", code, out, want, stderr)
+	}
+
+	// Concurrent stress across multiple goroutines sharing cmdSubstBufPool.
+	var wg sync.WaitGroup
+	for g := 0; g < 8; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 20; i++ {
+				gotOut, _, gotCode := perfTestRunScript(t, `
+					u=$( (printf BG) & printf FG )
+					v=$( printf CLEAN )
+					printf '%s' "$v"
+				`)
+				if gotCode != 0 || gotOut != "CLEAN" {
+					t.Errorf("concurrent cmdSubst => code=%d out=%q", gotCode, gotOut)
+					return
+				}
+				_ = gotOut
+			}
+		}()
+	}
+	wg.Wait()
+}
+
+func TestPerfShellNilConfigArithmAndLiteral(t *testing.T) {
+	parseWord := func(src string) *syntax.Word {
+		t.Helper()
+		p := syntax.NewParser()
+		var words []*syntax.Word
+		if err := p.Words(strings.NewReader(src), func(w *syntax.Word) bool {
+			words = append(words, w)
+			return true
+		}); err != nil || len(words) != 1 {
+			t.Fatalf("parseWord(%q): err=%v words=%d", src, err, len(words))
+		}
+		return words[0]
+	}
+
+	wVar := parseWord("$((x + 1))")
+	wNum := parseWord("$((2 + 3 * 4))")
+	wParam := parseWord("$unset_var")
+
+	for _, cfg := range []*expand.Config{nil, {}} {
+		got, err := expand.Literal(cfg, wVar)
+		if err != nil || got != "1" {
+			t.Fatalf("Literal(%v, $((x+1))) = %q, %v; want \"1\", nil", cfg, got, err)
+		}
+		got, err = expand.Literal(cfg, wNum)
+		if err != nil || got != "14" {
+			t.Fatalf("Literal(%v, $((2+3*4))) = %q, %v; want \"14\", nil", cfg, got, err)
+		}
+		got, err = expand.Literal(cfg, wParam)
+		if err != nil || got != "" {
+			t.Fatalf("Literal(%v, $unset_var) = %q, %v; want \"\", nil", cfg, got, err)
+		}
+		ae := wVar.Parts[0].(*syntax.ArithmExp)
+		n, err := expand.Arithm(cfg, ae.X)
+		if err != nil || n != 1 {
+			t.Fatalf("Arithm(%v, x+1) = %d, %v; want 1, nil", cfg, n, err)
+		}
+		fields, err := expand.Fields(cfg, wVar, wNum)
+		if err != nil || len(fields) != 2 || fields[0] != "1" || fields[1] != "14" {
+			t.Fatalf("Fields(%v) = %q, %v; want [1 14], nil", cfg, fields, err)
+		}
+	}
+}
+
+func TestPerfShellStreamingStdinAndWrappers(t *testing.T) {
+	if _, err := exec.LookPath("go"); err != nil {
+		t.Skip("go binary not in PATH")
+	}
+
+	// Part A: Streaming io.PipeReader passed to interp.StdIO must NOT hang
+	// external subprocesses that exit without draining stdin while pw stays open.
+	pr, pw := io.Pipe()
+	defer pw.Close()
+	go func() {
+		_, _ = pw.Write([]byte("undrained streaming bytes\n"))
+	}()
+
+	var outA, errA syncTestBuffer
+	r, err := interp.New(
+		interp.StdIO(pr, &outA, &errA),
+		interp.CallHandler(callOverride),
+		interp.OpenHandler(shellOpenHandler()),
+		interp.ExecHandlers(trackExec, extraHandler),
+	)
+	if err != nil {
+		t.Fatalf("interp.New: %v", err)
+	}
+	progA, _ := syntax.NewParser().Parse(strings.NewReader("go version\n"), "partA")
+	doneA := make(chan error, 1)
+	go func() {
+		doneA <- r.Run(context.Background(), progA)
+	}()
+	select {
+	case runErr := <-doneA:
+		if runErr != nil {
+			t.Fatalf("streaming StdIO external run failed: %v (stderr=%q)", runErr, errA.String())
+		}
+		if !strings.Contains(outA.String(), "go version") {
+			t.Fatalf("unexpected go version output: %q", outA.String())
+		}
+	case <-time.After(5 * time.Second):
+		_ = pw.Close()
+		t.Fatal("DEADLOCK: external command hung with open streaming io.PipeReader stdin")
+	}
+
+	// Also verify DefaultExecHandler directly with open io.PipeReader.
+	pr2, pw2 := io.Pipe()
+	defer pw2.Close()
+	var outDef syncTestBuffer
+	rDef, err := interp.New(interp.StdIO(pr2, &outDef, &outDef))
+	if err != nil {
+		t.Fatalf("interp.New default: %v", err)
+	}
+	doneDef := make(chan error, 1)
+	go func() {
+		doneDef <- rDef.Run(context.Background(), progA)
+	}()
+	select {
+	case runErr := <-doneDef:
+		if runErr != nil || !strings.Contains(outDef.String(), "go version") {
+			t.Fatalf("DefaultExecHandler streaming StdIO => err=%v out=%q", runErr, outDef.String())
+		}
+	case <-time.After(5 * time.Second):
+		_ = pw2.Close()
+		t.Fatal("DEADLOCK: DefaultExecHandler hung with open streaming io.PipeReader stdin")
+	}
+
+	// Part B: Infinite producer piped into child-spawning wrappers (env, nice,
+	// command nice, timeout, eval) running an external child that exits early.
+	wrapperScripts := []string{
+		`yes | env go version`,
+		`yes | nice go version`,
+		`yes | command nice go version`,
+		`yes | timeout 5 go version`,
+		`yes | eval "nice go version"`,
+	}
+	for _, sc := range wrapperScripts {
+		doneB := make(chan struct{})
+		var outB, errB string
+		var codeB int
+		go func(script string) {
+			defer close(doneB)
+			outB, errB, codeB = perfTestRunScript(t, script)
+		}(sc)
+		select {
+		case <-doneB:
+			if codeB != 0 || !strings.Contains(outB, "go version") {
+				t.Fatalf("wrapper pipeline %q => code=%d out=%q stderr=%q", sc, codeB, outB, errB)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("DEADLOCK on wrapper pipeline: %s", sc)
+		}
 	}
 }
 

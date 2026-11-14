@@ -82,7 +82,11 @@ func (e *expandEnv) ExpandCmdSubst(w io.Writer, cs *syntax.CmdSubst) error {
 	r2.stmts(ctx, cs.Stmts)
 	r2.finishSubshell(ctx)
 	exit := r2.exit
-	releaseCmdSubstSubshell(r2, oenv)
+	sharedStdout := false
+	if cb, ok := w.(expand.ConcurrentBufferWriter); ok && cb.IsConcurrentStdout() {
+		sharedStdout = true
+	}
+	releaseCmdSubstSubshell(r2, oenv, sharedStdout)
 	r.lastExpandExit = exit
 	if exit.fatalExit {
 		return exit.err // surface fatal errors immediately
@@ -1528,6 +1532,86 @@ func (r *Runner) stmts(ctx context.Context, stmts []*syntax.Stmt) {
 	}
 }
 
+func unwrapCallTarget(args []*syntax.Word) (lit string, bypassedFuncs bool, pureInProc bool) {
+	i := 0
+	for i < len(args) {
+		w := args[i].Lit()
+		if w == "" {
+			return "", bypassedFuncs, false
+		}
+		switch w {
+		case "command":
+			bypassedFuncs = true
+			i++
+			for i < len(args) {
+				opt := args[i].Lit()
+				if opt == "" {
+					return "", true, false
+				}
+				if opt == "--" {
+					i++
+					break
+				}
+				if len(opt) > 1 && opt[0] == '-' {
+					for j := 1; j < len(opt); j++ {
+						if opt[j] == 'v' || opt[j] == 'V' {
+							return "command", true, true
+						}
+						if opt[j] != 'p' {
+							return "", true, false
+						}
+					}
+					i++
+					continue
+				}
+				break
+			}
+			if i >= len(args) {
+				return "command", true, true
+			}
+			continue
+		case "builtin":
+			bypassedFuncs = true
+			i++
+			if i >= len(args) {
+				return "builtin", true, true
+			}
+			continue
+		case "exec":
+			bypassedFuncs = true
+			i++
+			for i < len(args) {
+				opt := args[i].Lit()
+				if opt == "" {
+					return "", true, false
+				}
+				if opt == "--" {
+					i++
+					break
+				}
+				if opt == "-c" || opt == "-l" {
+					i++
+					continue
+				}
+				if opt == "-a" {
+					i += 2
+					continue
+				}
+				if strings.HasPrefix(opt, "-") {
+					return "", true, false
+				}
+				break
+			}
+			if i >= len(args) {
+				return "exec", true, true
+			}
+			continue
+		}
+		return w, bypassedFuncs, false
+	}
+	return "", bypassedFuncs, false
+}
+
 func (r *Runner) stmtCanUseMemPipe(st *syntax.Stmt) bool {
 	if st == nil || st.Cmd == nil {
 		return true
@@ -1537,12 +1621,24 @@ func (r *Runner) stmtCanUseMemPipe(st *syntax.Stmt) bool {
 		if len(c.Args) == 0 {
 			return true
 		}
-		lit := c.Args[0].Lit()
+		lit, bypassedFuncs, pureInProc := unwrapCallTarget(c.Args)
+		if pureInProc {
+			return true
+		}
 		if lit == "" {
 			return false
 		}
-		if body := r.Funcs[lit]; body != nil {
-			return r.stmtAllInProcess(body, 0)
+		if !bypassedFuncs {
+			if body := r.Funcs[lit]; body != nil {
+				return r.stmtAllInProcess(body, 0)
+			}
+		}
+		switch lit {
+		case "eval", "source", ".":
+			return false
+		}
+		if memPipeDenied(lit) {
+			return false
 		}
 		return true
 	case *syntax.BinaryCmd:
@@ -1565,12 +1661,24 @@ func (r *Runner) stmtAllInProcess(st *syntax.Stmt, depth int) bool {
 		if len(c.Args) == 0 {
 			return true
 		}
-		lit := c.Args[0].Lit()
+		lit, bypassedFuncs, pureInProc := unwrapCallTarget(c.Args)
+		if pureInProc {
+			return true
+		}
 		if lit == "" {
 			return false
 		}
-		if body := r.Funcs[lit]; body != nil {
-			return r.stmtAllInProcess(body, depth+1)
+		if !bypassedFuncs {
+			if body := r.Funcs[lit]; body != nil {
+				return r.stmtAllInProcess(body, depth+1)
+			}
+		}
+		switch lit {
+		case "eval", "source", ".":
+			return false
+		}
+		if memPipeDenied(lit) {
+			return false
 		}
 		return IsBuiltin(lit) || (r.fastCallFilter != nil && r.fastCallFilter(lit))
 	case *syntax.Block:

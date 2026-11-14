@@ -20,6 +20,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"unicode/utf8"
 
@@ -307,6 +308,9 @@ func Literal(cfg *Config, word *syntax.Word) (string, error) {
 				return wp.Value, nil
 			}
 		case *syntax.ArithmExp:
+			if cfg == nil || cfg.Env == nil {
+				cfg = prepareConfig(cfg)
+			}
 			n, err := Arithm(cfg, wp.X)
 			if err != nil {
 				return "", err
@@ -945,6 +949,9 @@ func (cfg *Config) wordField(wps []syntax.WordPart, ql quoteLevel) ([]fieldPart,
 			}
 			field = append(field, fieldPart{val: val})
 		case *syntax.ArithmExp:
+			if cfg == nil || cfg.Env == nil {
+				cfg = prepareConfig(cfg)
+			}
 			n, err := Arithm(cfg, wp.X)
 			if err != nil {
 				return nil, err
@@ -968,31 +975,62 @@ func (cfg *Config) wordField(wps []syntax.WordPart, ql quoteLevel) ([]fieldPart,
 	return field, nil
 }
 
+// ConcurrentBufferWriter is implemented by command-substitution capture
+// buffers that switch from lock-free single-goroutine writes to mutex-guarded
+// writes when a background subshell inherits stdout.
+type ConcurrentBufferWriter interface {
+	MarkConcurrentStdout()
+	IsConcurrentStdout() bool
+}
+
+type cmdSubstBuffer struct {
+	buf    bytes.Buffer
+	shared atomic.Bool
+	mu     sync.Mutex
+	closed bool
+}
+
+func (w *cmdSubstBuffer) MarkConcurrentStdout() {
+	w.shared.Store(true)
+}
+
+func (w *cmdSubstBuffer) IsConcurrentStdout() bool {
+	return w.shared.Load()
+}
+
+func (w *cmdSubstBuffer) Write(p []byte) (int, error) {
+	if !w.shared.Load() {
+		return w.buf.Write(p)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return len(p), nil
+	}
+	return w.buf.Write(p)
+}
+
+func (w *cmdSubstBuffer) WriteString(s string) (int, error) {
+	if !w.shared.Load() {
+		return w.buf.WriteString(s)
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if w.closed {
+		return len(s), nil
+	}
+	return w.buf.WriteString(s)
+}
+
 var cmdSubstBufPool = sync.Pool{
 	New: func() any {
-		return bytes.NewBuffer(make([]byte, 0, 128))
+		w := &cmdSubstBuffer{}
+		w.buf.Grow(128)
+		return w
 	},
 }
 
-func (cfg *Config) cmdSubst(cs *syntax.CmdSubst) (string, error) {
-	if cfg.CmdSubst == nil && cfg.Callbacks == nil {
-		return "", UnexpectedCommandError{Node: cs}
-	}
-	buf := cmdSubstBufPool.Get().(*bytes.Buffer)
-	buf.Reset()
-	var err error
-	if cfg.CmdSubst != nil {
-		err = cfg.CmdSubst(buf, cs)
-	} else {
-		err = cfg.Callbacks.ExpandCmdSubst(buf, cs)
-	}
-	if err != nil {
-		if buf.Cap() <= 64*1024 {
-			cmdSubstBufPool.Put(buf)
-		}
-		return "", err
-	}
-	b := buf.Bytes()
+func cleanCmdSubstBytes(b []byte) string {
 	if bytes.IndexByte(b, 0) >= 0 {
 		w := 0
 		for _, c := range b {
@@ -1006,12 +1044,46 @@ func (cfg *Config) cmdSubst(cs *syntax.CmdSubst) (string, error) {
 	for len(b) > 0 && b[len(b)-1] == '\n' {
 		b = b[:len(b)-1]
 	}
-	var out string
-	if len(b) > 0 {
-		out = string(b)
+	if len(b) == 0 {
+		return ""
 	}
-	if buf.Cap() <= 64*1024 {
-		cmdSubstBufPool.Put(buf)
+	return string(b)
+}
+
+func (cfg *Config) cmdSubst(cs *syntax.CmdSubst) (string, error) {
+	if cfg.CmdSubst == nil && cfg.Callbacks == nil {
+		return "", UnexpectedCommandError{Node: cs}
+	}
+	w := cmdSubstBufPool.Get().(*cmdSubstBuffer)
+	w.buf.Reset()
+	var err error
+	if cfg.CmdSubst != nil {
+		err = cfg.CmdSubst(w, cs)
+	} else {
+		err = cfg.Callbacks.ExpandCmdSubst(w, cs)
+	}
+	if w.shared.Load() {
+		w.mu.Lock()
+		w.closed = true
+		var out string
+		if err == nil {
+			out = cleanCmdSubstBytes(w.buf.Bytes())
+		}
+		w.mu.Unlock()
+		if err != nil {
+			return "", err
+		}
+		return out, nil
+	}
+	if err != nil {
+		if w.buf.Cap() <= 64*1024 {
+			cmdSubstBufPool.Put(w)
+		}
+		return "", err
+	}
+	out := cleanCmdSubstBytes(w.buf.Bytes())
+	if w.buf.Cap() <= 64*1024 {
+		cmdSubstBufPool.Put(w)
 	}
 	return out, nil
 }
@@ -1135,6 +1207,9 @@ func (cfg *Config) wordFields(wps []syntax.WordPart) ([][]fieldPart, error) {
 			}
 			splitAdd(val)
 		case *syntax.ArithmExp:
+			if cfg == nil || cfg.Env == nil {
+				cfg = prepareConfig(cfg)
+			}
 			n, err := Arithm(cfg, wp.X)
 			if err != nil {
 				return nil, err

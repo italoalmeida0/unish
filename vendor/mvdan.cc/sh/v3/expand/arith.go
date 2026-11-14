@@ -20,6 +20,9 @@ import (
 // via intmax_t even on 32-bit systems, rather than the platform-dependent int.
 
 func Arithm(cfg *Config, expr syntax.ArithmExpr) (int, error) {
+	if cfg == nil || cfg.Env == nil {
+		cfg = prepareConfig(cfg)
+	}
 	switch expr := expr.(type) {
 	case *syntax.Word:
 		// Fast path: plain names and numeric literals dominate real
