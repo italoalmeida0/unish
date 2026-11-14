@@ -1,5 +1,83 @@
 # Changelog
 
+## 1.1.0 — 2026-11-14
+
+### Added
+
+- **Embedded POSIX / GNU `awk` (`gawk`) engine.** Full pure-Go AWK lexer
+  (context-sensitive `/re/` vs `/` division), recursive-descent AST parser,
+  and execution VM: `BEGIN`/`END` blocks (`exit` status preservation and
+  override), pattern/expression/range rules, `$0`/`$1..$NF` bidirectional
+  resplitting with mid-record `FS` snapshotting (`FS = ""` UTF-8 rune split,
+  single-char, default whitespace, ERE regex, and `RS = ""` paragraph mode),
+  strnum comparisons, multi-dimensional associative arrays (`SUBSEP`, `in`,
+  `delete`), user-defined recursive functions with local array/scalar
+  parameters, string/math/time builtins (`printf`/`sprintf` with exact
+  64-bit integer formatting and `+inf`/`-inf`/`nan`, `sub`/`gsub`/`gensub`,
+  `match`/`RSTART`/`RLENGTH`, `split`, `substr`, `index`, `systime`),
+  `getline`, output redirections, command pipes (`cmd | getline`,
+  `print | cmd`, `close(cmd)`), and `system(cmd)`.
+- **Embedded `jq` 1.7 JSON processor.** Pure-Go streaming JSON and filter
+  engine with exact 64-bit `int64` arithmetic and comparisons (preserving
+  Snowflake/GitHub IDs without 53-bit `float64` precision loss, promoting on
+  overflow, and passing >64-bit integers raw), insertion-ordered objects
+  (`-S` sorted), generator backtracking, full path and update assignments
+  (`=`, `|=`, `+=`, `-=`, `*=`, `//=`, `del(...)`, slice assignment, nested
+  auto-vivification), `try`/`catch`, `reduce`/`foreach`, recursive `def`
+  closures, string interpolation and formatters (`@uri`, `@base64`,
+  `@base64d`, `@csv`, `@tsv`, `@sh`, `@html`, `@json`, `@text`), regex
+  builtins (`test`, `match`, `capture`, `sub`, `gsub`, `splits`), and CLI
+  parity (`-r`, `-j`, `-0`, `-c`, `-s`, `-R`, `-n`, `-e`, `--arg`,
+  `--argjson`, `--slurpfile`, `--rawfile`, `--args`, `--jsonargs`, `$ENV`,
+  `$ARGS`).
+- **Agent & automation power toolkit (`rg`, `patch`, `bc`, `sponge`,
+  `flock`, `column`, `xxd`).**
+  - `rg`: parallel recursive search honoring hierarchical
+    `.gitignore`/`.ignore`/`.rgignore` rules (including negation `!`,
+    directory-only `/`, and anchored patterns), binary NUL skipping,
+    smart-case (`-S`), fixed-strings (`-F`), globs (`-g`), file types
+    (`-t`/`-T`), context lines (`-A`/`-B`/`-C`), `--files`, `--vimgrep`,
+    `$1` capture replacement (`-r`), and line-streaming `EPIPE` early exit.
+  - `patch`: unified diff applier supporting `-pN` path stripping, file
+    creation (`--- /dev/null`) and deletion (`+++ /dev/null`), fuzzy hunk
+    offset matching, `--dry-run`, `-R` reverse patches, `-N` forward
+    idempotence, `-b` backups, `-o` output redirection, and
+    `\ No newline at end of file` fidelity.
+  - `bc`: POSIX + GNU `bc` arbitrary-precision calculator (`math/big`) with
+    `-l` standard math library (`scale=20`, `s(x)`, `c(x)`, `a(x)`, `l(x)`,
+    `e(x)`, `j(n,x)`), `ibase`/`obase` (bases 2–16 with POSIX ordering),
+    arrays, control flow, and recursive `define` functions with `auto`
+    locals.
+  - `sponge`, `flock`, `column`, `xxd`: atomic soak-before-write `sponge`
+    (`-a` append) for safe in-place pipelines; cross-platform advisory
+    `flock` (`unix.Flock` / Windows `LockFileEx`, `-s`/`-x`/`-u`/`-n`/
+    `-w`/`-E`, lockfile + command and FD modes); UTF-8 and CJK
+    display-width-aware `column` (`-t`/`-s`/`-o`/`-n`/`-c`); and
+    canonical/plain/C-include/bits `xxd` hex dumper with binary `-r` and
+    `-r -p` reverse patching.
+
+### Performance
+
+- **Zero-allocation shell execution engine & pooled in-memory pipelines.**
+  Added single-pass `RegisterFastCallHandler` (`CallHandled`) and zero-alloc
+  `runTest` (`[`/`test`), `cmdPrintf`, `echo`, and virtual `/dev/null`
+  redirections; eliminated per-iteration heap allocations across arithmetic
+  loops (`$((...))`), parameter expansions (`${#v}`, `${v#pat}`,
+  `${v/sub/rep}` with bounded regexp memoization), and Windows
+  case-insensitive environment lookups; and replaced OS pipe syscalls on
+  pure in-process pipelines with a race-free 64 KB `sync.Pool` ring-buffered
+  `memPipe` (~10 GB/s throughput, with automatic OS-pipe bridging for
+  external subprocesses and wrapper commands).
+- **Coreutils SIMD literal fast paths, zero-alloc streaming & Schwartzian
+  `sort`.** Added `bytes.Index`/`bytes.Count` literal fast paths to `grep`
+  and `sed` (`s/lit/rep/`), chunked 64 KB line/word/UTF-8 rune counting in
+  `wc` (`O(1)` `Stat` on regular `wc -c`), zero-alloc byte-slice streaming
+  across `cut`, `tr` (`[256]byte` LUT), `uniq`, `head`, `seq`
+  (`strconv.AppendInt`), and `cat`, pre-extracted `int64`/`float64`/byte
+  Schwartzian sort keys in `sort` (`-n`, `-k`, `-u`), `fs.DirEntry`-based
+  `find` traversal (eliminating redundant `Lstat` calls), and pooled buffers
+  in `tar`.
+
 ## 1.0.2 — 2026-11-14
 
 ### Fixed

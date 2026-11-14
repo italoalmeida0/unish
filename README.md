@@ -35,7 +35,7 @@ Ctrl-C).
 
 ## Why
 
-- **Zero install**: one static binary (~4 MB), no glibc/msvcrt/cygwin
+- **Zero install**: one static binary (~7 MB), no glibc/msvcrt/cygwin
   dependency. Download and run — even on minimal Alpine/musl.
 - **Same behavior on every OS**: `ps`, `free`, `df`, `uname`, `stat`,
   `grep`, `sed`, `sort`, `find`, `tar`, hashes… all embedded in pure Go.
@@ -80,11 +80,12 @@ read the results.
 `mkdir`, `touch`, `chmod`, `find`, `mktemp`, `xargs`, `gzip`/`gunzip`,
 `tar`, `base64`, `shasum`.
 
-**Own extras** (~90, pure stdlib, no cgo):
+**Own extras** (~100, pure stdlib, no cgo):
 
 | Group | Commands |
 |---|---|
 | text | `grep` (-E BRE/ERE, -r, -o, -a/--text, -q/-s/-h/-H/-m/-l/-c/-n/-i/-v/-x/-w/-F, -A/-B/-C, --include/--exclude), `sed` (s/// with `w` flag, addresses, ranges, hold space, `y`, `a`/`i`/`c`, `=`, `N`, -n/-e/-f/-i/-E), `head` (-n, -c, -q/-v), `tail` (-n `+N`, -c, -q/-v), `sort` (-n, -r, -u, -c, -k, -t, -f, -s, -V, -o, -z), `uniq` (-c/-d/-u/-i/-f/-s/-w, --group), `wc` (-l/-w/-c/-m/-L), `tee`, `tr` (-d/-s/-c/-t, classes), `seq` (-s, -w, -f), `cut` (-d/-f/-c/-b, --complement, --output-delimiter), `paste` (-d, -s, `- -`), `comm` (-1/-2/-3, --check-order), `split` (-l/-b/-a/-d, --suffix-length, -n chunks), `diff` (-q, -u, -s/--brief), `cmp` (-s, -l), `hexdump` (-C, -n, -s, -e format), `strings` (-n, -t, -a), `od` (-An, -t, -A, -j, -N), `nl` (-ba, -v), `tac`, `rev`, `fold` (-w, -s, -b), `expand` (-t, -i), `unexpand` (-a), `join` (-1/-2/-j/-t/-e/-a/-o, -v), `cat` (-n/-b/-s/-E/-T, unbounded lines) |
+| automation | `awk`/`gawk` (POSIX + GNU gawk: `BEGIN`/`END`, regex/ranges, arrays, functions, `printf`/`sprintf`, `sub`/`gsub`/`gensub`, `getline`, pipes, `system()`), `jq` (1.7 filters, exact 64-bit `int64`, `=`/`|=`, `del`, `--arg`/`--argjson`, `-r`/`-c`/`-s`/`-R`/`-e`, `@base64`/`@uri`/`@csv`/`@tsv`/`@sh`), `rg` (`.gitignore`-aware recursive search, `-F`/`-i`/`-S`/`-w`/`-g`/`-t`/`-C`/`--files`/`-r`), `patch` (`-pN`, create/delete, fuzzy hunks, `-R`, `--dry-run`), `bc` (`-l` mathlib, arbitrary precision, `ibase`/`obase`, `define`), `sponge` (`-a`), `flock` (`-s`/`-x`/`-n`/`-w`/`-E`, file & FD locks), `column` (`-t`/`-s`/`-o`/`-n`, UTF-8/CJK width), `xxd` (`-p`/`-r`/`-i`/`-b`/`-s`/`-l`/`-c`/`-g`) |
 | files | `ls` (-a with `.`/`..`, -l, -R, -S, -t, -m, -C, -x, -i, -F, -Q, -d, …), `find` (-name/-iname, -path, -type, -maxdepth/-mindepth, -size, -mtime/-mmin, -newer, -empty, -perm, -not, -prune, -exec, -delete, -print0), `mktemp`, `cp` (-r, -v, -n, -p), `mv` (-v `renamed …`, -n), `rm` (never removes `.`/`..`, --preserve-root), `mkdir`, `touch` (-d, -r/--reference, -c), `chmod` (symbolic), `xargs` (-0, -n, -I, -r), `base64` (-d, -w, -i), `tar` (-cf/-xf/-tf/-czf, --exclude, slip defense), `gzip`/`gunzip`/`gzcat`, `dirname`, `basename`, `realpath`, `readlink`, `ln` (-s, -f), `du` (-s, -h, -b) |
 | system | `sleep`, `timeout` (-s, -k, --preserve-status), `kill` (-s/-n, `%jobspec`, `-0` existence check), `pwd`, `true`, `false`, `yes`, `which`, `printenv`, `whoami`, `nproc`, `clear`, `echo`, `date` (+strftime, -r, -d), `uname` (-s/-n/-r/-v/-m/-p/-i/-a, real kernel + machine), `hostname`, `md5sum`, `sha1sum`, `sha256sum`, `shasum` (-a, -c, -q/-s) |
 | sysinfo | `df` (-h, -k, -P), `ps` (aux/-ef/-o columns), `free` (-h/-m/-g), `uptime`, `env` (-i), `stat` (full + -c), `ss` (-t/-u/-l/-a/-n/-p), `id`, `arch`, `tty`, `logname`, `sync`, `nohup`, `nice` |
@@ -108,7 +109,7 @@ No args on a terminal (or `unish -i`) starts a readline shell:
 - **Prompt**: PS1/PS2 with `\u \h \w \W \$ \# \!` + `$vars` +
   `$(cmds)` + `\[...\]` colors, PROMPT_COMMAND, `~/.unishrc`
 
-Anything else (`git`, `curl`, `ssh`, `awk`, `python`, …) falls through
+Anything else (`git`, `curl`, `ssh`, `python`, …) falls through
 to the system binary.
 
 ## Compatibility notes
