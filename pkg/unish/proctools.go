@@ -110,12 +110,21 @@ func cmdKillNetproc(ctx context.Context, hc interp.HandlerContext, args []string
 		}
 		// Session job table first: fake $! ids ("g1"), tracked child pids,
 		// and jobspecs (%1, %%/\%+, \%-, \%name, \%?substr).
+		// Only signal or exempt from checkProc while j.alive() is true so a
+		// reaped child's recycled OS PID can never be signaled without OpProc.
 		if j := jt.resolveJobSpec(p); j != nil && j.proc != nil {
-			if err := killProc(j.proc, sig); err != nil {
-				fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", j.pid, killErrText(err))
-				code = 1
+			if j.alive() {
+				if err := killProc(j.proc, sig); err != nil {
+					fmt.Fprintf(hc.Stderr, "kill: (%d) - %s\n", j.pid, killErrText(err))
+					code = 1
+				}
+				continue
 			}
-			continue
+			if strings.HasPrefix(p, "%") || strings.HasPrefix(p, "g") {
+				fmt.Fprintf(hc.Stderr, "kill: (%d) - No such process\n", j.pid)
+				code = 1
+				continue
+			}
 		}
 		if strings.HasPrefix(p, "%") {
 			fmt.Fprintf(hc.Stderr, "kill: %s: no such job\n", p)
@@ -128,13 +137,35 @@ func cmdKillNetproc(ctx context.Context, hc interp.HandlerContext, args []string
 			code = 1
 			continue
 		}
+		// Defense-in-depth: never let any numeric alias of os.Getpid() reach
+		// OS FindProcess/killProc in embedded or jailed mode.
+		if pid == os.Getpid() {
+			if !queueSelfSignalForHC(hc, sig) {
+				if embeddedOrJailed {
+					if ec := portableSelfSignalExitCode(sig); ec > 0 {
+						return interp.Exit(ec)
+					}
+					continue
+				}
+				if p2, err := os.FindProcess(os.Getpid()); err == nil {
+					if err := killProc(p2, sig); err != nil {
+						code = 1
+						continue
+					}
+				}
+				if ec := defaultSelfExitCode(sig); ec > 0 {
+					os.Exit(ec)
+				}
+			}
+			continue
+		}
 		if err := checkProc(ctx, "kill", pid, sig); err != nil {
 			fmt.Fprintf(hc.Stderr, "kill: (%d) - %v\n", pid, err)
 			code = 1
 			continue
 		}
-		if pid <= 0 && embeddedOrJailed {
-			// Prevent process-group or broadcast signals (0, -1, -pgid) from
+		if (pid <= 0 || pid == os.Getpid()) && embeddedOrJailed {
+			// Prevent process-group, broadcast, or host-PID signals from
 			// killing the host Go process in embedded/jailed mode.
 			fmt.Fprintf(hc.Stderr, "kill: (%d) - Operation not permitted\n", pid)
 			code = 1
@@ -341,6 +372,9 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 	if *pgroup != "" {
 		j := jt.resolveJobSpec("%" + *pgroup)
 		if len(rest) == 0 && j != nil && j.proc != nil {
+			if !j.alive() {
+				return exitError{1}
+			}
 			if sig == "0" {
 				return nil
 			}
@@ -364,7 +398,7 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 			return exitError{2}
 		}
 		jobPid := 0
-		if j != nil && j.proc != nil {
+		if j != nil && j.proc != nil && j.alive() {
 			jobPid = j.proc.Pid
 		}
 		pgidProcs := filterProcsByPgid(procs, os.Getpid(), wantPgid, jobPid)
@@ -411,7 +445,7 @@ func cmdPkill(ctx context.Context, hc interp.HandlerContext, args []string) erro
 		if p.pid == myPid {
 			continue
 		}
-		if jt.byPID(p.pid) == nil {
+		if own := jt.byPID(p.pid); own == nil || !own.alive() {
 			if err := checkProc(ctx, "pkill", p.pid, sig); err != nil {
 				fmt.Fprintf(hc.Stderr, "pkill: (%d) - %v\n", p.pid, err)
 				continue

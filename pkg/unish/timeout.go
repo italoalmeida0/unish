@@ -2,6 +2,7 @@ package unish
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -268,7 +269,7 @@ func resolveTimeoutPathExec(hc interp.HandlerContext, name string) (string, erro
 			searchDir = resolveHostPath(hc.Dir, searchDir)
 		}
 		for _, cand := range execCandidates(searchDir, name) {
-			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			if fi, err := os.Stat(cand); err == nil && isExecutableFileInfo(fi) {
 				return cand, nil
 			}
 		}
@@ -282,15 +283,20 @@ func startTimeoutProc(ctx context.Context, hc interp.HandlerContext, cmdArgs []s
 	}
 	rawCmd := cmdArgs[0]
 	var execPath string
+	var alreadyCheckedCanon string
+	var checkedBin string
 	if isAbsOrRel(rawCmd) {
-		if _, cerr := checkExec(ctx, "timeout", rawCmd, cmdArgs, hc.Dir); cerr != nil {
+		cb, cerr := checkExec(ctx, "timeout", rawCmd, cmdArgs, hc.Dir)
+		if cerr != nil {
 			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, cerr)
 			return nil, exitError{126}
 		}
+		alreadyCheckedCanon, _ = canonicalizeForCheck(resolveHostPath(hc.Dir, rawCmd))
+		checkedBin = cb
 		lp, err := resolveDirectExecPath(hc.Dir, rawCmd)
 		if err != nil {
 			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, err)
-			if strings.Contains(err.Error(), "Is a directory") {
+			if strings.Contains(err.Error(), "Is a directory") || errors.Is(err, os.ErrPermission) {
 				return nil, exitError{126}
 			}
 			return nil, exitError{127}
@@ -304,10 +310,16 @@ func startTimeoutProc(ctx context.Context, hc interp.HandlerContext, cmdArgs []s
 		}
 		execPath = lp
 	}
-	checkedBin, err := checkExec(ctx, "timeout", execPath, cmdArgs, hc.Dir)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, err)
-		return nil, exitError{126}
+	pathCanon, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, execPath))
+	if alreadyCheckedCanon == "" || !sameCleanPath(pathCanon, alreadyCheckedCanon) {
+		cb, err := checkExec(ctx, "timeout", execPath, cmdArgs, hc.Dir)
+		if err != nil {
+			fmt.Fprintf(hc.Stderr, "timeout: failed to run command '%s': %v\n", rawCmd, err)
+			return nil, exitError{126}
+		}
+		checkedBin = cb
+	} else if CapabilityHookFromContext(ctx) == nil {
+		checkedBin = execPath
 	}
 	c := exec.Command(checkedBin, cmdArgs[1:]...)
 	c.Stdin = hc.Stdin

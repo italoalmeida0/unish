@@ -1196,12 +1196,32 @@ func cmdNice(ctx context.Context, hc interp.HandlerContext, args []string) error
 	return runSysSubcommand(ctx, hc, "nice", childEnv, cleared, adjust, true, cmd)
 }
 
+func isExecutableFileMode(goos string, mode os.FileMode) bool {
+	if mode.IsDir() {
+		return false
+	}
+	if goos != "windows" {
+		return mode&0o111 != 0
+	}
+	return true
+}
+
+func isExecutableFileInfo(fi os.FileInfo) bool {
+	if fi == nil {
+		return false
+	}
+	return isExecutableFileMode(runtime.GOOS, fi.Mode())
+}
+
 func resolveDirectExecPath(dir, name string) (string, error) {
 	p := resolveHostPath(dir, name)
 	fi, err := os.Stat(p)
 	if err == nil {
 		if fi.IsDir() {
 			return "", fmt.Errorf("%s: Is a directory", name)
+		}
+		if runtime.GOOS != "windows" && fi.Mode()&0o111 == 0 {
+			return "", fmt.Errorf("%s: %w", name, os.ErrPermission)
 		}
 		if abs, aerr := filepath.Abs(p); aerr == nil {
 			return abs, nil
@@ -1251,7 +1271,7 @@ func findSubcommandExec(hc interp.HandlerContext, childEnv []string, cleared boo
 			searchDir = resolveHostPath(hc.Dir, searchDir)
 		}
 		for _, cand := range execCandidates(searchDir, name) {
-			if fi, err := os.Stat(cand); err == nil && !fi.IsDir() {
+			if fi, err := os.Stat(cand); err == nil && isExecutableFileInfo(fi) {
 				return cand, nil
 			}
 		}
@@ -1266,24 +1286,35 @@ func runSysSubcommand(ctx context.Context, hc interp.HandlerContext, wrapperName
 	if cmdArgs[0] == "printf" {
 		return cmdPrintf(ctx, hc, cmdArgs)
 	}
+	var alreadyCheckedCanon string
+	var checkedBin string
 	if isAbsOrRel(cmdArgs[0]) {
-		if _, cerr := checkExec(ctx, wrapperName, cmdArgs[0], cmdArgs, hc.Dir); cerr != nil {
+		cb, cerr := checkExec(ctx, wrapperName, cmdArgs[0], cmdArgs, hc.Dir)
+		if cerr != nil {
 			fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", wrapperName, cmdArgs[0], cerr)
 			return exitError{126}
 		}
+		alreadyCheckedCanon, _ = canonicalizeForCheck(resolveHostPath(hc.Dir, cmdArgs[0]))
+		checkedBin = cb
 	}
 	path, err := findSubcommandExec(hc, childEnv, cleared, cmdArgs[0])
 	if err != nil {
 		fmt.Fprintf(hc.Stderr, "%v\n", err)
-		if strings.Contains(err.Error(), "Is a directory") {
+		if strings.Contains(err.Error(), "Is a directory") || errors.Is(err, os.ErrPermission) {
 			return exitError{126}
 		}
 		return exitError{127}
 	}
-	checkedBin, err := checkExec(ctx, wrapperName, path, cmdArgs, hc.Dir)
-	if err != nil {
-		fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", wrapperName, cmdArgs[0], err)
-		return exitError{126}
+	pathCanon, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
+	if alreadyCheckedCanon == "" || !sameCleanPath(pathCanon, alreadyCheckedCanon) {
+		cb, cerr := checkExec(ctx, wrapperName, path, cmdArgs, hc.Dir)
+		if cerr != nil {
+			fmt.Fprintf(hc.Stderr, "%s: %s: %v\n", wrapperName, cmdArgs[0], cerr)
+			return exitError{126}
+		}
+		checkedBin = cb
+	} else if CapabilityHookFromContext(ctx) == nil {
+		checkedBin = path
 	}
 	if childEnv == nil {
 		childEnv = []string{}

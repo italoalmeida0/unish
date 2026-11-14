@@ -32,18 +32,25 @@ package unish
 //   - No cgo, no platform-specific code: os.Process + exec.Cmd only.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"io/fs"
 	"os"
 	"os/exec"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
+	"mvdan.cc/sh/v3/expand"
 	"mvdan.cc/sh/v3/interp"
+	"mvdan.cc/sh/v3/syntax"
 )
 
 func init() {
@@ -412,39 +419,185 @@ func trackExec(next interp.ExecHandlerFunc) interp.ExecHandlerFunc {
 	}
 }
 
+func isExecTextBusy(err error) bool {
+	return runtime.GOOS != "windows" && errors.Is(err, syscall.ETXTBSY)
+}
+
+func isExecFormatError(err error) bool {
+	return runtime.GOOS != "windows" && errors.Is(err, syscall.ENOEXEC)
+}
+
+func jailedOpenHandler(ctx context.Context, path string, flag int, perm os.FileMode) (io.ReadWriteCloser, error) {
+	if isWriteOnlyDevNull(path, flag) {
+		return sharedDevNull, nil
+	}
+	hc := interp.HandlerCtx(ctx)
+	f, err := fsOpenFile(ctx, hc.Dir, "open", path, flag, perm)
+	if err != nil {
+		var pe *os.PathError
+		if !errors.As(err, &pe) {
+			return nil, &os.PathError{Op: "open", Path: path, Err: err}
+		}
+		return nil, err
+	}
+	return f, nil
+}
+
+func jailedReadDirHandler(ctx context.Context, path string) ([]fs.DirEntry, error) {
+	hc := interp.HandlerCtx(ctx)
+	return fsReadDir(ctx, hc.Dir, "glob", path)
+}
+
+func jailedStatHandler(ctx context.Context, path string, followSymlinks bool) (fs.FileInfo, error) {
+	hc := interp.HandlerCtx(ctx)
+	if followSymlinks {
+		return fsStat(ctx, hc.Dir, "stat", path)
+	}
+	return fsLstat(ctx, hc.Dir, "stat", path)
+}
+
+func jailedAccessHandler(ctx context.Context, path string, mode interp.AccessMode) error {
+	hc := interp.HandlerCtx(ctx)
+	op := OpStat
+	switch {
+	case mode&interp.AccessWrite != 0:
+		op = OpWrite
+	case mode&interp.AccessRead != 0:
+		op = OpRead
+	}
+	checked, err := checkFS(ctx, hc.Dir, "access", path, op)
+	if err != nil {
+		return err
+	}
+	return interp.DefaultAccessHandler()(ctx, checked, mode)
+}
+
+// runJailedENOEXEC executes a shebang-less +x script inside a fully jailed
+// sub-runner (never mvdan/sh's unjailed DefaultExecHandler.runScriptENOEXEC).
+func runJailedENOEXEC(ctx context.Context, hc interp.HandlerContext, checkedBin string, args []string) error {
+	b, err := fsReadFile(ctx, hc.Dir, args[0], checkedBin)
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, err)
+		return interp.NewExitStatus(126)
+	}
+	line, _, _ := bytes.Cut(b, []byte("\n"))
+	if bytes.IndexByte(line, 0) >= 0 {
+		fmt.Fprintf(hc.Stderr, "%s: cannot execute binary file\n", args[0])
+		return interp.NewExitStatus(126)
+	}
+	file, err := syntax.NewParser().Parse(bytes.NewReader(b), args[0])
+	if err != nil {
+		fmt.Fprintln(hc.Stderr, err)
+		return interp.NewExitStatus(2)
+	}
+	opts := []interp.RunnerOption{
+		interp.Dir(hc.Dir),
+		interp.Env(expand.ListEnviron(shellExecEnv(hc)...)),
+		interp.StdIO(hc.Stdin, hc.Stdout, hc.Stderr),
+		interp.CallHandler(callOverride),
+		interp.OpenHandler(jailedOpenHandler),
+		interp.ReadDirHandler2(jailedReadDirHandler),
+		interp.StatHandler(jailedStatHandler),
+		interp.AccessHandler(jailedAccessHandler),
+		interp.ExecHandlers(trackExec, extraHandler),
+		interp.ProcSubstHandler(procSubstHandler),
+	}
+	if len(args) > 1 {
+		opts = append(opts, interp.Params(append([]string{"--"}, args[1:]...)...))
+	}
+	r, err := interp.New(opts...)
+	if err != nil {
+		return err
+	}
+	return r.Run(ctx, file)
+}
+
 func runExternalTrackedInTable(ctx context.Context, jt *jobTable, args []string) (error, bool) {
 	hc := interp.HandlerCtx(ctx)
+	var alreadyCheckedCanon string
+	var checkedBin string
 	if isAbsOrRel(args[0]) {
-		if _, cerr := checkExec(ctx, args[0], args[0], args, hc.Dir); cerr != nil {
+		cb, cerr := checkExec(ctx, args[0], args[0], args, hc.Dir)
+		if cerr != nil {
 			if hc.InBackground() {
 				hc.ReportBgStart(0)
 			}
 			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
 			return interp.NewExitStatus(126), true
 		}
+		alreadyCheckedCanon, _ = canonicalizeForCheck(resolveHostPath(hc.Dir, args[0]))
+		checkedBin = cb
 	}
 	path, err := interp.LookPathDir(hc.Dir, hc.Env, args[0])
 	if err != nil {
+		if isAbsOrRel(args[0]) {
+			if hc.InBackground() {
+				hc.ReportBgStart(0)
+			}
+			resolved := resolveHostPath(hc.Dir, args[0])
+			if fi, serr := os.Stat(resolved); serr == nil {
+				if fi.IsDir() {
+					fmt.Fprintf(hc.Stderr, "%s: Is a directory\n", args[0])
+				} else {
+					fmt.Fprintf(hc.Stderr, "%s: Permission denied\n", args[0])
+				}
+				return interp.NewExitStatus(126), true
+			}
+			fmt.Fprintf(hc.Stderr, "%s: No such file or directory\n", args[0])
+			return interp.NewExitStatus(127), true
+		}
 		return nil, false
 	}
-	checkedBin, cerr := checkExec(ctx, args[0], path, args, hc.Dir)
-	if cerr != nil {
+	pathCanon, _ := canonicalizeForCheck(resolveHostPath(hc.Dir, path))
+	if alreadyCheckedCanon == "" || !sameCleanPath(pathCanon, alreadyCheckedCanon) {
+		cb, cerr := checkExec(ctx, args[0], path, args, hc.Dir)
+		if cerr != nil {
+			if hc.InBackground() {
+				hc.ReportBgStart(0)
+			}
+			fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
+			return interp.NewExitStatus(126), true
+		}
+		checkedBin = cb
+	} else if CapabilityHookFromContext(ctx) == nil {
+		checkedBin = path
+	}
+
+	newCmd := func() (*exec.Cmd, func(), func()) {
+		c := exec.CommandContext(ctx, checkedBin, args[1:]...)
+		c.Dir = hc.Dir
+		c.Stdin = hc.Stdin
+		c.Stdout = hc.Stdout
+		c.Stderr = hc.Stderr
+		c.Env = shellExecEnv(hc)
+		as, aw := interp.PrepareExecStdio(c)
+		return c, as, aw
+	}
+	cmd, afterStart, afterWait := newCmd()
+	err = cmd.Start()
+	for delay := time.Millisecond; err != nil && isExecTextBusy(err) && delay < 300*time.Millisecond; delay *= 2 {
+		afterWait()
+		time.Sleep(delay)
+		cmd, afterStart, afterWait = newCmd()
+		err = cmd.Start()
+	}
+	if err != nil {
+		afterWait()
+		if isExecFormatError(err) {
+			if hc.InBackground() {
+				hc.ReportBgStart(0)
+			}
+			return runJailedENOEXEC(ctx, hc, checkedBin, args), true
+		}
 		if hc.InBackground() {
 			hc.ReportBgStart(0)
 		}
-		fmt.Fprintf(hc.Stderr, "%s: %v\n", args[0], cerr)
+		fmt.Fprintf(hc.Stderr, "%v\n", err)
+		var execErr *exec.Error
+		if errors.As(err, &execErr) || os.IsNotExist(err) {
+			return interp.NewExitStatus(127), true
+		}
 		return interp.NewExitStatus(126), true
-	}
-	cmd := exec.CommandContext(ctx, checkedBin, args[1:]...)
-	cmd.Dir = hc.Dir
-	cmd.Stdin = hc.Stdin
-	cmd.Stdout = hc.Stdout
-	cmd.Stderr = hc.Stderr
-	cmd.Env = shellExecEnv(hc)
-	afterStart, afterWait := interp.PrepareExecStdio(cmd)
-	if err := cmd.Start(); err != nil {
-		afterWait()
-		return nil, false
 	}
 	afterStart()
 	defer afterWait()

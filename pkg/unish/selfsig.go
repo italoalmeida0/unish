@@ -30,15 +30,16 @@ func setActiveRunner(r selfSignalRunner) {
 	activeRunnerMu.Unlock()
 }
 
-// selfPID reports whether the operand names this very process ($$, or the
-// literal pid), so the signal should be delivered to our own trap queue.
+// selfPID reports whether the operand names this very process ($$, or any
+// numeric representation of os.Getpid() such as 0$$ or +$$), so the signal is
+// delivered to our own trap queue rather than OS Kill on the host process.
 func selfPID(operand string) bool {
 	operand = strings.TrimSpace(operand)
 	if operand == "" {
 		return false
 	}
-	me := os.Getpid()
-	return operand == strconv.Itoa(me)
+	pid, err := strconv.Atoi(operand)
+	return err == nil && pid == os.Getpid()
 }
 
 func canonicalTrapSignalName(clean string) string {

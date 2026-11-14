@@ -481,7 +481,13 @@ echo NEVER
 				t.Fatalf("timeout kill -9 $$: code=%d stdout=%q stderr=%q", rTo.code, rTo.stdout, rTo.stderr)
 			}
 
-			// 7) Dangerous broadcast/group PIDs (0, -1, -$$) never kill the host process!
+			// 7) Dangerous broadcast/group PIDs (0, -1, -$$) and non-canonical self-PIDs (0$$, +$$) never kill the host process!
+			for _, nonCanonSelf := range []string{"kill -9 0$$; echo NEVER", "kill -9 +$$; echo NEVER", "kill -TERM 00$$; echo NEVER"} {
+				rnc := runNetprocScript(t, mode.ctx, t.TempDir(), nil, nil, nil, nonCanonSelf)
+				if (rnc.code != 137 && rnc.code != 143) || strings.Contains(rnc.stdout, "NEVER") {
+					t.Fatalf("%s: expected 137/143 and host survival, got code=%d stdout=%q stderr=%q", nonCanonSelf, rnc.code, rnc.stdout, rnc.stderr)
+				}
+			}
 			for _, bad := range []string{"kill -9 0", "kill -9 -- -1", "kill -TERM -- -$$"} {
 				rb := runNetprocScript(t, mode.ctx, t.TempDir(), nil, nil, nil, bad)
 				if rb.code != 1 {
@@ -506,8 +512,24 @@ func startExternalSleeper(t *testing.T, dir string) *exec.Cmd {
 	if err != nil {
 		t.Fatalf("os.Executable: %v", err)
 	}
+	exeBytes, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("read test exe: %v", err)
+	}
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	// Short <=15-char image name so `pkill unsh_slp_77` matches on Linux (/proc/pid/comm),
+	// macOS, and Windows (CreateToolhelp32Snapshot ExeFile).
+	sleeperBin := filepath.Join(dir, "unsh_slp_77"+ext)
+	if _, serr := os.Stat(sleeperBin); serr != nil {
+		if werr := os.WriteFile(sleeperBin, exeBytes, 0o755); werr != nil {
+			t.Fatalf("write sleeper bin: %v", werr)
+		}
+	}
 	readyFile := filepath.Join(dir, fmt.Sprintf("ready_%d.pid", time.Now().UnixNano()))
-	cmd := exec.Command(exe, "-test.run=^TestNetprocHelperProcess$", "--", "sleep", readyFile)
+	cmd := exec.Command(sleeperBin, "-test.run=^TestNetprocHelperProcess$", "--", "sleep", readyFile)
 	cmd.Env = append(os.Environ(), "UNISH_NETPROC_HELPER=1")
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("start sleeper: %v", err)
@@ -599,7 +621,7 @@ func TestJailProc_KillPkillPgrepPsSsGating(t *testing.T) {
 		t.Fatalf("ss with list allowed: code=%d stderr=%q", ssRes.code, ssRes.stderr)
 	}
 	// pkill can now enumerate processes, MUST STILL check OpProc per matched external PID and block!
-	pkRes := runNetprocScript(t, listCtx, tmp, nil, nil, nil, "pkill -f TestNetprocHelperProcess")
+	pkRes := runNetprocScript(t, listCtx, tmp, nil, nil, nil, "pkill unsh_slp_77")
 	if pkRes.code != 1 {
 		t.Fatalf("pkill with per-PID OpProc denied: code=%d, want 1", pkRes.code)
 	}
@@ -959,5 +981,239 @@ func TestConcurrentSessions_PerContextJobTableIsolation(t *testing.T) {
 	_, killBErr, killBRC := runStep(ctxB, rB, &outB, &errB, "pkill -KILL -g 1 && wait $!; true")
 	if killBRC != 0 || killBErr != "" {
 		t.Fatalf("Session B pkill -g 1 / wait $! unexpected rc=%d stderr=%q", killBRC, killBErr)
+	}
+}
+
+// 8. Red-Team Regression Suite for Verifier Findings (#82):
+//   - Single OpExec check (no duplicate one-shot Approver prompts) on ./rel and /abs paths
+//   - Zero DefaultExecHandler fallthrough on cmd.Start() failure + jailed ENOEXEC sub-runner
+//   - Dead/reaped job (!j.alive()) guard in kill & pkill (no signaling recycled OS PIDs without OpProc)
+//   - Unix 0o111 executable bit check in PATH lookup
+func TestJailRedTeam_VerifierFindings(t *testing.T) {
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatalf("os.Executable: %v", err)
+	}
+	exeBytes, err := os.ReadFile(exe)
+	if err != nil {
+		t.Fatalf("read test exe: %v", err)
+	}
+
+	rawAllowed := t.TempDir()
+	allowedDir, _ := canonicalizeForCheck(rawAllowed)
+	rawOutside := t.TempDir()
+	outsideDir, _ := canonicalizeForCheck(rawOutside)
+
+	outsideSecret := filepath.Join(outsideDir, "secret.txt")
+	if err := os.WriteFile(outsideSecret, []byte("TOP_SECRET"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	ext := ""
+	if runtime.GOOS == "windows" {
+		ext = ".exe"
+	}
+	toolPath := filepath.Join(allowedDir, "mytool"+ext)
+	if err := os.WriteFile(toolPath, exeBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// (A) Single OpExec prompt check across direct ./mytool, env ./mytool, nice ./mytool, nohup ./mytool, timeout ./mytool.
+	for _, cmdSrc := range []string{
+		"./mytool" + ext + " -test.run=^TestNetprocHelperProcess$ -- echo one",
+		"env ./mytool" + ext + " -test.run=^TestNetprocHelperProcess$ -- echo one",
+		"nice ./mytool" + ext + " -test.run=^TestNetprocHelperProcess$ -- echo one",
+		"nohup ./mytool" + ext + " -test.run=^TestNetprocHelperProcess$ -- echo one",
+		"timeout 5 ./mytool" + ext + " -test.run=^TestNetprocHelperProcess$ -- echo one",
+	} {
+		execChecks := 0
+		oneShotHook := &customNetprocHook{
+			checkFn: func(_ context.Context, req AccessRequest) error {
+				if req.Op == OpExec {
+					execChecks++
+					if execChecks > 1 {
+						return &AccessDenialError{Op: OpExec, Target: req.Path, Reason: "duplicate one-shot Approver prompt!"}
+					}
+				}
+				return nil
+			},
+		}
+		envPairs := append(os.Environ(), "UNISH_NETPROC_HELPER=1", "PATH="+allowedDir)
+		res := runNetprocScript(t, WithCapabilityHook(context.Background(), oneShotHook), allowedDir, envPairs, nil, nil, cmdSrc)
+		if res.code != 0 || execChecks != 1 || !strings.Contains(res.stdout, "HELPER_OK:one") {
+			t.Fatalf("%q: execChecks=%d (want 1) code=%d stdout=%q stderr=%q", cmdSrc, execChecks, res.code, res.stdout, res.stderr)
+		}
+	}
+
+	// (B) cmd.Start() failure (corrupted executable) MUST NOT fall through to DefaultExecHandler
+	// (OpExec checked once, returns 126/127) and jailed ENOEXEC script cannot escape sandbox!
+	corruptBin := filepath.Join(allowedDir, "corrupt_bin"+ext)
+	if err := os.WriteFile(corruptBin, []byte("\x00\xffNOT_A_VALID_EXE\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	corruptExecChecks := 0
+	corruptHook := &customNetprocHook{
+		checkFn: func(_ context.Context, req AccessRequest) error {
+			if req.Op == OpExec {
+				corruptExecChecks++
+				return nil
+			}
+			if req.Op == OpRead && sameCleanPath(req.Path, corruptBin) {
+				return nil
+			}
+			return &AccessDenialError{Op: req.Op, Target: req.Path, Reason: "jailed"}
+		},
+	}
+	cRes := runNetprocScript(t, WithCapabilityHook(context.Background(), corruptHook), allowedDir, nil, nil, nil, "./corrupt_bin"+ext)
+	if cRes.code != 126 && cRes.code != 127 {
+		t.Fatalf("corrupt_bin start error: code=%d, want 126 or 127 (stderr=%q)", cRes.code, cRes.stderr)
+	}
+	if corruptExecChecks != 1 {
+		t.Fatalf("corrupt_bin triggered %d OpExec checks, want 1 (no fallthrough retry)", corruptExecChecks)
+	}
+
+	// Test runJailedENOEXEC directly on all OSes (and end-to-end ./noshebang.sh on Unix!):
+	noShebang := filepath.Join(allowedDir, "noshebang.sh")
+	outsideBin := filepath.Join(outsideDir, "outside_bin"+ext)
+	if err := os.WriteFile(outsideBin, exeBytes, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	escapeScript := fmt.Sprintf("stat %q >/dev/null 2>&1 && echo ESCAPED_STAT\necho pwn > %q 2>/dev/null && echo ESCAPED_WRITE\nnc 10.0.0.1 80 2>/dev/null && echo ESCAPED_NET\nps >/dev/null 2>&1 && echo ESCAPED_PS\n%q -test.run=^TestNetprocHelperProcess$ -- echo bad 2>/dev/null && echo ESCAPED_EXEC\nglobbed=( %s/* )\necho \"JAILED_SCRIPT_DONE:$1:${#globbed[@]}\"\n",
+		filepath.ToSlash(outsideSecret),
+		filepath.ToSlash(filepath.Join(outsideDir, "pwn.txt")),
+		filepath.ToSlash(outsideBin),
+		filepath.ToSlash(outsideDir),
+	)
+	if err := os.WriteFile(noShebang, []byte(escapeScript), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	enoJailHook := newTestJailHook(t, allowedDir)
+	enoCtx := WithCapabilityHook(WithJobTable(context.Background(), NewJobTable()), enoJailHook)
+	var enoOut, enoErr bytes.Buffer
+	enoHC := interp.HandlerContext{
+		Dir:    allowedDir,
+		Env:    expand.ListEnviron("PATH=" + allowedDir),
+		Stdin:  strings.NewReader(""),
+		Stdout: &enoOut,
+		Stderr: &enoErr,
+	}
+	if err := runJailedENOEXEC(enoCtx, enoHC, noShebang, []string{noShebang, "arg1"}); err != nil {
+		t.Fatalf("runJailedENOEXEC unexpected err: %v (stderr=%q)", err, enoErr.String())
+	}
+	gotEno := strings.ReplaceAll(enoOut.String(), "\r\n", "\n")
+	// Note: when glob fails due to denied ReadDir, literal pattern remains 1 unexpanded element `${outsideDir}/*`.
+	if strings.Contains(gotEno, "ESCAPED_") || !strings.HasPrefix(gotEno, "JAILED_SCRIPT_DONE:arg1:") {
+		t.Fatalf("runJailedENOEXEC jail escape or wrong output: %q (stderr=%q)", gotEno, enoErr.String())
+	}
+	if _, serr := os.Stat(filepath.Join(outsideDir, "pwn.txt")); serr == nil {
+		t.Fatal("runJailedENOEXEC wrote outside jail!")
+	}
+	// Also verify OpRead on noshebang.sh itself is enforced by runJailedENOEXEC!
+	outsideScript := filepath.Join(outsideDir, "outside_noshebang.sh")
+	if err := os.WriteFile(outsideScript, []byte("echo SHOULD_NOT_READ\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	enoOut.Reset()
+	enoErr.Reset()
+	errOutsideRead := runJailedENOEXEC(enoCtx, enoHC, outsideScript, []string{outsideScript})
+	var esOutside interp.ExitStatus
+	if !errors.As(errOutsideRead, &esOutside) || int(esOutside) != 126 || strings.Contains(enoOut.String(), "SHOULD_NOT_READ") {
+		t.Fatalf("runJailedENOEXEC must deny OpRead outside jail with 126: err=%v out=%q", errOutsideRead, enoOut.String())
+	}
+	if runtime.GOOS != "windows" {
+		unixEnoRes := runNetprocScript(t, enoCtx, allowedDir, []string{"PATH=" + allowedDir}, nil, nil, "./noshebang.sh unix_ok")
+		if unixEnoRes.code != 0 || !strings.HasPrefix(unixEnoRes.stdout, "JAILED_SCRIPT_DONE:unix_ok:") || strings.Contains(unixEnoRes.stdout, "ESCAPED_") {
+			t.Fatalf("Unix ./noshebang.sh ENOEXEC jail test failed: code=%d stdout=%q stderr=%q", unixEnoRes.code, unixEnoRes.stdout, unixEnoRes.stderr)
+		}
+	}
+
+	// (C) Reaped/dead job (!j.alive()) in JobTable must NEVER bypass checkProc or signal recycled PIDs!
+	jtDead := NewJobTable()
+	liveVictim := startExternalSleeper(t, outsideDir)
+	victimPID := liveVictim.Process.Pid
+	closedDone := make(chan struct{})
+	close(closedDone)
+	// Simulate a finished/reaped job in jtDead whose old OS PID was recycled by the kernel to liveVictim!
+	jtDead.jobs = append(jtDead.jobs, &trackedJob{
+		id:   1,
+		pid:  victimPID,
+		argv: []string{"finished_worker"},
+		proc: liveVictim.Process,
+		done: closedDone,
+		code: 0,
+	})
+	deadProcChecks := 0
+	deadHook := &customNetprocHook{
+		checkFn: func(_ context.Context, req AccessRequest) error {
+			if req.Op == OpProc {
+				if req.PID == 0 && req.Signal == "list" {
+					return nil
+				}
+				deadProcChecks++
+				return &AccessDenialError{Op: OpProc, Target: strconv.Itoa(req.PID), Reason: "recycled pid denied"}
+			}
+			return nil
+		},
+	}
+	deadCtx := WithJobTable(WithCapabilityHook(context.Background(), deadHook), jtDead)
+
+	// 1) `kill %1` on reaped job reports No such process (rc=1) WITHOUT killing liveVictim!
+	// Note: avoid calling `jobs` first because `jobs` sweeps dead entries; test directly while entry is in jtDead.jobs!
+	kJobRes := runNetprocScript(t, deadCtx, allowedDir, nil, nil, nil, "kill -KILL %1")
+	if kJobRes.code != 1 || !strings.Contains(kJobRes.stderr, "No such process") {
+		t.Fatalf("kill %%1 on dead job: code=%d stderr=%q", kJobRes.code, kJobRes.stderr)
+	}
+	// 2) `kill <victimPID>` must NOT be exempted by dead job entry -> hits checkProc and denies!
+	kPidRes := runNetprocScript(t, deadCtx, allowedDir, nil, nil, nil, fmt.Sprintf("kill -KILL %d", victimPID))
+	if kPidRes.code != 1 || deadProcChecks == 0 {
+		t.Fatalf("kill recycled PID should hit checkProc and fail: code=%d checks=%d stderr=%q", kPidRes.code, deadProcChecks, kPidRes.stderr)
+	}
+	// 3) `pkill -g 1` and `pkill unsh_slp_77` must ALSO refuse dead job / hit per-PID checkProc!
+	pkGrpRes := runNetprocScript(t, deadCtx, allowedDir, nil, nil, nil, "pkill -KILL -g 1")
+	if pkGrpRes.code != 1 {
+		t.Fatalf("pkill -g 1 on dead job should fail with code 1, got %d", pkGrpRes.code)
+	}
+	prevChecks := deadProcChecks
+	pkDeadRes := runNetprocScript(t, deadCtx, allowedDir, nil, nil, nil, "pkill -KILL unsh_slp_77")
+	if pkDeadRes.code != 1 || deadProcChecks <= prevChecks {
+		t.Fatalf("pkill recycled PID should hit checkProc and fail: code=%d checks=%d->%d", pkDeadRes.code, prevChecks, deadProcChecks)
+	}
+	if err := killProc(liveVictim.Process, "0"); err != nil {
+		t.Fatalf("liveVictim was killed through dead-job PID-reuse bug: %v", err)
+	}
+
+	// (D) Unix 0o111 executable bit check in PATH lookup.
+	if isExecutableFileMode("linux", 0o644) || isExecutableFileMode("darwin", 0o600) {
+		t.Fatal("non-0111 file mode must not be executable on Unix")
+	}
+	if !isExecutableFileMode("linux", 0o755) || !isExecutableFileMode("windows", 0o644) {
+		t.Fatal("0755 on Unix and regular file on Windows must be executable")
+	}
+	if runtime.GOOS != "windows" {
+		shadowDir := t.TempDir()
+		// Non-executable file named `mytool` in shadowDir must NOT shadow executable `mytool` in allowedDir,
+		// and non-executable `.env` in outsideDir must return 127 (not 126 oracle)!
+		if err := os.WriteFile(filepath.Join(shadowDir, "mytool"), []byte("not exec"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		dotEnv := filepath.Join(outsideDir, ".env")
+		if err := os.WriteFile(dotEnv, []byte("SECRET=1"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		pathEnv := append(os.Environ(),
+			"UNISH_NETPROC_HELPER=1",
+			"PATH="+outsideDir+":"+shadowDir+":"+allowedDir,
+		)
+		uHook := newTestJailHook(t, allowedDir)
+		uCtx := WithCapabilityHook(context.Background(), uHook)
+
+		oracleRes := runNetprocScript(t, uCtx, allowedDir, pathEnv, nil, nil, "env .env")
+		if oracleRes.code != 127 {
+			t.Fatalf("non-exec .env on PATH must return 127 (not 126 oracle), got %d (stderr=%q)", oracleRes.code, oracleRes.stderr)
+		}
+		shadowRes := runNetprocScript(t, uCtx, allowedDir, pathEnv, nil, nil, "env mytool -test.run=^TestNetprocHelperProcess$ -- echo unshadowed")
+		if shadowRes.code != 0 || !strings.Contains(shadowRes.stdout, "HELPER_OK:unshadowed") {
+			t.Fatalf("non-exec file in earlier PATH dir shadowed real executable: code=%d stdout=%q stderr=%q", shadowRes.code, shadowRes.stdout, shadowRes.stderr)
+		}
 	}
 }
