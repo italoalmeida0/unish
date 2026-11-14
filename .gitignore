@@ -1,6 +1,6 @@
 # Binaries
-unish
-unish.exe
+/unish
+/unish.exe
 unish-*
 *.exe
 !assets/
